@@ -7,7 +7,6 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
-
 - **Zero-downtime keeper key rotation (#71).** The keeper accepts a standby
   key in `KEEPER_SECRET_NEXT`: if the active key's source account is unusable
   it rotates mid-pass and retries the same mandate, and after a pass settles
@@ -41,6 +40,10 @@ All notable changes to payflow-backend. The format follows
   SQL is an interpolated template literal. Vetted static fragments carry an
   explained `eslint-disable-next-line` comment, and a test runs the real
   config against a deliberately bad query to prove the rule fires.
+- **Volume and fee statistics (#55).** `/api/stats` reports 24-hour and all-time
+  charge volume (gross: net amount plus protocol fee), total fees and the
+  number of merchants with an active mandate, alongside the existing counts.
+  Amounts are decimal strings.
 
 ### Changed
 

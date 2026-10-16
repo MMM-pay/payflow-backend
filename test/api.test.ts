@@ -271,3 +271,87 @@ describe("merchant summary caching", () => {
     assert.equal(cache.get("m3")?.merchant, "m3");
   });
 });
+
+describe("stats volume", () => {
+  const MERCHANT2 = "GBIWM7VWG7UBSHPOXG7XQV6M4EXG2XC5JQER6IZU35VS2DGLTJX7UVOM";
+  const statsDb = openDatabase(":memory:");
+  const statsIx = new Indexer(statsDb, {} as never, {} as never);
+  let statsServer: Server;
+  let statsBase: string;
+
+  const ev = (
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+    tx = "t",
+  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+
+  const statsGet = async (path: string) => {
+    const res = await fetch(statsBase + path);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  before(async () => {
+    // One active merchant with a recent charge and one from two days ago, and
+    // a cancelled merchant that must not count as active.
+    statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
+      token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
+    }));
+    statsIx.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }));
+    statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      amount: 2_000_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "tx-old"));
+    statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      amount: 3_000_000n, fee: 150_000n, charges_made: 2n, next_charge: 4_000_000_000n,
+    }, "tx-recent"));
+    statsDb
+      .prepare("UPDATE charges SET created_at = ? WHERE tx_hash = ?")
+      .run(Date.now() - 2 * 86_400_000, "tx-old");
+
+    statsIx.apply(ev("plan_created", [MERCHANT2, 2n], {
+      token: "CTOKEN", amount: 1_000_000n, period: 2_592_000n, name: "p2",
+    }));
+    statsIx.apply(ev("subscribed", [2n, SUBSCRIBER, MERCHANT2], {
+      plan_id: 2n, amount: 1_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }));
+    statsIx.apply(ev("cancelled", [2n, SUBSCRIBER], { charges_made: 0 }));
+
+    const app = createApp(statsDb, config);
+    await new Promise<void>((resolve) => {
+      statsServer = app.listen(0, () => {
+        const addr = statsServer.address();
+        statsBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    statsServer.close();
+    statsDb.close();
+  });
+
+  test("stats report volume, fees and active merchants as decimal strings", async () => {
+    const { body } = await statsGet("/api/stats");
+    assert.equal(body.plans, 2);
+    assert.equal(body.mandates, 2);
+    assert.equal(body.activeMandates, 1);
+    assert.equal(body.charges, 2);
+    // Only the merchant with an active mandate counts.
+    assert.equal(body.activeMerchants, 1);
+    // Gross volume and fees across every charge: 2_100_000 + 3_150_000.
+    assert.equal(body.volumeAllTime, "5250000");
+    assert.equal(body.totalFees, "250000");
+    for (const field of ["volume24h", "volumeAllTime", "totalFees"]) {
+      assert.equal(typeof body[field], "string", `${field} is a string`);
+    }
+  });
+
+  test("the 24-hour window counts only recent charges", async () => {
+    const { body } = await statsGet("/api/stats");
+    // The charge from two days ago is excluded: 3_000_000 + 150_000.
+    assert.equal(body.volume24h, "3150000");
+  });
+});

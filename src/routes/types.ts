@@ -104,6 +104,14 @@ export interface StatsResponse {
   mandates: number;
   activeMandates: number;
   charges: number;
+  /** String gross charge volume in the last 24h, token's smallest unit. */
+  volume24h: string;
+  /** String gross charge volume all-time, token's smallest unit. */
+  volumeAllTime: string;
+  /** String sum of fees collected all-time, token's smallest unit. */
+  totalFees: string;
+  /** Count of distinct merchants with at least one active mandate. */
+  activeMerchants: number;
   lastIndexedLedger: number;
 }
 

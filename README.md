@@ -135,7 +135,7 @@ Base path `/api`. All amounts are strings in the token's smallest unit
 | `GET` | `/api/due` | Mandates chargeable right now |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/subscribers/:address/summary` | Mandates and total paid |
-| `GET` | `/api/stats` | Protocol totals and last indexed ledger |
+| `GET` | `/api/stats` | Protocol totals, charge volume, fees and last indexed ledger |
 
 `/api/mandates` also accepts `ids`, a comma-separated batch of up to 100
 mandate ids (`?ids=1,2,3`). Ids that do not exist are omitted; more than 100
