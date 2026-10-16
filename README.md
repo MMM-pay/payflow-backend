@@ -142,6 +142,7 @@ checks at `/ready` and liveness checks at `/health`.
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
 | `GET` | `/api/due` | Mandates chargeable right now |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
+| `GET` | `/api/merchants/:address/forecast?days=30` | Projected charges over the next N days, net of fees |
 | `GET` | `/api/subscribers/:address/summary` | Mandates and total paid |
 | `GET` | `/api/subscribers/:address/upcoming?days=30` | Charges due over the next N days, with projected times |
 | `GET` | `/api/stats` | Protocol totals, charge volume, fees and last indexed ledger |
@@ -221,6 +222,13 @@ the ones it skipped. A `max_charges` cap limits the count to the remaining
 allowance, charges are listed oldest-first inside `[now, until)`, `amount` is
 the gross per-charge the subscriber pays, and `truncated` marks output clipped
 by the per-mandate cap of 400 occurrences.
+
+`forecast` sums the charges active mandates will produce in the next `days`
+(default 30, capped at 365), each occurrence net of the mandate's `fee_bps`.
+Occurrence times are `next_charge + k × period`; a `max_charges` of 0 means no
+expiry, otherwise the remaining allowance caps the count. The response carries
+its `assumptions` (window bounds, fee normalisation, vault funding ignored)
+so consumers do not have to infer them.
 
 ## Configuration
 

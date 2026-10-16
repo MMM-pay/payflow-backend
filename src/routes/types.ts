@@ -99,6 +99,16 @@ export interface MerchantSummary {
   tokens: TokenRevenue[];
 }
 
+export interface ForecastResponse {
+  merchant: string;
+  days: number;
+  from: number;
+  to: number;
+  forecast: string;
+  mandateCount: number;
+  assumptions: string[];
+}
+
 export interface SubscriberSummary {
   subscriber: string;
   mandates: MandateRow[];

@@ -59,6 +59,10 @@ All notable changes to payflow-backend. The format follows
   until the indexer's projection trails the network by no more than 120
   ledgers, so orchestrators do not route traffic to an instance that is still
   backfilling. `/health` stays a liveness probe answering 200.
+- **Merchant revenue forecast (#63).** `/api/merchants/:address/forecast` projects
+  the charges a merchant's active mandates will produce over the next `days`
+  (default 30, capped at 365), each occurrence net of the mandate's fee, and
+  returns the window and assumptions it used.
 
 ### Changed
 

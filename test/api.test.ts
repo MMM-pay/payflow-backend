@@ -12,6 +12,10 @@ import type { MerchantSummary } from "../src/routes/types.ts";
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
 const YEARLY_MERCHANT = "GDLXOW3J5FEFW4UZ7XBHX6EFHL7POV7S2NG5RZ7ULYCGLJWGPUBFQO4U";
+const FORECAST_MERCHANT = "GA5WDTXMB5SW2DIVYCXKQ36M3LWPSGVPYQWRTMLERMZSPGYQXVQ2N55B";
+const CAPPED_MERCHANT = "GCP3XZ2Z4XLRTNBRD7KWWLE7K4LRBNTBVF37LWZRY2MEEK3GZ3RWZG7Y";
+/** Frozen at load; forecast fixtures hang off it so the window maths is stable. */
+const NOW = Math.floor(Date.now() / 1000);
 
 const config = {
   STELLAR_NETWORK: "testnet",
@@ -55,6 +59,17 @@ before(async () => {
   ix.apply(ev("subscribed", [2n, SUBSCRIBER, YEARLY_MERCHANT], {
     plan_id: 1n, amount: 120_000_000n, period: 31_536_000n, next_charge: 4_000_000_000n,
   }, "tx2"));
+
+  // Forecast fixtures: a daily mandate net of a 1% fee, and one capped at two
+  // charges. The first charge is an hour away, so /due stays empty.
+  ix.apply(ev("subscribed", [3n, SUBSCRIBER, FORECAST_MERCHANT], {
+    plan_id: 1n, amount: 5_000_000n, period: 86_400n,
+    next_charge: BigInt(NOW + 3_600), max_charges: 0n, fee_bps: 100n,
+  }, "tx3"));
+  ix.apply(ev("subscribed", [4n, SUBSCRIBER, CAPPED_MERCHANT], {
+    plan_id: 1n, amount: 2_000_000n, period: 86_400n,
+    next_charge: BigInt(NOW + 3_600), max_charges: 2n, fee_bps: 0n,
+  }, "tx4"));
 
   const app = createApp(db, config, status, ix.merchantCache);
   await new Promise<void>((resolve) => {
@@ -199,6 +214,36 @@ describe("http api", () => {
     assert.equal(body.mrr, "9863013");
   });
 
+  test("forecast sums the next 30 days net of fees", async () => {
+    const { body } = await get(`/api/merchants/${FORECAST_MERCHANT}/forecast`);
+    assert.equal(body.days, 30);
+    assert.equal(body.to as number - (body.from as number), 30 * 86_400);
+    assert.equal(body.mandateCount, 1);
+    // 5_000_000 per day, 1% fee -> 4_950_000 x 30 occurrences
+    assert.equal(body.forecast, "148500000");
+    assert.ok(Array.isArray(body.assumptions) && (body.assumptions as unknown[]).length > 0);
+  });
+
+  test("forecast respects the days parameter", async () => {
+    const one = await get(`/api/merchants/${FORECAST_MERCHANT}/forecast?days=1`);
+    assert.equal(one.body.days, 1);
+    assert.equal(one.body.forecast, "4950000");
+
+    const malformed = await get(`/api/merchants/${FORECAST_MERCHANT}/forecast?days=nope`);
+    assert.equal(malformed.body.days, 30);
+  });
+
+  test("forecast stops at max_charges and ignores unknown merchants", async () => {
+    const capped = await get(`/api/merchants/${CAPPED_MERCHANT}/forecast`);
+    // two charges fit in 30 days, but the mandate is capped at two
+    assert.equal(capped.body.mandateCount, 1);
+    assert.equal(capped.body.forecast, "4000000");
+
+    const none = await get("/api/merchants/GNOBODY/forecast");
+    assert.equal(none.body.mandateCount, 0);
+    assert.equal(none.body.forecast, "0");
+  });
+
   test("subscriber summary includes fee in total paid", async () => {
     const { body } = await get(`/api/subscribers/${SUBSCRIBER}/summary`);
     assert.equal(body.totalPaid, "10000000");
@@ -212,7 +257,7 @@ describe("http api", () => {
   test("stats reflect indexed state", async () => {
     const { body } = await get("/api/stats");
     assert.equal(body.plans, 1);
-    assert.equal(body.mandates, 2);
+    assert.equal(body.mandates, 4);
     assert.equal(body.charges, 1);
   });
 

@@ -15,6 +15,7 @@
 import type {
   ChargePage,
   DuePage,
+  ForecastResponse,
   HealthResponse,
   MandatePage,
   MandateRow,
@@ -33,6 +34,7 @@ export type {
   ChargeRow,
   DueMandateRow,
   DuePage,
+  ForecastResponse,
   HealthResponse,
   HealthStatus,
   MandatePage,
@@ -148,6 +150,13 @@ export class PayflowClient {
 
   merchantSummary(address: string): Promise<MerchantSummary> {
     return this.get<MerchantSummary>(`/api/merchants/${encodeURIComponent(address)}/summary`);
+  }
+
+  merchantForecast(address: string, days?: number): Promise<ForecastResponse> {
+    return this.get<ForecastResponse>(
+      `/api/merchants/${encodeURIComponent(address)}/forecast`,
+      days !== undefined ? { days } : undefined,
+    );
   }
 
   subscriberSummary(address: string): Promise<SubscriberSummary> {
