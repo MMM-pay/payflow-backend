@@ -254,6 +254,7 @@ describe("merchant summary caching", () => {
       chargeCount: 1,
       mrr: "10",
       arr: "120",
+      tokens: [],
     });
 
     cache.set("m1", mockSummary("m1"));
@@ -353,5 +354,102 @@ describe("stats volume", () => {
     const { body } = await statsGet("/api/stats");
     // The charge from two days ago is excluded: 3_000_000 + 150_000.
     assert.equal(body.volume24h, "3150000");
+  });
+});
+
+describe("merchant revenue per token", () => {
+  const TOKEN_A = "CTOKEN_A";
+  const TOKEN_B = "CTOKEN_B";
+  const TOKEN_C = "CTOKEN_C";
+  const tokenDb = openDatabase(":memory:");
+  const tokenIx = new Indexer(tokenDb, {} as never, {} as never);
+  const tokenServers: Server[] = [];
+
+  const ev = (
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+    tx = "t",
+  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+
+  const start = async (cfg: Config): Promise<string> => {
+    const server = await new Promise<Server>((resolve) => {
+      const s = createApp(tokenDb, cfg).listen(0, () => resolve(s));
+    });
+    tokenServers.push(server);
+    const addr = server.address();
+    return `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+  };
+
+  const summaryGet = async (base: string, path: string) => {
+    const res = await fetch(base + path);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  let plainBase: string;
+  let scopedBase: string;
+
+  before(async () => {
+    // One merchant with a plan in each of three tokens: two charged, one not.
+    const plans: [bigint, string, bigint][] = [
+      [1n, TOKEN_A, 10_000_000n],
+      [2n, TOKEN_B, 5_000_000n],
+      [3n, TOKEN_C, 2_000_000n],
+    ];
+    for (const [id, token, amount] of plans) {
+      tokenIx.apply(ev("plan_created", [MERCHANT, id], {
+        token, amount, period: 2_592_000n, name: `p${id}`,
+      }));
+      tokenIx.apply(ev("subscribed", [id, SUBSCRIBER, MERCHANT], {
+        plan_id: id, amount, period: 2_592_000n, next_charge: 4_000_000_000n,
+      }));
+    }
+    tokenIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "ta1"));
+    tokenIx.apply(ev("charged", [2n, SUBSCRIBER, MERCHANT], {
+      amount: 4_950_000n, fee: 50_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "tb1"));
+
+    plainBase = await start(config);
+    // A default token that is not the first one, so selection is provable.
+    scopedBase = await start({ ...config, TOKEN_ID: TOKEN_B } as unknown as Config);
+  });
+
+  after(() => {
+    for (const server of tokenServers) server.close();
+    tokenDb.close();
+  });
+
+  const breakdown = [
+    { token: TOKEN_A, totalCollected: "9900000", mrr: "10000000" },
+    { token: TOKEN_B, totalCollected: "4950000", mrr: "5000000" },
+    { token: TOKEN_C, totalCollected: "0", mrr: "2000000" },
+  ];
+
+  test("summary groups revenue per token; without a default the totals span all", async () => {
+    const { body } = await summaryGet(plainBase, `/api/merchants/${MERCHANT}/summary`);
+    assert.deepEqual(body.tokens, breakdown);
+    assert.equal(body.activeMandates, 3);
+    // No TOKEN_ID: the flat fields keep their previous all-token meaning.
+    assert.equal(body.totalCollected, "14850000");
+    assert.equal(body.mrr, "17000000");
+    assert.equal(body.chargeCount, 2);
+  });
+
+  test("TOKEN_ID scopes the flat fields to the default token", async () => {
+    const { body } = await summaryGet(scopedBase, `/api/merchants/${MERCHANT}/summary`);
+    assert.equal(body.totalCollected, "4950000");
+    assert.equal(body.mrr, "5000000");
+    // The breakdown and the charge count still cover every token.
+    assert.deepEqual(body.tokens, breakdown);
+    assert.equal(body.chargeCount, 2);
+  });
+
+  test("an unknown merchant has an empty breakdown and zero totals", async () => {
+    const { body } = await summaryGet(plainBase, "/api/merchants/GNOBODY/summary");
+    assert.deepEqual(body.tokens, []);
+    assert.equal(body.totalCollected, "0");
+    assert.equal(body.mrr, "0");
   });
 });

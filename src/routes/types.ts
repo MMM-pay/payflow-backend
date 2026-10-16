@@ -80,6 +80,12 @@ export interface DuePage {
   due: DueMandateRow[];
 }
 
+export interface TokenRevenue {
+  token: string;
+  totalCollected: string;
+  mrr: string;
+}
+
 export interface MerchantSummary {
   merchant: string;
   activeMandates: number;
@@ -90,6 +96,7 @@ export interface MerchantSummary {
   mrr: string;
   /** String ARR: active mandates normalised to a 365-day year. */
   arr: string;
+  tokens: TokenRevenue[];
 }
 
 export interface SubscriberSummary {

@@ -83,7 +83,7 @@ export function createApp(
     res.json(body);
   });
 
-  app.use("/api", buildRoutes(db, merchantCache));
+  app.use("/api", buildRoutes(db, merchantCache, config.TOKEN_ID));
 
   app.use((_req, res) => {
     res.status(404).json({ error: "not_found" });

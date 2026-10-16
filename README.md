@@ -151,8 +151,10 @@ curl localhost:8080/api/merchants/GB343X.../summary
   "activeMandates": 1,
   "totalCollected": "19800000",
   "chargeCount": 2,
-  "mrr": "432000000000",
-  "arr": "5256000000000"
+  "arr": "5256000000000",
+  "tokens": [
+    { "token": "CDLZFC...", "totalCollected": "19800000", "mrr": "432000000000" }
+  ]
 }
 ```
 
@@ -195,15 +197,28 @@ package is private for now: the frontend depends on it from the repository
 (it is built by `npm run build` into `dist/client`), and publishing it to a
 registry is a release-time step for maintainers.
 
+`tokens` breaks the same revenue down per token, joined through each charge's
+mandate and plan. With `TOKEN_ID` configured, the flat `totalCollected` and
+`mrr` cover that default token only, so a merchant's other tokens cannot
+inflate them; without one they keep their previous all-token meaning.
+`chargeCount` always counts every token's charges.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` | RPC endpoint |
 | `NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` | Network id |
+<<<<<<< HEAD
 | `PLAN_REGISTRY_ID` | â€” | Deployed registry contract |
 | `VAULT_ID` | â€” | Deployed vault contract |
 | `SUBSCRIPTION_ID` | â€” | Deployed subscription contract |
+=======
+| `PLAN_REGISTRY_ID` | — | Deployed registry contract |
+| `VAULT_ID` | — | Deployed vault contract |
+| `SUBSCRIPTION_ID` | — | Deployed subscription contract |
+| `TOKEN_ID` | — | Default token for the flat merchant-summary amounts. Unset, they span every token |
+>>>>>>> 580db6c (feat(api): merchant revenue per token)
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
 | `KEEPER_SECRET` | â€” | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | â€” | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |

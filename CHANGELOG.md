@@ -60,6 +60,14 @@ All notable changes to payflow-backend. The format follows
   query handling and response shapes are identical and the existing API
   tests pass unchanged.
 
+### Fixed
+
+- **Merchant totals no longer mix tokens (#56).** `/api/merchants/:address/summary`
+  summed every charge into one figure even when the merchant's plans used
+  several tokens. Revenue and MRR are now also grouped per token in a `tokens`
+  array, and the flat fields report the default token (`TOKEN_ID`) when one is
+  configured — without one they keep their previous all-token meaning.
+
 ## [0.2.0] - 2026-10-09
 
 Points at the v0.2.0 contract suite on testnet.

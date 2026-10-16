@@ -26,11 +26,12 @@ export { defaultMerchantSummaryCache, MerchantSummaryCache };
 export function buildRoutes(
   db: DatabaseSync,
   summaryCache: MerchantSummaryCache = defaultMerchantSummaryCache,
+  defaultToken?: string,
 ): Router {
   const r = Router();
   r.use(plansRouter(db));
   r.use(mandatesRouter(db));
-  r.use(merchantsRouter(db, summaryCache));
+  r.use(merchantsRouter(db, summaryCache, defaultToken));
   r.use(subscribersRouter(db));
   r.use(statsRouter(db));
   return r;

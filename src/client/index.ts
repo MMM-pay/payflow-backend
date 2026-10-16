@@ -42,6 +42,7 @@ export type {
   PlanRow,
   StatsResponse,
   SubscriberSummary,
+  TokenRevenue,
 } from "../routes/types.ts";
 
 export interface PlansQuery {
