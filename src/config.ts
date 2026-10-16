@@ -72,6 +72,9 @@ const schema = z.object({
   LOG_LEVEL: z.string().default("info"),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+
+  ADMIN_TOKEN: z.string().optional(),
+
 });
 
 export type Config = z.infer<typeof schema>;

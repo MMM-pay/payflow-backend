@@ -236,6 +236,23 @@ export class Keeper {
     return wait ? Math.max(0, wait.retryAt - now) : 0;
   }
 
+  /** Mandates currently backing off, soonest retry first. Read by /admin. */
+  backoffList(now: number = Math.floor(Date.now() / 1000)): {
+    mandateId: number;
+    failures: number;
+    retryAt: number;
+    retryIn: number;
+  }[] {
+    return [...this.backoff.entries()]
+      .map(([mandateId, wait]) => ({
+        mandateId,
+        failures: wait.failures,
+        retryAt: wait.retryAt,
+        retryIn: Math.max(0, wait.retryAt - now),
+      }))
+      .sort((a, b) => a.retryAt - b.retryAt);
+  }
+
   private record(result: SettleResult, now: number): void {
     if (result.status === "settled") {
       this.backoff.delete(result.mandateId);

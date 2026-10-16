@@ -63,6 +63,11 @@ All notable changes to payflow-backend. The format follows
   the charges a merchant's active mandates will produce over the next `days`
   (default 30, capped at 365), each occurrence net of the mandate's fee, and
   returns the window and assumptions it used.
+- **Token-protected `/admin` operator endpoints (#64).** Trigger an indexer pass,
+  run a keeper pass, or read the keeper's backoff list. They exist only when
+  `ADMIN_TOKEN` is set, require `Authorization: Bearer`, and the token is
+  compared in constant time. Triggered passes queue behind any pass already
+  running rather than overlapping it.
 
 ### Changed
 

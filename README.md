@@ -230,6 +230,25 @@ expiry, otherwise the remaining allowance caps the count. The response carries
 its `assumptions` (window bounds, fee normalisation, vault funding ignored)
 so consumers do not have to infer them.
 
+### Operator endpoints
+
+`/admin/*` exists only when `ADMIN_TOKEN` is set, and every request needs
+`Authorization: Bearer <token>`, compared in constant time. Without the
+variable the paths are absent and 404 like any other unknown route.
+
+| Method | Path | Action |
+|---|---|---|
+| `POST` | `/admin/reindex` | Run one indexer pass now |
+| `POST` | `/admin/keeper/run` | Run one settlement pass now |
+| `GET` | `/admin/keeper/backoff` | Mandates backing off after failed charges |
+
+Triggered passes share one serialized runner with the scheduled loops, so a
+trigger queues behind a pass that is still running instead of overlapping it —
+overlap would race the cursor and, for the keeper, the account sequence
+number. The keeper endpoints answer `503 keeper_unavailable` when the keeper
+is off (`KEEPER_ENABLED=false`). A pass that fails answers 500 and the failure
+is logged; the next scheduled pass retries as usual.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -253,6 +272,7 @@ so consumers do not have to infer them.
 | `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
+| `ADMIN_TOKEN` | — | Bearer token for `/admin`. Unset keeps those routes disabled |
 
 Setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports OpenTelemetry spans for every
 RPC call (`rpc.<method>`), indexer and keeper pass, and HTTP request. Every

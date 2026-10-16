@@ -5,6 +5,7 @@ import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Config } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
+import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
 import { buildRoutes, MerchantSummaryCache } from "./routes/index.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
@@ -23,18 +24,23 @@ export function createApp(
   db: DatabaseSync,
   config: Config,
   indexer?: IndexerStatus,
-  merchantCacheOrRpc?: MerchantSummaryCache | RpcStatus,
-  rpcParam?: RpcStatus,
+  arg3?: MerchantSummaryCache | RpcStatus | AdminHooks,
+  arg4?: RpcStatus | AdminHooks,
+  arg5?: AdminHooks,
 ): Express {
   let merchantCache: MerchantSummaryCache | undefined;
   let rpc: RpcStatus | undefined;
-  if (merchantCacheOrRpc && "active" in merchantCacheOrRpc && Array.isArray((merchantCacheOrRpc as RpcStatus).endpoints)) {
-    rpc = merchantCacheOrRpc as RpcStatus;
-  } else if (merchantCacheOrRpc instanceof MerchantSummaryCache) {
-    merchantCache = merchantCacheOrRpc;
-  }
-  if (rpcParam) {
-    rpc = rpcParam;
+  let admin: AdminHooks | undefined;
+
+  for (const arg of [arg3, arg4, arg5]) {
+    if (!arg) continue;
+    if (arg instanceof MerchantSummaryCache) {
+      merchantCache = arg;
+    } else if ("active" in arg && Array.isArray((arg as RpcStatus).endpoints)) {
+      rpc = arg as RpcStatus;
+    } else if (typeof arg === "object") {
+      admin = arg as AdminHooks;
+    }
   }
 
   const app = express();
@@ -116,6 +122,12 @@ export function createApp(
       lag,
     });
   });
+
+  // Operator endpoints are opt-in. Without ADMIN_TOKEN — or without hooks —
+  // /admin falls through to the 404 below like any unknown path.
+  if (config.ADMIN_TOKEN && admin) {
+    app.use("/admin", buildAdminRoutes(config.ADMIN_TOKEN, admin));
+  }
 
   app.use("/api", buildRoutes(db, merchantCache, config.TOKEN_ID));
 

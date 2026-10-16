@@ -4,7 +4,7 @@ import { nativeToScVal, rpc } from "@stellar/stellar-sdk";
 import { openDatabase, readCursor, writeCursor } from "../src/lib/db.ts";
 import { Indexer, type IndexerRpc } from "../src/indexer.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
-import { drain, every } from "../src/lib/loop.ts";
+import { drain, every, serial } from "../src/lib/loop.ts";
 import type { Config } from "../src/config.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
@@ -396,5 +396,29 @@ describe("loop", () => {
     await new Promise((r) => setTimeout(r, 150));
     await loop.stop();
     assert.ok(passes >= 2);
+  });
+
+  test("serial starts a call only after the previous one settles", async () => {
+    const order: string[] = [];
+    const run = serial(async () => {
+      order.push("start");
+      await new Promise((r) => setTimeout(r, 20));
+      order.push("end");
+    });
+
+    await Promise.all([run(), run()]);
+    assert.deepEqual(order, ["start", "end", "start", "end"]);
+  });
+
+  test("serial keeps working after a call rejects", async () => {
+    let calls = 0;
+    const run = serial(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("boom");
+      return calls;
+    });
+
+    await assert.rejects(run(), /boom/);
+    assert.equal(await run(), 2);
   });
 });

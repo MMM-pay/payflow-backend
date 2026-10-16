@@ -4,8 +4,9 @@ import { makeRpc } from "./lib/stellar.ts";
 import { createApp } from "./app.ts";
 import { Indexer } from "./indexer.ts";
 import { Keeper } from "./keeper.ts";
+import type { AdminHooks } from "./routes/admin.ts";
 import { logger } from "./lib/logger.ts";
-import { drain, every, type Loop } from "./lib/loop.ts";
+import { drain, every, serial, type Loop } from "./lib/loop.ts";
 import { initTelemetry, withSpan } from "./lib/telemetry.ts";
 
 const config = loadConfig();
@@ -14,48 +15,79 @@ const db = openDatabase(config.DATABASE_PATH);
 const server = makeRpc(config);
 
 const indexer = new Indexer(db, server, config);
-const app = createApp(db, config, indexer.status, indexer.merchantCache, server);
-const http = app.listen(config.PORT, () => {
-  logger.info({ port: config.PORT, network: config.STELLAR_NETWORK }, "api listening");
+const keeper = config.KEEPER_ENABLED ? new Keeper(db, server, config) : undefined;
+const activeKeeper = keeper;
+if (keeper) {
+  logger.info({ keeper: keeper.publicKey }, "keeper enabled");
+} else {
+  logger.info("keeper disabled (KEEPER_ENABLED=false)");
+}
+
+// Each runner is serialized, and the scheduled loop and the /admin trigger
+// share it: a pass can take longer than the interval while backfilling, and
+// overlapping passes would race on the cursor and, for the keeper, on the
+// account sequence number.
+const runIndexerPass = serial(async () => {
+  try {
+    const r = await withSpan("indexer.pass", () => indexer.tick());
+    indexer.status.lastRunAt = Date.now();
+    indexer.status.lastError = null;
+    if (r.applied > 0) logger.info({ events: r.applied, cursor: r.cursor }, "indexed");
+    return r;
+  } catch (err) {
+    indexer.status.lastError = err instanceof Error ? err.message : String(err);
+    logger.error({ err }, "indexer pass failed");
+    throw err;
+  }
 });
 
-// A pass can take longer than the interval while backfilling, so each loop
-// waits for its pass to finish before scheduling the next. Overlapping passes
-// would race on the cursor and, for the keeper, on the account sequence number.
-const loops: Loop[] = [];
-let activeKeeper: Keeper | undefined;
-
-loops.push(
-  every(config.INDEXER_INTERVAL_MS, async () => {
-    try {
-      const r = await withSpan("indexer.pass", () => indexer.tick());
-      indexer.status.lastRunAt = Date.now();
-      indexer.status.lastError = null;
-      if (r.applied > 0) logger.info({ events: r.applied, cursor: r.cursor }, "indexed");
-    } catch (err) {
-      indexer.status.lastError = err instanceof Error ? err.message : String(err);
-      logger.error({ err }, "indexer pass failed");
-    }
-  }),
-);
-
-if (config.KEEPER_ENABLED) {
-  const keeper = new Keeper(db, server, config);
-  activeKeeper = keeper;
-  logger.info({ keeper: keeper.publicKey }, "keeper enabled");
-  loops.push(
-    every(config.KEEPER_INTERVAL_MS, async () => {
+const runKeeperPass = keeper
+  ? serial(async () => {
       try {
         const results = await withSpan("keeper.pass", () => keeper.tick());
         const settled = results.filter((r) => r.status === "settled").length;
         if (results.length > 0) logger.info({ settled, attempted: results.length }, "keeper pass");
+        return results;
       } catch (err) {
         logger.error({ err }, "keeper pass failed");
+        throw err;
+      }
+    })
+  : undefined;
+
+const adminHooks: AdminHooks = { reindex: () => runIndexerPass() };
+if (keeper && runKeeperPass) {
+  adminHooks.keeperPass = () => runKeeperPass();
+  adminHooks.keeperBackoff = () => keeper.backoffList();
+}
+
+const app = createApp(db, config, indexer.status, indexer.merchantCache, server, adminHooks);
+const http = app.listen(config.PORT, () => {
+  logger.info({ port: config.PORT, network: config.STELLAR_NETWORK }, "api listening");
+});
+
+const loops: Loop[] = [];
+
+loops.push(
+  every(config.INDEXER_INTERVAL_MS, async () => {
+    try {
+      await runIndexerPass();
+    } catch {
+      // Handled in runIndexerPass
+    }
+  }),
+);
+
+if (runKeeperPass) {
+  loops.push(
+    every(config.KEEPER_INTERVAL_MS, async () => {
+      try {
+        await runKeeperPass();
+      } catch {
+        // Handled in runKeeperPass
       }
     }),
   );
-} else {
-  logger.info("keeper disabled (KEEPER_ENABLED=false)");
 }
 
 /**

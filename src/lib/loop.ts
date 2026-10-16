@@ -50,3 +50,25 @@ export async function drain(loops: Loop[], timeoutMs: number): Promise<"drained"
     clearTimeout(timer);
   }
 }
+
+/**
+ * Wrap `pass` so calls never overlap: each call starts only after the previous
+ * one settles, however long that takes.
+ *
+ * The scheduled loop and operator-triggered passes share one serialized
+ * runner, so a trigger cannot run alongside a pass that is still going — that
+ * would race the cursor and, for the keeper, the account sequence number.
+ */
+export function serial<T>(pass: () => Promise<T>): () => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return () => {
+    const next = tail.then(() => pass());
+    // Keep the chain alive after a rejection; the caller still sees it.
+    tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
+}
+
