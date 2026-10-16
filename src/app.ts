@@ -5,8 +5,9 @@ import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Config } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
-import { buildRoutes, type MerchantSummaryCache } from "./routes/index.ts";
+import { buildRoutes, MerchantSummaryCache } from "./routes/index.ts";
 import type { HealthResponse } from "./routes/types.ts";
+import type { RpcStatus } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
 import { withSpan } from "./lib/telemetry.ts";
 
@@ -17,8 +18,19 @@ export function createApp(
   db: DatabaseSync,
   config: Config,
   indexer?: IndexerStatus,
-  merchantCache?: MerchantSummaryCache,
+  merchantCacheOrRpc?: MerchantSummaryCache | RpcStatus,
+  rpcParam?: RpcStatus,
 ): Express {
+  let merchantCache: MerchantSummaryCache | undefined;
+  let rpc: RpcStatus | undefined;
+  if (merchantCacheOrRpc && "active" in merchantCacheOrRpc && Array.isArray((merchantCacheOrRpc as RpcStatus).endpoints)) {
+    rpc = merchantCacheOrRpc as RpcStatus;
+  } else if (merchantCacheOrRpc instanceof MerchantSummaryCache) {
+    merchantCache = merchantCacheOrRpc;
+  }
+  if (rpcParam) {
+    rpc = rpcParam;
+  }
   const app = express();
 
   app.use(
@@ -74,6 +86,7 @@ export function createApp(
             mismatchedEvents: indexer.mismatchedEvents ?? 0,
           }
         : null,
+      rpc: rpc ? { active: rpc.active, endpoints: rpc.endpoints } : null,
       contracts: {
         planRegistry: config.PLAN_REGISTRY_ID,
         vault: config.VAULT_ID,

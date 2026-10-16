@@ -44,6 +44,11 @@ All notable changes to payflow-backend. The format follows
   charge volume (gross: net amount plus protocol fee), total fees and the
   number of merchants with an active mandate, alongside the existing counts.
   Amounts are decimal strings.
+- **RPC endpoint failover (#60).** `SOROBAN_RPC_URL` now accepts a comma-separated
+  list. Calls go to the active endpoint and switch to the next when one fails;
+  a health probe prefers the endpoint with the freshest ledger, so a reachable
+  but lagging node does not hold the indexer back either. `/health` reports the
+  active endpoint and the full list under `rpc`.
 
 ### Changed
 

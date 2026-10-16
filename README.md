@@ -126,7 +126,7 @@ Base path `/api`. All amounts are strings in the token's smallest unit
 
 | Method | Path | Returns |
 |---|---|---|
-| `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs |
+| `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
@@ -199,7 +199,7 @@ registry is a release-time step for maintainers.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` | RPC endpoint |
+| `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` | RPC endpoint, or a comma-separated list to fail over between |
 | `NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` | Network id |
 | `PLAN_REGISTRY_ID` | â€” | Deployed registry contract |
 | `VAULT_ID` | â€” | Deployed vault contract |
@@ -235,6 +235,14 @@ shutdown. Without the variable, tracing does nothing and costs nothing.
 
 The keeper is **off** by default. Turning it on requires funding
 `KEEPER_SECRET` with XLM for transaction fees.
+
+`SOROBAN_RPC_URL` may list several endpoints. Calls go to the active endpoint
+(reported under `rpc.active` on `/health`). If a call fails, the next endpoint
+is tried and takes over, so an outage at one provider does not stop indexing
+or settlement; the caller's loop logs the failure and retries next pass. A
+lagging endpoint — one that answers but from an older ledger — loses to the
+freshest endpoint the health probe finds. Reads get a 15-second timeout, so a
+hung provider fails over instead of stalling a pass forever.
 
 ## Deployment
 

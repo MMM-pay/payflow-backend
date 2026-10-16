@@ -1,8 +1,36 @@
 import { z } from "zod";
 
+/** Split a comma-separated URL list, dropping blanks and duplicates. */
+function rpcUrls(raw: string): string[] {
+  const seen = new Set<string>();
+  for (const part of raw.split(",")) {
+    const url = part.trim();
+    if (url !== "") seen.add(url);
+  }
+  return [...seen];
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 const schema = z.object({
   STELLAR_NETWORK: z.string().default("testnet"),
-  SOROBAN_RPC_URL: z.string().url().default("https://soroban-testnet.stellar.org"),
+  /** One or more RPC endpoints; the client fails over between them. */
+  SOROBAN_RPC_URL: z
+    .string()
+    .default("https://soroban-testnet.stellar.org")
+    .transform(rpcUrls)
+    .pipe(
+      z
+        .array(z.string().refine(isHttpUrl, "must be an http(s) URL"))
+        .min(1, "must list at least one URL"),
+    ),
   NETWORK_PASSPHRASE: z.string().default("Test SDF Network ; September 2015"),
 
   PLAN_REGISTRY_ID: z.string().min(56),

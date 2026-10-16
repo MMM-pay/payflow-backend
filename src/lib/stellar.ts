@@ -1,14 +1,175 @@
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
+import type { Account, FeeBumpTransaction, Transaction } from "@stellar/stellar-sdk";
 import type { Config } from "../config.ts";
+import { logger } from "./logger.ts";
 import { traceRpc } from "./telemetry.ts";
 import eventSpecFile from "./event_spec.json" with { type: "json" };
 
-export function makeRpc(config: Config): rpc.Server {
+/** The RPC calls the indexer and keeper make. Narrow so tests can fake them. */
+export type RpcLike = Pick<
+  rpc.Server,
+  | "getLatestLedger"
+  | "getHealth"
+  | "getEvents"
+  | "getAccount"
+  | "prepareTransaction"
+  | "sendTransaction"
+  | "getTransaction"
+>;
+
+/** Where failover currently stands; reported by /health. */
+export interface RpcStatus {
+  /** URL of the endpoint calls currently go to. */
+  readonly active: string;
+  /** Every configured endpoint, in configured order. */
+  readonly endpoints: readonly string[];
+}
+
+/** Obtains a server handle for a URL; injectable so tests can fake endpoints. */
+export type Dial = (url: string) => RpcLike;
+
+/**
+ * Hung endpoints must become errors, not promises that never settle, or
+ * failover has nothing to react to; the SDK default is no timeout at all.
+ */
+const RPC_TIMEOUT_MS = 15_000;
+
+function defaultDial(url: string): RpcLike {
   return traceRpc(
-    new rpc.Server(config.SOROBAN_RPC_URL, {
-      allowHttp: config.SOROBAN_RPC_URL.startsWith("http://"),
+    new rpc.Server(url, {
+      allowHttp: url.startsWith("http://"),
+      timeout: RPC_TIMEOUT_MS,
     }),
   );
+}
+
+/**
+ * A list of RPC endpoints fronted as one.
+ *
+ * Calls go to the active endpoint. When a call throws — an outage, a timeout —
+ * the next endpoint is tried and, on success, becomes the active one, so a
+ * pass that hits a dead provider still makes progress. `getHealth` probes
+ * every endpoint and the freshest ledger wins, so a node that is reachable
+ * but lagging does not hold the indexer back either.
+ */
+export class FailoverRpc implements RpcStatus {
+  readonly endpoints: readonly string[];
+  private readonly servers: RpcLike[];
+  private index = 0;
+
+  constructor(urls: readonly string[], dial: Dial = defaultDial) {
+    this.endpoints = [...urls];
+    this.servers = this.endpoints.map((url) => dial(url));
+  }
+
+  get active(): string {
+    return this.endpoints[this.index] ?? "";
+  }
+
+  /**
+   * Call `op` on the active endpoint, then each of the others in turn, until
+   * one answers. Every endpoint is tried at most once, so one pass cannot
+   * stall retrying a provider that is down; if all fail, the last error is
+   * rethrown for the caller's loop to log and retry on the next pass.
+   */
+  private async run<T>(op: string, call: (server: RpcLike) => Promise<T>): Promise<T> {
+    const count = this.servers.length;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < count; attempt += 1) {
+      const i = (this.index + attempt) % count;
+      const server = this.servers[i];
+      if (server === undefined) continue;
+      try {
+        const result = await call(server);
+        if (i !== this.index) {
+          logger.warn(
+            { op, from: this.endpoints[this.index], to: this.endpoints[i] },
+            "rpc endpoint switched",
+          );
+          this.index = i;
+        }
+        return result;
+      } catch (err) {
+        lastError = err;
+        logger.warn({ op, endpoint: this.endpoints[i], err }, "rpc endpoint call failed");
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * Probe every endpoint concurrently and adopt the one whose ledger is
+   * furthest ahead; a failing probe is ignored. The probe starts at the
+   * current endpoint, so a healthy cluster (or one where the endpoints tie)
+   * keeps its active endpoint instead of flapping. If none answer, the first
+   * error is rethrown.
+   */
+  async getHealth(): Promise<rpc.Api.GetHealthResponse> {
+    const count = this.servers.length;
+    const probes = await Promise.allSettled(this.servers.map((server) => server.getHealth()));
+    let best: rpc.Api.GetHealthResponse | undefined;
+    let bestIndex = this.index;
+    for (let offset = 0; offset < count; offset += 1) {
+      const i = (this.index + offset) % count;
+      const probe = probes[i];
+      if (probe?.status !== "fulfilled") continue;
+      if (best === undefined || probe.value.latestLedger > best.latestLedger) {
+        best = probe.value;
+        bestIndex = i;
+      }
+    }
+    if (best === undefined) {
+      const failed = probes.filter((p): p is PromiseRejectedResult => p.status === "rejected");
+      throw failed[0]?.reason ?? new Error("all rpc endpoints failed");
+    }
+    if (bestIndex !== this.index) {
+      logger.warn(
+        {
+          from: this.endpoints[this.index],
+          to: this.endpoints[bestIndex],
+          latest: best.latestLedger,
+        },
+        "rpc endpoint is lagging; switched",
+      );
+      this.index = bestIndex;
+    }
+    return best;
+  }
+
+  async getLatestLedger(): Promise<rpc.Api.GetLatestLedgerResponse> {
+    return this.run("getLatestLedger", (server) => server.getLatestLedger());
+  }
+
+  async getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse> {
+    return this.run("getEvents", (server) => server.getEvents(request));
+  }
+
+  async getAccount(address: string): Promise<Account> {
+    return this.run("getAccount", (server) => server.getAccount(address));
+  }
+
+  async prepareTransaction(
+    tx: Transaction | FeeBumpTransaction,
+    useUpgradedAuth?: boolean,
+  ): Promise<Transaction> {
+    return this.run("prepareTransaction", (server) =>
+      server.prepareTransaction(tx, useUpgradedAuth),
+    );
+  }
+
+  async sendTransaction(
+    transaction: Transaction | FeeBumpTransaction,
+  ): Promise<rpc.Api.SendTransactionResponse> {
+    return this.run("sendTransaction", (server) => server.sendTransaction(transaction));
+  }
+
+  async getTransaction(hash: string): Promise<rpc.Api.GetTransactionResponse> {
+    return this.run("getTransaction", (server) => server.getTransaction(hash));
+  }
+}
+
+export function makeRpc(config: Config, dial: Dial = defaultDial): FailoverRpc {
+  return new FailoverRpc(config.SOROBAN_RPC_URL, dial);
 }
 
 /** A contract event flattened into plain JS values. */
