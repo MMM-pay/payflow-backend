@@ -135,6 +135,7 @@ Base path `/api`. All amounts are strings in the token's smallest unit
 | `GET` | `/api/due` | Mandates chargeable right now |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/subscribers/:address/summary` | Mandates and total paid |
+| `GET` | `/api/subscribers/:address/upcoming?days=30` | Charges due over the next N days, with projected times |
 | `GET` | `/api/stats` | Protocol totals, charge volume, fees and last indexed ledger |
 
 `/api/mandates` also accepts `ids`, a comma-separated batch of up to 100
@@ -203,22 +204,26 @@ mandate and plan. With `TOKEN_ID` configured, the flat `totalCollected` and
 inflate them; without one they keep their previous all-token meaning.
 `chargeCount` always counts every token's charges.
 
+`upcoming` projects each active mandate's charges over the next `days`
+(default 30, capped at 365). A mandate already due is projected at `now` — the
+keeper settles it on its next pass — and then every `period`; a future one
+starts at its `next_charge`. Missed periods are not replayed, matching the
+contract, which sets `next_charge = charge time + period` rather than walking
+the ones it skipped. A `max_charges` cap limits the count to the remaining
+allowance, charges are listed oldest-first inside `[now, until)`, `amount` is
+the gross per-charge the subscriber pays, and `truncated` marks output clipped
+by the per-mandate cap of 400 occurrences.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` | RPC endpoint, or a comma-separated list to fail over between |
 | `NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` | Network id |
-<<<<<<< HEAD
-| `PLAN_REGISTRY_ID` | â€” | Deployed registry contract |
-| `VAULT_ID` | â€” | Deployed vault contract |
-| `SUBSCRIPTION_ID` | â€” | Deployed subscription contract |
-=======
 | `PLAN_REGISTRY_ID` | — | Deployed registry contract |
 | `VAULT_ID` | — | Deployed vault contract |
 | `SUBSCRIPTION_ID` | — | Deployed subscription contract |
 | `TOKEN_ID` | — | Default token for the flat merchant-summary amounts. Unset, they span every token |
->>>>>>> 580db6c (feat(api): merchant revenue per token)
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
 | `KEEPER_SECRET` | â€” | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | â€” | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |

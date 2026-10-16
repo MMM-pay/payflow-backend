@@ -49,6 +49,12 @@ All notable changes to payflow-backend. The format follows
   a health probe prefers the endpoint with the freshest ledger, so a reachable
   but lagging node does not hold the indexer back either. `/health` reports the
   active endpoint and the full list under `rpc`.
+- **`/api/subscribers/:address/upcoming` (#62).** Projects each active mandate's
+  charges over the next `days` (default 30, capped at 365), following the
+  contract's scheduling rule — a due mandate at `now`, a future one at its
+  `next_charge`, then every `period` — and stops at a mandate's remaining
+  `max_charges` allowance. Each entry is the gross per-charge the subscriber
+  pays, with the projected time; `truncated` flags the per-mandate cap.
 
 ### Changed
 

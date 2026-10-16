@@ -106,6 +106,24 @@ export interface SubscriberSummary {
   totalPaid: string;
 }
 
+export interface UpcomingCharge {
+  mandateId: number;
+  merchant: string;
+  amount: string;
+  at: number;
+}
+
+export interface UpcomingChargesResponse {
+  subscriber: string;
+  days: number;
+  now: number;
+  until: number;
+  upcoming: UpcomingCharge[];
+  totalUpcoming: string;
+  truncated: boolean;
+  assumptions: string[];
+}
+
 export interface StatsResponse {
   plans: number;
   mandates: number;

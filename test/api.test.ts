@@ -356,7 +356,6 @@ describe("stats volume", () => {
     assert.equal(body.volume24h, "3150000");
   });
 });
-
 describe("merchant revenue per token", () => {
   const TOKEN_A = "CTOKEN_A";
   const TOKEN_B = "CTOKEN_B";
@@ -451,5 +450,197 @@ describe("merchant revenue per token", () => {
     assert.deepEqual(body.tokens, []);
     assert.equal(body.totalCollected, "0");
     assert.equal(body.mrr, "0");
+  });
+});
+
+// Upcoming-charges fixtures hang off a single instant so the window maths is
+// stable: requests happen milliseconds later, far inside the tolerances used.
+const UP_NOW = Math.floor(Date.now() / 1000);
+
+const DUE_SUB = `GDUE${"A".repeat(52)}`;
+const FUTURE_SUB = `GFUT${"B".repeat(52)}`;
+const CAPPED_SUB = `GCAP${"C".repeat(52)}`;
+const SPENT_SUB = `GSPENT${"D".repeat(50)}`;
+const FAST_SUB = `GFAST${"E".repeat(51)}`;
+const MIXED_SUB = `GMIX${"F".repeat(52)}`;
+
+const M_DUE = `GMDUE${"M".repeat(51)}`;
+const M_FUTURE = `GMFUT${"M".repeat(51)}`;
+const M_CAPPED = `GMCAP${"M".repeat(51)}`;
+const M_SPENT = `GMSPENT${"M".repeat(49)}`;
+const M_FAST = `GMFAST${"M".repeat(50)}`;
+const M_WEEKLY = `GMWEEK${"M".repeat(50)}`;
+const M_DAILY = `GMDAIL${"M".repeat(50)}`;
+
+interface UpcomingCharge {
+  mandateId: number;
+  merchant: string;
+  amount: string;
+  at: number;
+}
+
+interface UpcomingBody {
+  subscriber: string;
+  days: number;
+  now: number;
+  until: number;
+  upcoming: UpcomingCharge[];
+  totalUpcoming: string;
+  truncated: boolean;
+  assumptions: unknown[];
+}
+
+describe("subscriber upcoming charges", () => {
+  let upServer: Server;
+  let upBase: string;
+  const upDb = openDatabase(":memory:");
+
+  before(async () => {
+    const ix = new Indexer(upDb, {} as never, {} as never);
+    const upEv = (name: string, topics: unknown[], data: Record<string, unknown>, tx: string): DecodedEvent => ({
+      name, contractId: "C", ledger: 1, txHash: tx, topics, data,
+    });
+    const sub = (id: number, subscriber: string, merchant: string, data: Record<string, unknown>): void =>
+      ix.apply(upEv("subscribed", [BigInt(id), subscriber, merchant], { plan_id: 1n, ...data }, `sub-${id}`));
+
+    // Due an hour ago: projected from now, not from the stale next_charge.
+    sub(101, DUE_SUB, M_DUE, {
+      amount: 5_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW - 3_600), max_charges: 0n, fee_bps: 0n,
+    });
+    // First charge an hour out: the anchor is exactly its next_charge.
+    sub(102, FUTURE_SUB, M_FUTURE, {
+      amount: 2_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 0n, fee_bps: 0n,
+    });
+    // One of two allowed charges already made: one remains.
+    sub(103, CAPPED_SUB, M_CAPPED, {
+      amount: 1_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 2n, fee_bps: 0n,
+    });
+    ix.apply(upEv("charged", [103n, CAPPED_SUB, M_CAPPED], {
+      amount: 1_000_000n, fee: 0n, charges_made: 1n, next_charge: BigInt(UP_NOW + 3_600),
+    }, "charge-103"));
+    // Allowance used up: nothing more will ever be charged.
+    sub(104, SPENT_SUB, M_SPENT, {
+      amount: 2_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 2n, fee_bps: 0n,
+    });
+    ix.apply(upEv("charged", [104n, SPENT_SUB, M_SPENT], {
+      amount: 2_000_000n, fee: 0n, charges_made: 2n, next_charge: BigInt(UP_NOW + 86_400),
+    }, "charge-104"));
+    // A 60s period over 30 days is 43,200 occurrences: the cap kicks in.
+    sub(105, FAST_SUB, M_FAST, {
+      amount: 1_000n, period: 60n, next_charge: BigInt(UP_NOW + 60), max_charges: 0n, fee_bps: 0n,
+    });
+    // Two mandates with different rhythms, to check the merge order.
+    sub(106, MIXED_SUB, M_WEEKLY, {
+      amount: 3_000_000n, period: 604_800n, next_charge: BigInt(UP_NOW + 100), max_charges: 0n, fee_bps: 0n,
+    });
+    sub(107, MIXED_SUB, M_DAILY, {
+      amount: 1_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 200), max_charges: 0n, fee_bps: 0n,
+    });
+
+    await new Promise<void>((resolve) => {
+      upServer = createApp(upDb, config).listen(0, () => {
+        const addr = upServer.address();
+        upBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    upServer.close();
+    upDb.close();
+  });
+
+  const upGet = async (path: string): Promise<{ status: number; body: UpcomingBody }> => {
+    const res = await fetch(upBase + path);
+    return { status: res.status, body: (await res.json()) as UpcomingBody };
+  };
+
+  test("a due mandate is projected from now, then every period", async () => {
+    const { body } = await upGet(`/api/subscribers/${DUE_SUB}/upcoming`);
+
+    assert.equal(body.subscriber, DUE_SUB);
+    assert.equal(body.days, 30);
+    assert.equal(body.until, body.now + 30 * 86_400);
+    assert.equal(body.upcoming.length, 30);
+    // The first charge is now — the keeper settles it on its next pass — not
+    // the stale next_charge, and the hour it is late produces no catch-up.
+    assert.equal(body.upcoming[0]!.mandateId, 101);
+    assert.equal(body.upcoming[0]!.merchant, M_DUE);
+    assert.equal(body.upcoming[0]!.at, body.now);
+    assert.equal(body.upcoming[1]!.at, body.now + 86_400);
+    assert.equal(body.totalUpcoming, "150000000"); // 5_000_000 × 30
+    assert.equal(body.truncated, false);
+    assert.equal(typeof body.upcoming[0]!.amount, "string");
+    assert.ok(body.assumptions.length > 0);
+  });
+
+  test("a future mandate starts at its next_charge", async () => {
+    const { body } = await upGet(`/api/subscribers/${FUTURE_SUB}/upcoming`);
+
+    assert.equal(body.upcoming.length, 30);
+    assert.equal(body.upcoming[0]!.at, UP_NOW + 3_600);
+    assert.equal(body.upcoming[1]!.at, UP_NOW + 3_600 + 86_400);
+    assert.equal(body.totalUpcoming, "60000000"); // 2_000_000 × 30
+    assert.equal(body.truncated, false);
+  });
+
+  test("a capped mandate stops at its remaining allowance", async () => {
+    const capped = await upGet(`/api/subscribers/${CAPPED_SUB}/upcoming`);
+    // One of its two charges was made, so one remains even though 30 fit.
+    assert.equal(capped.body.upcoming.length, 1);
+    assert.equal(capped.body.upcoming[0]!.at, UP_NOW + 3_600);
+    assert.equal(capped.body.totalUpcoming, "1000000");
+
+    const spent = await upGet(`/api/subscribers/${SPENT_SUB}/upcoming`);
+    assert.deepEqual(spent.body.upcoming, []);
+    assert.equal(spent.body.totalUpcoming, "0");
+  });
+
+  test("a 60s period is capped per mandate and flagged", async () => {
+    const { body } = await upGet(`/api/subscribers/${FAST_SUB}/upcoming`);
+
+    assert.equal(body.upcoming.length, 400);
+    assert.equal(body.truncated, true);
+    assert.equal(body.upcoming[0]!.at, UP_NOW + 60);
+    assert.equal(body.upcoming[399]!.at, UP_NOW + 60 + 399 * 60);
+    assert.equal(body.totalUpcoming, "400000"); // 1_000 × 400 listed
+  });
+
+  test("charges from several mandates merge in time order", async () => {
+    const { body } = await upGet(`/api/subscribers/${MIXED_SUB}/upcoming`);
+
+    assert.equal(body.upcoming.length, 35); // 5 weekly + 30 daily
+    assert.equal(body.upcoming[0]!.mandateId, 106); // weekly, +100s
+    assert.equal(body.upcoming[1]!.mandateId, 107); // daily, +200s
+    assert.equal(body.upcoming[1]!.at, UP_NOW + 200);
+    assert.equal(body.upcoming[2]!.mandateId, 107);
+    assert.equal(body.upcoming[2]!.at, UP_NOW + 200 + 86_400);
+    const ats = body.upcoming.map((c) => c.at);
+    assert.deepEqual(ats, [...ats].sort((a, b) => a - b));
+    assert.equal(body.totalUpcoming, "45000000"); // 3_000_000 × 5 + 1_000_000 × 30
+  });
+
+  test("days caps the window and malformed values fall back to 30", async () => {
+    const one = await upGet(`/api/subscribers/${DUE_SUB}/upcoming?days=1`);
+    assert.equal(one.body.days, 1);
+    assert.equal(one.body.until, one.body.now + 86_400);
+    assert.equal(one.body.upcoming.length, 1);
+    assert.equal(one.body.upcoming[0]!.at, one.body.now);
+
+    const long = await upGet(`/api/subscribers/${DUE_SUB}/upcoming?days=400`);
+    assert.equal(long.body.days, 365);
+    assert.equal(long.body.truncated, false);
+
+    const malformed = await upGet(`/api/subscribers/${DUE_SUB}/upcoming?days=nope`);
+    assert.equal(malformed.body.days, 30);
+  });
+
+  test("an unknown subscriber has nothing upcoming", async () => {
+    const { status, body } = await upGet("/api/subscribers/GNOBODY/upcoming");
+    assert.equal(status, 200);
+    assert.deepEqual(body.upcoming, []);
+    assert.equal(body.totalUpcoming, "0");
+    assert.equal(body.truncated, false);
   });
 });

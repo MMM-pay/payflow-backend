@@ -43,6 +43,8 @@ export type {
   StatsResponse,
   SubscriberSummary,
   TokenRevenue,
+  UpcomingCharge,
+  UpcomingChargesResponse,
 } from "../routes/types.ts";
 
 export interface PlansQuery {
