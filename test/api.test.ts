@@ -107,6 +107,37 @@ describe("http api", () => {
     }
   });
 
+  test("readiness passes once the projection has caught up", async () => {
+    const { status: code, body } = await get("/ready");
+    assert.equal(code, 200);
+    assert.equal(body.status, "ready");
+    assert.equal(body.lag, 10);
+  });
+
+  test("readiness fails while the indexer is catching up", async () => {
+    status.latest = 50_000;
+    try {
+      const res = await get("/ready");
+      assert.equal(res.status, 503);
+      assert.equal(res.body.status, "catching_up");
+      assert.equal(res.body.lag, 49_000);
+    } finally {
+      status.latest = 1_010;
+    }
+  });
+
+  test("readiness fails before the indexer's first pass", async () => {
+    status.latest = 0;
+    try {
+      const res = await get("/ready");
+      assert.equal(res.status, 503);
+      assert.equal(res.body.status, "starting");
+      assert.equal(res.body.lag, null);
+    } finally {
+      status.latest = 1_010;
+    }
+  });
+
   test("lists plans and filters by merchant", async () => {
     const all = await get("/api/plans");
     assert.equal((all.body.plans as unknown[]).length, 1);

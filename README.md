@@ -124,9 +124,17 @@ Secrets are never logged; rotation logs only public keys.
 Base path `/api`. All amounts are strings in the token's smallest unit
 (stroops for XLM) to avoid JavaScript float precision loss.
 
+`/health` is a **liveness** probe and always answers 200, so a slow backfill
+does not get the service restarted. `/ready` is a **readiness** probe: it
+answers 503 (`starting` until the indexer's first pass, then `catching_up`)
+while the projection trails the network by more than 120 ledgers, and 200
+`ready` once it is within that threshold. Point orchestration readiness
+checks at `/ready` and liveness checks at `/health`.
+
 | Method | Path | Returns |
 |---|---|---|
 | `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
+| `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |

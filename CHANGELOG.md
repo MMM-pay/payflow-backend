@@ -55,6 +55,10 @@ All notable changes to payflow-backend. The format follows
   `next_charge`, then every `period` — and stops at a mandate's remaining
   `max_charges` allowance. Each entry is the gross per-charge the subscriber
   pays, with the projected time; `truncated` flags the per-mandate cap.
+- **`/ready` readiness probe (#58).** Answers 503 (`starting`, then `catching_up`)
+  until the indexer's projection trails the network by no more than 120
+  ledgers, so orchestrators do not route traffic to an instance that is still
+  backfilling. `/health` stays a liveness probe answering 200.
 
 ### Changed
 

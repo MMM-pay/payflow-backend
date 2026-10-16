@@ -11,8 +11,13 @@ import type { RpcStatus } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
 import { withSpan } from "./lib/telemetry.ts";
 
-/** Ledgers the indexer may trail the network by before /health reports it. */
+/** Ledgers the indexer may trail the network by before it is considered behind. */
 const MAX_LAG = 120;
+
+/** Ledgers the projection trails the network by; null until the first pass. */
+function lagOf(indexer: IndexerStatus | undefined): number | null {
+  return indexer && indexer.latest > 0 ? Math.max(0, indexer.latest - indexer.cursor) : null;
+}
 
 export function createApp(
   db: DatabaseSync,
@@ -31,6 +36,7 @@ export function createApp(
   if (rpcParam) {
     rpc = rpcParam;
   }
+
   const app = express();
 
   app.use(
@@ -65,7 +71,7 @@ export function createApp(
   // Always 200 so a slow backfill does not get the service restarted; the
   // body says whether the projection is current.
   app.get("/health", (_req, res) => {
-    const lag = indexer && indexer.latest > 0 ? Math.max(0, indexer.latest - indexer.cursor) : null;
+    const lag = lagOf(indexer);
     const freshnessSeconds = indexer
       ? (indexer.freshnessSeconds ??
          (indexer.lastLedgerCloseTime != null
@@ -73,6 +79,7 @@ export function createApp(
            : null))
       : null;
     const body: HealthResponse = {
+
       status: lag === null ? "starting" : lag <= MAX_LAG ? "ok" : "catching_up",
       network: config.STELLAR_NETWORK,
       indexer: indexer
@@ -96,7 +103,22 @@ export function createApp(
     res.json(body);
   });
 
+  // Readiness for orchestrators: 503 until the projection trails the network
+  // by no more than the same threshold /health uses, so traffic is not sent
+  // to an instance that is still backfilling. An unknown lag (no indexer has
+  // run yet, or none is attached) is treated as not ready, since the
+  // freshness of the projection cannot be established.
+  app.get("/ready", (_req, res) => {
+    const lag = lagOf(indexer);
+    const ready = lag !== null && lag <= MAX_LAG;
+    res.status(ready ? 200 : 503).json({
+      status: ready ? "ready" : lag === null ? "starting" : "catching_up",
+      lag,
+    });
+  });
+
   app.use("/api", buildRoutes(db, merchantCache, config.TOKEN_ID));
+
 
   app.use((_req, res) => {
     res.status(404).json({ error: "not_found" });
