@@ -14,7 +14,7 @@ const db = openDatabase(config.DATABASE_PATH);
 const server = makeRpc(config);
 
 const indexer = new Indexer(db, server, config);
-const app = createApp(db, config, indexer.status);
+const app = createApp(db, config, indexer.status, indexer.merchantCache);
 const http = app.listen(config.PORT, () => {
   logger.info({ port: config.PORT, network: config.STELLAR_NETWORK }, "api listening");
 });

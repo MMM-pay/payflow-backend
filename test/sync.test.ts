@@ -41,6 +41,7 @@ function rawEvent(ledger: number, planId: number): rpc.Api.EventResponse {
 interface FakeChain {
   latest: number;
   oldest: number;
+  closeTime?: string | number;
   events: rpc.Api.EventResponse[];
   calls: Array<Record<string, unknown>>;
 }
@@ -52,7 +53,7 @@ interface FakeChain {
  */
 function fakeRpc(chain: FakeChain, pageSize = 200): IndexerRpc {
   return {
-    getLatestLedger: async () => ({ sequence: chain.latest }) as never,
+    getLatestLedger: async () => ({ sequence: chain.latest, closeTime: chain.closeTime }) as never,
     getHealth: async () => ({ oldestLedger: chain.oldest, latestLedger: chain.latest }) as never,
     getEvents: async (req: Record<string, unknown>) => {
       chain.calls.push(req);
@@ -245,6 +246,25 @@ describe("indexer sync", () => {
     writeCursor(db, 100);
     await ix.tick();
     assert.deepEqual(plans(db), [1]);
+  });
+
+  test("tracks last ledger close time and reports freshnessSeconds with fake RPC", async () => {
+    const db = openDatabase(":memory:");
+    const nowSec = Math.floor(Date.now() / 1000);
+    const closeTime = String(nowSec - 15);
+    const chain: FakeChain = {
+      latest: 1_100,
+      oldest: 500,
+      closeTime,
+      events: [rawEvent(1_050, 1)],
+      calls: [],
+    };
+    const ix = new Indexer(db, fakeRpc(chain), { ...config, INDEXER_START_LEDGER: 1_000 });
+
+    const r = await ix.tick();
+    assert.equal(r.cursor, 1_100);
+    assert.equal(ix.status.lastLedgerCloseTime, nowSec - 15);
+    assert.ok(ix.status.freshnessSeconds !== null && ix.status.freshnessSeconds >= 15);
   });
 });
 

@@ -3,12 +3,70 @@ import type { DatabaseSync } from "node:sqlite";
 import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "./helpers.ts";
 import type { MerchantSummary } from "./types.ts";
 
+/**
+ * Bounded LRU in-memory cache for merchant summaries.
+ * Keeps memory bounded under high merchant concurrency while allowing
+ * instant invalidation when the indexer applies an event for a merchant.
+ */
+export class MerchantSummaryCache {
+  private readonly max: number;
+  private readonly map = new Map<string, MerchantSummary>();
+
+  constructor(max = 1_000) {
+    this.max = max;
+  }
+
+  get(merchant: string): MerchantSummary | undefined {
+    const entry = this.map.get(merchant);
+    if (entry !== undefined) {
+      this.map.delete(merchant);
+      this.map.set(merchant, entry);
+    }
+    return entry;
+  }
+
+  set(merchant: string, summary: MerchantSummary): void {
+    if (this.map.has(merchant)) {
+      this.map.delete(merchant);
+    } else if (this.map.size >= this.max) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) {
+        this.map.delete(oldest);
+      }
+    }
+    this.map.set(merchant, summary);
+  }
+
+  invalidate(merchant: string): void {
+    this.map.delete(merchant);
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+}
+
+export const defaultMerchantSummaryCache = new MerchantSummaryCache();
+
 /** `GET /merchants/:address/summary`. */
-export function merchantsRouter(db: DatabaseSync): Router {
+export function merchantsRouter(
+  db: DatabaseSync,
+  cache: MerchantSummaryCache = defaultMerchantSummaryCache,
+): Router {
   const r = Router();
 
   r.get("/merchants/:address/summary", (req, res) => {
     const address = String(req.params.address);
+    const cached = cache.get(address);
+    if (cached !== undefined) {
+      res.json(cached);
+      return;
+    }
+
     const active = db
       .prepare(
         "SELECT COUNT(*) AS n FROM mandates WHERE merchant = ? AND status = 'Active'",
@@ -41,6 +99,7 @@ export function merchantsRouter(db: DatabaseSync): Router {
       mrr: String(recurring.mrr),
       arr: String(recurring.arr),
     };
+    cache.set(address, body);
     res.json(body);
   });
 

@@ -116,6 +116,7 @@ export interface HealthResponse {
     cursor: number;
     latestLedger: number;
     lag: number | null;
+    freshnessSeconds: number | null;
     lastRunAt: string | null;
     lastError: string | null;
     /** Contract events that failed spec validation since process start. */

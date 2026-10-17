@@ -6,6 +6,8 @@ import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
 import type { Config } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
+import { MerchantSummaryCache } from "../src/routes/index.ts";
+import type { MerchantSummary } from "../src/routes/types.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
@@ -21,15 +23,24 @@ const config = {
 } as unknown as Config;
 
 let server: Server;
-const status = { cursor: 1_000, latest: 1_010, lastRunAt: Date.now(), lastError: null };
+let ix: Indexer;
+const status = {
+  cursor: 1_000,
+  latest: 1_010,
+  lastRunAt: Date.now(),
+  lastError: null,
+  lastLedgerCloseTime: 1_700_000_000,
+  freshnessSeconds: 42,
+};
 let base: string;
 const db = openDatabase(":memory:");
 
+const ev = (name: string, topics: unknown[], data: Record<string, unknown>, tx = "t"): DecodedEvent => ({
+  name, contractId: "C", ledger: 1, txHash: tx, topics, data,
+});
+
 before(async () => {
-  const ix = new Indexer(db, {} as never, {} as never);
-  const ev = (name: string, topics: unknown[], data: Record<string, unknown>, tx = "t"): DecodedEvent => ({
-    name, contractId: "C", ledger: 1, txHash: tx, topics, data,
-  });
+  ix = new Indexer(db, {} as never, {} as never);
 
   ix.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
   ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
@@ -45,7 +56,7 @@ before(async () => {
     plan_id: 1n, amount: 120_000_000n, period: 31_536_000n, next_charge: 4_000_000_000n,
   }, "tx2"));
 
-  const app = createApp(db, config, status);
+  const app = createApp(db, config, status, ix.merchantCache);
   await new Promise<void>((resolve) => {
     server = app.listen(0, () => {
       const addr = server.address();
@@ -77,6 +88,12 @@ describe("http api", () => {
     const ix = body.indexer as unknown as { cursor: number; lag: number };
     assert.equal(ix.cursor, 1_000);
     assert.equal(ix.lag, 10);
+  });
+
+  test("health reports freshnessSeconds", async () => {
+    const { body } = await get("/health");
+    const ixStatus = body.indexer as unknown as { freshnessSeconds: number };
+    assert.equal(ixStatus.freshnessSeconds, 42);
   });
 
   test("health says catching_up while far behind, but stays 200", async () => {
@@ -181,5 +198,71 @@ describe("http api", () => {
     assert.ok(missing.headers.get("x-request-id"));
     const echoed = await fetch(`${base}/health`, { headers: { "X-Request-Id": "abc-123" } });
     assert.equal(echoed.headers.get("x-request-id"), "abc-123");
+  });
+});
+
+describe("merchant summary caching", () => {
+  test("invalidates after a new charge", async () => {
+    const memDb = openDatabase(":memory:");
+    const cache = new MerchantSummaryCache();
+    const indexer = new Indexer(memDb, {} as never, {} as never, cache);
+    indexer.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
+    indexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
+    }));
+    indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "tx1"));
+
+    const app = createApp(memDb, config, status, cache);
+    const testServer = app.listen(0);
+    const addr = testServer.address();
+    const testBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+
+    try {
+      const firstRes = await fetch(`${testBase}/api/merchants/${MERCHANT}/summary`);
+      const first = (await firstRes.json()) as MerchantSummary;
+      assert.equal(first.chargeCount, 1);
+      assert.equal(first.totalCollected, "9900000");
+
+      // Apply a second charge
+      indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+        amount: 5_000_000n, fee: 50_000n, charges_made: 2n, next_charge: 5_000_000_000n,
+      }, "tx2"));
+
+      const secondRes = await fetch(`${testBase}/api/merchants/${MERCHANT}/summary`);
+      const second = (await secondRes.json()) as MerchantSummary;
+      assert.equal(second.chargeCount, 2);
+      assert.equal(second.totalCollected, "14900000");
+    } finally {
+      testServer.close();
+      memDb.close();
+    }
+  });
+
+  test("memory is bounded by evicting oldest entries", () => {
+    const cache = new MerchantSummaryCache(2);
+    const mockSummary = (m: string): MerchantSummary => ({
+      merchant: m,
+      activeMandates: 1,
+      totalCollected: "100",
+      chargeCount: 1,
+      mrr: "10",
+      arr: "120",
+    });
+
+    cache.set("m1", mockSummary("m1"));
+    cache.set("m2", mockSummary("m2"));
+    assert.equal(cache.size, 2);
+
+    // Access m1 so m2 is the least recently used
+    assert.equal(cache.get("m1")?.merchant, "m1");
+
+    // Inserting 3rd entry evicts m2
+    cache.set("m3", mockSummary("m3"));
+    assert.equal(cache.size, 2);
+    assert.equal(cache.get("m1")?.merchant, "m1");
+    assert.equal(cache.get("m2"), undefined);
+    assert.equal(cache.get("m3")?.merchant, "m3");
   });
 });

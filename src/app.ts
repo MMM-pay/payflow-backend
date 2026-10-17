@@ -5,7 +5,7 @@ import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Config } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
-import { buildRoutes } from "./routes/index.ts";
+import { buildRoutes, type MerchantSummaryCache } from "./routes/index.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import { logger } from "./lib/logger.ts";
 import { withSpan } from "./lib/telemetry.ts";
@@ -13,7 +13,12 @@ import { withSpan } from "./lib/telemetry.ts";
 /** Ledgers the indexer may trail the network by before /health reports it. */
 const MAX_LAG = 120;
 
-export function createApp(db: DatabaseSync, config: Config, indexer?: IndexerStatus): Express {
+export function createApp(
+  db: DatabaseSync,
+  config: Config,
+  indexer?: IndexerStatus,
+  merchantCache?: MerchantSummaryCache,
+): Express {
   const app = express();
 
   app.use(
@@ -43,6 +48,12 @@ export function createApp(db: DatabaseSync, config: Config, indexer?: IndexerSta
   // body says whether the projection is current.
   app.get("/health", (_req, res) => {
     const lag = indexer && indexer.latest > 0 ? Math.max(0, indexer.latest - indexer.cursor) : null;
+    const freshnessSeconds = indexer
+      ? (indexer.freshnessSeconds ??
+         (indexer.lastLedgerCloseTime != null
+           ? Math.max(0, Math.floor(Date.now() / 1000) - indexer.lastLedgerCloseTime)
+           : null))
+      : null;
     const body: HealthResponse = {
       status: lag === null ? "starting" : lag <= MAX_LAG ? "ok" : "catching_up",
       network: config.STELLAR_NETWORK,
@@ -51,6 +62,7 @@ export function createApp(db: DatabaseSync, config: Config, indexer?: IndexerSta
             cursor: indexer.cursor,
             latestLedger: indexer.latest,
             lag,
+            freshnessSeconds,
             lastRunAt: indexer.lastRunAt ? new Date(indexer.lastRunAt).toISOString() : null,
             lastError: indexer.lastError,
             mismatchedEvents: indexer.mismatchedEvents ?? 0,
@@ -65,7 +77,7 @@ export function createApp(db: DatabaseSync, config: Config, indexer?: IndexerSta
     res.json(body);
   });
 
-  app.use("/api", buildRoutes(db));
+  app.use("/api", buildRoutes(db, merchantCache));
 
   app.use((_req, res) => {
     res.status(404).json({ error: "not_found" });

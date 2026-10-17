@@ -1,10 +1,16 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
 import { mandatesRouter } from "./mandates.ts";
-import { merchantsRouter } from "./merchants.ts";
+import {
+  defaultMerchantSummaryCache,
+  merchantsRouter,
+  MerchantSummaryCache,
+} from "./merchants.ts";
 import { plansRouter } from "./plans.ts";
 import { statsRouter } from "./stats.ts";
 import { subscribersRouter } from "./subscribers.ts";
+
+export { defaultMerchantSummaryCache, MerchantSummaryCache };
 
 /**
  * One router per resource: `plans.ts`, `mandates.ts`, `merchants.ts`,
@@ -17,11 +23,14 @@ import { subscribersRouter } from "./subscribers.ts";
  * handlers annotate their bodies with them and the typed client
  * (`src/client/index.ts`) re-exports them, so types are shared, not copied.
  */
-export function buildRoutes(db: DatabaseSync): Router {
+export function buildRoutes(
+  db: DatabaseSync,
+  summaryCache: MerchantSummaryCache = defaultMerchantSummaryCache,
+): Router {
   const r = Router();
   r.use(plansRouter(db));
   r.use(mandatesRouter(db));
-  r.use(merchantsRouter(db));
+  r.use(merchantsRouter(db, summaryCache));
   r.use(subscribersRouter(db));
   r.use(statsRouter(db));
   return r;

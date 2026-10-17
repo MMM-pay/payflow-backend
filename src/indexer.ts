@@ -11,6 +11,24 @@ import {
   type DecodedEvent,
 } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
+import { defaultMerchantSummaryCache, type MerchantSummaryCache } from "./routes/index.ts";
+
+/** Helper to parse a ledger close time into unix epoch seconds. */
+export function parseCloseTime(raw: unknown): number | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === "number") {
+    return raw > 1e11 ? Math.floor(raw / 1000) : raw;
+  }
+  if (typeof raw === "string") {
+    const asNum = Number(raw);
+    if (!Number.isNaN(asNum) && asNum > 0) {
+      return asNum > 1e11 ? Math.floor(asNum / 1000) : asNum;
+    }
+    const parsed = Date.parse(raw);
+    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
+  }
+  return null;
+}
 
 /** RPC caps a single getEvents window; stay well inside it. */
 const LEDGER_WINDOW = 8_000;
@@ -45,28 +63,45 @@ export interface IndexerStatus {
    * silently missing data — check the warn logs for which events.
    */
   mismatchedEvents?: number;
+  /**
+   * Close time of the last indexed ledger (unix timestamp in seconds).
+   */
+  lastLedgerCloseTime?: number | null;
+  /**
+   * Data freshness in seconds (seconds elapsed since the last indexed ledger closed).
+   */
+  freshnessSeconds?: number | null;
 }
 
 export class Indexer {
   private readonly db: DatabaseSync;
   private readonly server: IndexerRpc;
   private readonly config: Config;
+  readonly merchantCache: MerchantSummaryCache;
   readonly status: IndexerStatus = {
     cursor: 0,
     latest: 0,
     lastRunAt: null,
     lastError: null,
     mismatchedEvents: 0,
+    lastLedgerCloseTime: null,
+    freshnessSeconds: null,
   };
   /** Events since process start that failed spec validation. */
   get mismatchedEvents(): number {
     return this.status.mismatchedEvents ?? 0;
   }
 
-  constructor(db: DatabaseSync, server: IndexerRpc, config: Config) {
+  constructor(
+    db: DatabaseSync,
+    server: IndexerRpc,
+    config: Config,
+    merchantCache: MerchantSummaryCache = defaultMerchantSummaryCache,
+  ) {
     this.db = db;
     this.server = server;
     this.config = config;
+    this.merchantCache = merchantCache;
   }
 
   private contractIds(): string[] {
@@ -140,13 +175,48 @@ export class Indexer {
    * replays that range on restart; every apply path is idempotent so that is
    * safe.
    */
+  private updateFreshness(
+    latestCloseTime: number | null,
+    eventCloseTime: number | null,
+    cursor: number,
+    latest: number,
+  ): void {
+    if (cursor >= latest && latestCloseTime !== null) {
+      this.status.lastLedgerCloseTime = latestCloseTime;
+    } else if (eventCloseTime !== null) {
+      this.status.lastLedgerCloseTime = eventCloseTime;
+    } else if (latestCloseTime !== null) {
+      this.status.lastLedgerCloseTime = Math.max(0, latestCloseTime - (latest - cursor) * 5);
+    }
+
+    if (this.status.lastLedgerCloseTime != null) {
+      this.status.freshnessSeconds = Math.max(
+        0,
+        Math.floor(Date.now() / 1000) - this.status.lastLedgerCloseTime,
+      );
+    }
+  }
+
+  /**
+   * Index ledgers [cursor, min(cursor + LEDGER_WINDOW * concurrency, latest)).
+   *
+   * Up to `INDEXER_FETCH_CONCURRENCY` windows are fetched in parallel, but
+   * their events are applied in ledger order and the cursor only advances after
+   * a window has been applied. If a fetch fails, windows already applied keep
+   * their cursor and the next pass resumes at the failed one. A crash mid-range
+   * replays that range on restart; every apply path is idempotent so that is
+   * safe.
+   */
   async tick(): Promise<TickResult> {
-    const latest = (await this.server.getLatestLedger()).sequence;
+    const latestRes = await this.server.getLatestLedger();
+    const latest = latestRes.sequence;
+    const latestCloseTime = parseCloseTime((latestRes as { closeTime?: unknown }).closeTime);
     const start = await this.firstLedger(readCursor(this.db, 0));
 
     this.status.latest = latest;
     if (start > latest) {
       this.status.cursor = start;
+      this.updateFreshness(latestCloseTime, null, start, latest);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -155,6 +225,7 @@ export class Indexer {
     const end = Math.min(start + LEDGER_WINDOW, latest);
     if (end <= start) {
       this.status.cursor = start;
+      this.updateFreshness(latestCloseTime, null, start, latest);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -174,6 +245,7 @@ export class Indexer {
     let mismatched = 0;
     let cursor = start;
     let failure: unknown;
+    let lastSeenCloseTime: number | null = null;
 
     for (let i = 0; i < windows.length; i += 1) {
       const result = fetched[i]!;
@@ -182,6 +254,8 @@ export class Indexer {
         break;
       }
       for (const raw of result.value) {
+        const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
+        if (ct !== null) lastSeenCloseTime = ct;
         const decoded = decodeEvent(raw);
         if (!decoded) continue;
         if (this.apply(decoded) !== "mismatched") applied += 1;
@@ -194,6 +268,7 @@ export class Indexer {
     }
 
     this.status.cursor = cursor;
+    this.updateFreshness(latestCloseTime, lastSeenCloseTime, cursor, latest);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
   }
@@ -274,6 +349,7 @@ export class Indexer {
 
   private onPlanCreated(e: DecodedEvent): void {
     const [merchant, planId] = e.topics;
+    this.merchantCache.invalidate(str(merchant));
     this.db
       .prepare(
         `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
@@ -303,6 +379,7 @@ export class Indexer {
 
   private onSubscribed(e: DecodedEvent): void {
     const [mandateId, subscriber, merchant] = e.topics;
+    this.merchantCache.invalidate(str(merchant));
     this.db
       .prepare(
         `INSERT INTO mandates
@@ -332,6 +409,7 @@ export class Indexer {
   private onCharged(e: DecodedEvent): void {
     const [mandateId, subscriber, merchant] = e.topics;
     const id = num(mandateId);
+    this.merchantCache.invalidate(str(merchant));
 
     this.db
       .prepare(
@@ -377,19 +455,29 @@ export class Indexer {
   /** `endedBy` records which side cancelled; completion leaves it null. */
   private onStatus(e: DecodedEvent, status: string, endedBy: string | null = null): void {
     const [mandateId] = e.topics;
+    const mid = num(mandateId);
+    const row = this.db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(mid) as
+      | { merchant: string }
+      | undefined;
+    if (row) this.merchantCache.invalidate(row.merchant);
     this.db
       .prepare("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?")
-      .run(status, endedBy, num(mandateId));
+      .run(status, endedBy, mid);
   }
 
   private onPauseChanged(e: DecodedEvent): void {
     const [mandateId] = e.topics;
+    const mid = num(mandateId);
+    const row = this.db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(mid) as
+      | { merchant: string }
+      | undefined;
+    if (row) this.merchantCache.invalidate(row.merchant);
     this.db
       .prepare(
         `UPDATE mandates SET status = ?
           WHERE id = ? AND status IN ('Active','Paused')`,
       )
-      .run(e.data.paused ? "Paused" : "Active", num(mandateId));
+      .run(e.data.paused ? "Paused" : "Active", mid);
   }
 
   private onVaultEvent(e: DecodedEvent): void {

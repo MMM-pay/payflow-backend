@@ -1,4 +1,4 @@
-<h1 align="center">Payflow — Backend</h1>
+<h1 align="center">Payflow â€” Backend</h1>
 
 <p align="center">
   <strong>Event indexer, settlement keeper, and read API for the Payflow protocol.</strong>
@@ -13,8 +13,10 @@
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-green"/>
 </p>
 
-> **Live demo:** https://mmm-pay.github.io/payflow-frontend/ ·
-> **Docs:** https://mmm-pay.github.io/payflow-docs/
+> **Live demo:** https://mmm-pay.github.io/payflow-frontend/ Â·
+> **Docs:** https://mmm-pay.github.io/payflow-docs/ ·
+> **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
+> **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md)
 
 ---
 
@@ -33,7 +35,7 @@ what this service is for. It does three jobs:
 ### The keeper is not a trust dependency
 
 `charge` is permissionless on-chain. This keeper holds no user funds and has no
-privileged role — it only pays the transaction fee to trigger settlement. If it
+privileged role â€” it only pays the transaction fee to trigger settlement. If it
 stops running, merchants and subscribers can settle their own mandates directly.
 Nothing is lost but timeliness.
 
@@ -97,7 +99,7 @@ npm run keeper
 
 ### Rotating the keeper key without downtime
 
-`charge` is permissionless, so the keeper key is only a fee payer — but losing
+`charge` is permissionless, so the keeper key is only a fee payer â€” but losing
 it used to mean an outage until someone edited the config and restarted. It no
 longer does:
 
@@ -110,7 +112,7 @@ longer does:
    retired` names both public keys.
 3. Promote the standby: make it `KEEPER_SECRET`, drop `KEEPER_SECRET_NEXT`,
    and send the process `SIGHUP` (`kill -HUP <pid>`). Node re-reads `.env`,
-   the config is re-validated and the running keeper swaps its signing keys —
+   the config is re-validated and the running keeper swaps its signing keys â€”
    no restart, and the next successful pass confirms the old key can be
    retired. A leaked key can be abandoned mid-pass the same way; nothing is
    lost but a few seconds of timeliness.
@@ -124,7 +126,7 @@ Base path `/api`. All amounts are strings in the token's smallest unit
 
 | Method | Path | Returns |
 |---|---|---|
-| `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag and spec-mismatch count, contract IDs |
+| `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
@@ -158,8 +160,8 @@ curl localhost:8080/api/merchants/GB343X.../summary
 (2,592,000 s) and a 365-day year (31,536,000 s) respectively:
 
 ```
-mrr = sum(amount × 2592000 / period)   over active mandates
-arr = sum(amount × 31536000 / period)  over active mandates
+mrr = sum(amount Ã— 2592000 / period)   over active mandates
+arr = sum(amount Ã— 31536000 / period)  over active mandates
 ```
 
 A yearly plan of 120,000000 stroops therefore reports `arr` of 120000000 and
@@ -171,7 +173,7 @@ that is arithmetic, not a bug.
 Response shapes are declared once, in `src/routes/types.ts`. The route
 handlers annotate their bodies with those types, one router per resource
 lives in `src/routes/*.ts`, and the client in `src/client/index.ts`
-re-exports the same declarations — types are shared, not copied, so backend
+re-exports the same declarations â€” types are shared, not copied, so backend
 and frontend cannot drift.
 
 ```ts
@@ -199,12 +201,12 @@ registry is a release-time step for maintainers.
 |---|---|---|
 | `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` | RPC endpoint |
 | `NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` | Network id |
-| `PLAN_REGISTRY_ID` | — | Deployed registry contract |
-| `VAULT_ID` | — | Deployed vault contract |
-| `SUBSCRIPTION_ID` | — | Deployed subscription contract |
+| `PLAN_REGISTRY_ID` | â€” | Deployed registry contract |
+| `VAULT_ID` | â€” | Deployed vault contract |
+| `SUBSCRIPTION_ID` | â€” | Deployed subscription contract |
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
-| `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
-| `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
+| `KEEPER_SECRET` | â€” | `S...` key that pays settlement fees. Required when the keeper is on |
+| `KEEPER_SECRET_NEXT` | â€” | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
@@ -212,7 +214,7 @@ registry is a release-time step for maintainers.
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
 | `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | � | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
 
 Setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports OpenTelemetry spans for every
