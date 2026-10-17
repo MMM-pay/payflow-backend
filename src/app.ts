@@ -7,6 +7,7 @@ import type { Config } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
 import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
 import { buildRoutes, MerchantSummaryCache } from "./routes/index.ts";
+import { asReader, TokenMetadataService } from "./lib/tokens.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
@@ -24,24 +25,39 @@ export function createApp(
   db: DatabaseSync,
   config: Config,
   indexer?: IndexerStatus,
-  arg3?: MerchantSummaryCache | RpcStatus | AdminHooks,
-  arg4?: RpcStatus | AdminHooks,
-  arg5?: AdminHooks,
+  arg3?: MerchantSummaryCache | RpcStatus | AdminHooks | TokenMetadataService,
+  arg4?: RpcStatus | AdminHooks | TokenMetadataService,
+  arg5?: AdminHooks | TokenMetadataService,
+  arg6?: TokenMetadataService,
 ): Express {
   let merchantCache: MerchantSummaryCache | undefined;
   let rpc: RpcStatus | undefined;
   let admin: AdminHooks | undefined;
+  let tokens: TokenMetadataService | undefined;
 
-  for (const arg of [arg3, arg4, arg5]) {
+  // The collaborators are optional and positional, so each one is identified
+  // by its type instead of by the slot it was passed in.
+  for (const arg of [arg3, arg4, arg5, arg6]) {
     if (!arg) continue;
     if (arg instanceof MerchantSummaryCache) {
       merchantCache = arg;
+    } else if (arg instanceof TokenMetadataService) {
+      tokens = arg;
     } else if ("active" in arg && Array.isArray((arg as RpcStatus).endpoints)) {
       rpc = arg as RpcStatus;
     } else if (typeof arg === "object") {
       admin = arg as AdminHooks;
     }
   }
+
+  // Default to a reader that reports every non-native token as unavailable, so
+  // a service started without an RPC url never reaches the network from a
+  // request handler. Native XLM still resolves from the passphrase alone.
+  const tokenService: TokenMetadataService =
+    tokens ??
+    new TokenMetadataService(asReader(undefined), {
+      networkPassphrase: config.NETWORK_PASSPHRASE,
+    });
 
   const app = express();
 
@@ -129,8 +145,7 @@ export function createApp(
     app.use("/admin", buildAdminRoutes(config.ADMIN_TOKEN, admin));
   }
 
-  app.use("/api", buildRoutes(db, merchantCache, config.TOKEN_ID));
-
+  app.use("/api", buildRoutes(db, tokenService, merchantCache, config.TOKEN_ID));
 
   app.use((_req, res) => {
     res.status(404).json({ error: "not_found" });

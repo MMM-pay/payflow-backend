@@ -70,7 +70,9 @@ const schema = z.object({
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),
-  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
+  // zod 4 moved URL validation from `z.string().url()` to the top-level
+  // `z.url()` format validator, which validates through the WHATWG URL parser.
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
 
   ADMIN_TOKEN: z.string().optional(),

@@ -1,13 +1,21 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
-import { limitOf } from "./helpers.ts";
+import type { TokenMetadataService } from "../lib/tokens.ts";
+import { limitOf, tokenFields } from "./helpers.ts";
 import type { PlanPage, PlanRow } from "./types.ts";
 
-/** `GET /plans` and `GET /plans/:id`. */
-export function plansRouter(db: DatabaseSync): Router {
+/**
+ * `GET /plans` and `GET /plans/:id`.
+ *
+ * Each row's amount is in its token's smallest unit, so the response carries
+ * the token's `symbol` and `decimals` alongside it (resolved from the token
+ * contract, cached). When the contract cannot be read those are `null` and the
+ * amount stays a string — the endpoint never fails just because RPC is down.
+ */
+export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Router {
   const r = Router();
 
-  r.get("/plans", (req, res) => {
+  r.get("/plans", async (req, res) => {
     const { merchant } = req.query;
     const rows = merchant
       ? db
@@ -16,11 +24,17 @@ export function plansRouter(db: DatabaseSync): Router {
       : db
           .prepare("SELECT * FROM plans ORDER BY id DESC LIMIT ?")
           .all(limitOf(req.query.limit));
-    const body: PlanPage = { plans: rows as unknown as PlanRow[] };
+    const plans = await Promise.all(
+      (rows as unknown as PlanRow[]).map(async (row) => ({
+        ...row,
+        ...(await tokenFields(tokens, row.token)),
+      })),
+    );
+    const body: PlanPage = { plans };
     res.json(body);
   });
 
-  r.get("/plans/:id", (req, res) => {
+  r.get("/plans/:id", async (req, res) => {
     const row = db
       .prepare("SELECT * FROM plans WHERE id = ?")
       .get(Number(req.params.id)) as unknown as PlanRow | undefined;
@@ -28,7 +42,7 @@ export function plansRouter(db: DatabaseSync): Router {
       res.status(404).json({ error: "plan_not_found" });
       return;
     }
-    res.json(row);
+    res.json({ ...row, ...(await tokenFields(tokens, row.token)) });
   });
 
   return r;

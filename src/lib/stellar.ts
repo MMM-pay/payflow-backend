@@ -15,6 +15,8 @@ export type RpcLike = Pick<
   | "prepareTransaction"
   | "sendTransaction"
   | "getTransaction"
+  /** Read-only contract calls; token metadata (symbol/name/decimals) uses them. */
+  | "simulateTransaction"
 >;
 
 /** Where failover currently stands; reported by /health. */
@@ -165,6 +167,17 @@ export class FailoverRpc implements RpcStatus {
 
   async getTransaction(hash: string): Promise<rpc.Api.GetTransactionResponse> {
     return this.run("getTransaction", (server) => server.getTransaction(hash));
+  }
+
+  /**
+   * Simulations are read-only, so they are failed over exactly like the other
+   * calls: one dead provider must not make a token's metadata unreadable,
+   * which is what `lib/tokens.ts` reads symbol/name/decimals through.
+   */
+  async simulateTransaction(
+    tx: Transaction | FeeBumpTransaction,
+  ): Promise<rpc.Api.SimulateTransactionResponse> {
+    return this.run("simulateTransaction", (server) => server.simulateTransaction(tx));
   }
 }
 

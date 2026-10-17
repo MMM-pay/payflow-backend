@@ -9,7 +9,35 @@
  * XLM); they are never JS numbers.
  */
 
-export interface PlanRow {
+/**
+ * What a token contract id means. `decimals` says how to scale an amount, and
+ * `symbol` is what to label it with; without them an amount of a 6-decimal
+ * token is displayed as if it were stroops.
+ *
+ * Native XLM is reported as XLM/7 without reading the chain, because the
+ * network's own asset contract returns `native` as its symbol.
+ */
+export interface TokenMetadata {
+  /** Contract id of the token, as stored in the projection. */
+  token: string;
+  symbol: string;
+  name: string;
+  /** Digits after the decimal point; 7 for XLM's stroops. */
+  decimals: number;
+}
+
+/**
+ * Token metadata joined onto a row's amounts. `null` means the token contract
+ * could not be read (RPC unreachable, or the token is not an SAC); the amount
+ * stays a string in the token's smallest unit either way, so a consumer must
+ * not scale it when these are null.
+ */
+export interface TokenFields {
+  tokenSymbol?: string | null;
+  decimals?: number | null;
+}
+
+export interface PlanRow extends TokenFields {
   id: number;
   merchant: string;
   name: string;
@@ -21,7 +49,7 @@ export interface PlanRow {
   ledger: number;
 }
 
-export interface MandateRow {
+export interface MandateRow extends TokenFields {
   id: number;
   subscriber: string;
   merchant: string;

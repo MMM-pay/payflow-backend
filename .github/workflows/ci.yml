@@ -34,13 +34,19 @@ jobs:
       - run: npm run typecheck
 
   test:
-    name: test
+    name: test (node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is the current LTS the service runs on; 24 is the next LTS, so CI
+        # finds upgrade breakage before a deployment does (node:sqlite needs 22.5+).
+        node-version: ["22", "24"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
       - run: npm test

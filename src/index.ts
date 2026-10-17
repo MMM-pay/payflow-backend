@@ -1,6 +1,7 @@
 import { loadConfig } from "./config.ts";
 import { openDatabase } from "./lib/db.ts";
 import { makeRpc } from "./lib/stellar.ts";
+import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
 import { createApp } from "./app.ts";
 import { Indexer } from "./indexer.ts";
 import { Keeper } from "./keeper.ts";
@@ -13,6 +14,13 @@ const config = loadConfig();
 const stopTelemetry = initTelemetry(config.OTEL_EXPORTER_OTLP_ENDPOINT);
 const db = openDatabase(config.DATABASE_PATH);
 const server = makeRpc(config);
+
+// Token metadata is read from the token contract itself through the same RPC
+// server the indexer uses, cached by contract id (see lib/tokens.ts).
+const tokens = new TokenMetadataService(
+  makeSimulationReader(server, config.NETWORK_PASSPHRASE),
+  { networkPassphrase: config.NETWORK_PASSPHRASE },
+);
 
 const indexer = new Indexer(db, server, config);
 const keeper = config.KEEPER_ENABLED ? new Keeper(db, server, config) : undefined;
@@ -61,7 +69,15 @@ if (keeper && runKeeperPass) {
   adminHooks.keeperBackoff = () => keeper.backoffList();
 }
 
-const app = createApp(db, config, indexer.status, indexer.merchantCache, server, adminHooks);
+const app = createApp(
+  db,
+  config,
+  indexer.status,
+  indexer.merchantCache,
+  server,
+  adminHooks,
+  tokens,
+);
 const http = app.listen(config.PORT, () => {
   logger.info({ port: config.PORT, network: config.STELLAR_NETWORK }, "api listening");
 });
