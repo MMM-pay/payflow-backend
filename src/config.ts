@@ -46,6 +46,12 @@ const schema = z.object({
    */
   KEEPER_SECRET_NEXT: z.string().optional(),
   KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  /**
+   * Which due mandate to settle first: `oldest` (due date ascending, the
+   * historical behaviour) or `largest` (amount descending, to prioritise
+   * high-value mandates under a fee budget).
+   */
+  KEEPER_ORDER: z.enum(["oldest", "largest"]).default("oldest"),
   KEEPER_ENABLED: z
     .string()
     .default("false")

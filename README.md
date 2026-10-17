@@ -223,6 +223,7 @@ inflate them; without one they keep their previous all-token meaning.
 | `KEEPER_SECRET` | â€” | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | â€” | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
+| `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |

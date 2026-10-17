@@ -58,3 +58,19 @@ describe("soroban rpc endpoints", () => {
     assert.throws(() => loadConfig({ ...BASE, SOROBAN_RPC_URL: " , " }), /SOROBAN_RPC_URL/);
   });
 });
+
+describe("keeper order", () => {
+  test("KEEPER_ORDER defaults to oldest, today's settled behaviour", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_ORDER, "oldest");
+  });
+
+  test("KEEPER_ORDER accepts oldest and largest", () => {
+    assert.equal(loadConfig({ ...BASE, KEEPER_ORDER: "oldest" }).KEEPER_ORDER, "oldest");
+    assert.equal(loadConfig({ ...BASE, KEEPER_ORDER: "largest" }).KEEPER_ORDER, "largest");
+  });
+
+  test("KEEPER_ORDER rejects anything else", () => {
+    assert.throws(() => loadConfig({ ...BASE, KEEPER_ORDER: "newest" }), /KEEPER_ORDER/);
+    assert.throws(() => loadConfig({ ...BASE, KEEPER_ORDER: "" }), /KEEPER_ORDER/);
+  });
+});

@@ -15,6 +15,8 @@ export interface DueMandate {
   subscriber: string;
   merchant: string;
   next_charge: number;
+  /** Decimal string in the token's smallest unit; never a JS number. */
+  amount: string;
 }
 
 /** The RPC calls the keeper makes. Narrow so tests can supply a fake. */
@@ -141,8 +143,10 @@ export class Keeper {
   }
 
   /**
-   * Mandates the indexer believes are chargeable right now, oldest first,
-   * skipping any that are backing off after a failed charge.
+   * Mandates the indexer believes are chargeable right now, in the order set
+   * by `KEEPER_ORDER` (`oldest` = oldest-due first, the default; `largest` =
+   * largest amount first), skipping any that are backing off after a failed
+   * charge.
    */
   findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): DueMandate[] {
     const due: DueMandate[] = [];
@@ -157,9 +161,10 @@ export class Keeper {
   }
 
   private queryDue(now: number, limit: number): DueMandate[] {
+    if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
     return this.db
       .prepare(
-        `SELECT id, subscriber, merchant, next_charge
+        `SELECT id, subscriber, merchant, next_charge, amount
            FROM mandates
           WHERE status = 'Active'
             AND next_charge <= ?
@@ -168,6 +173,35 @@ export class Keeper {
           LIMIT ?`,
       )
       .all(now, limit) as unknown as DueMandate[];
+  }
+
+  /**
+   * Chargeable mandates ordered by amount descending, the batch set by
+   * `KEEPER_ORDER=largest`. `amount` is a decimal string in the token's
+   * smallest unit, so SQLite's TEXT ordering would sort it lexicographically
+   * and a JS number would lose precision on large amounts; the sort therefore
+   * compares `BigInt` values in JavaScript. Ties break by oldest-due first,
+   * then id, so the order is deterministic. The scan is unbounded by design:
+   * "largest first" must see every due mandate before it can pick a batch.
+   */
+  private queryDueLargest(now: number, limit: number): DueMandate[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, subscriber, merchant, next_charge, amount
+           FROM mandates
+          WHERE status = 'Active'
+            AND next_charge <= ?
+            AND (max_charges = 0 OR charges_made < max_charges)`,
+      )
+      .all(now) as unknown as DueMandate[];
+    rows.sort((a, b) => {
+      const amountDiff = BigInt(b.amount) - BigInt(a.amount);
+      if (amountDiff > 0n) return 1;
+      if (amountDiff < 0n) return -1;
+      if (a.next_charge !== b.next_charge) return a.next_charge - b.next_charge;
+      return a.id - b.id;
+    });
+    return rows.slice(0, limit);
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {

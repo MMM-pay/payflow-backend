@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
-import { Account, Keypair, Transaction } from "@stellar/stellar-sdk";
+import { Account, Keypair, Transaction, scValToNative } from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
@@ -15,12 +15,16 @@ const CONTRACT = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 const keyA = Keypair.random();
 const keyB = Keypair.random();
 
-function keeperConfig(secrets: { KEEPER_SECRET?: string; KEEPER_SECRET_NEXT?: string }): Config {
+function keeperConfig(
+  secrets: { KEEPER_SECRET?: string; KEEPER_SECRET_NEXT?: string },
+  order?: "oldest" | "largest",
+): Config {
   return {
     PLAN_REGISTRY_ID: CONTRACT,
     VAULT_ID: CONTRACT,
     SUBSCRIPTION_ID: CONTRACT,
     NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+    ...(order ? { KEEPER_ORDER: order } : {}),
     ...secrets,
   } as unknown as Config;
 }
@@ -52,10 +56,19 @@ function fakeRpc(funded: Set<string>, submitted: string[] = []): KeeperRpc {
 }
 
 function insertDue(db: ReturnType<typeof openDatabase>, id: number, nextCharge: number): void {
+  insertMandate(db, id, nextCharge, "10");
+}
+
+function insertMandate(
+  db: ReturnType<typeof openDatabase>,
+  id: number,
+  nextCharge: number,
+  amount: string,
+): void {
   db.prepare(
     `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
-     VALUES (?, ?, ?, 1, '10', 60, ?, 'Active', 1)`,
-  ).run(id, SUBSCRIBER, MERCHANT, nextCharge);
+     VALUES (?, ?, ?, 1, ?, 60, ?, 'Active', 1)`,
+  ).run(id, SUBSCRIBER, MERCHANT, amount, nextCharge);
 }
 
 /** Collect logger.info messages while running `fn`. */
@@ -201,5 +214,166 @@ describe("keeper key rotation", () => {
     };
     const config = loadConfig(env as NodeJS.ProcessEnv);
     assert.equal(config.KEEPER_SECRET_NEXT, keyB.secret());
+  });
+});
+
+describe("keeper due-mandate ordering", () => {
+  /** findDue never touches the network, so an unfunded fake RPC suffices. */
+  function orderingKeeper(
+    db: ReturnType<typeof openDatabase>,
+    order?: "oldest" | "largest",
+  ): Keeper {
+    return new Keeper(
+      db,
+      fakeRpc(new Set()),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, order),
+    );
+  }
+
+  test("oldest-due first is the default when KEEPER_ORDER is unset", () => {
+    const db = openDatabase(":memory:");
+    insertMandate(db, 1, 1_000, "5");
+    insertMandate(db, 2, 1_001, "1000000"); // bigger, but due later
+    const due = orderingKeeper(db).findDue(2_000);
+    assert.deepEqual(
+      due.map((m) => m.id),
+      [1, 2],
+      "an unset order keeps today's oldest-due behaviour; callers are not reordered",
+    );
+    db.close();
+  });
+
+  test("KEEPER_ORDER=oldest sorts by due date regardless of amount", () => {
+    const db = openDatabase(":memory:");
+    insertMandate(db, 1, 1_002, "9000000");
+    insertMandate(db, 2, 1_000, "100");
+    insertMandate(db, 3, 1_001, "500000000");
+    const due = orderingKeeper(db, "oldest").findDue(2_000);
+    assert.deepEqual(
+      due.map((m) => m.id),
+      [2, 3, 1],
+    );
+    db.close();
+  });
+
+  test("KEEPER_ORDER=largest sorts by amount descending", () => {
+    const db = openDatabase(":memory:");
+    insertMandate(db, 1, 1_000, "5");
+    insertMandate(db, 2, 1_001, "1000000");
+    insertMandate(db, 3, 1_002, "700");
+    const due = orderingKeeper(db, "largest").findDue(2_000);
+    assert.deepEqual(
+      due.map((m) => m.id),
+      [2, 3, 1],
+      "largest amount first, even though mandate 2 is also the oldest",
+    );
+    db.close();
+  });
+
+  test("largest compares decimal strings exactly, beyond float precision", () => {
+    const db = openDatabase(":memory:");
+    // 2^53 + 1 and 2^53 are indistinguishable as JS numbers but not as BigInt.
+    insertMandate(db, 1, 1_000, "9007199254740992");
+    insertMandate(db, 2, 1_001, "9007199254740993");
+    // A lexicographic TEXT sort would put "5..." before "10...".
+    insertMandate(db, 3, 1_002, "5000000");
+    insertMandate(db, 4, 1_003, "10000000000");
+    const due = orderingKeeper(db, "largest").findDue(2_000);
+    assert.deepEqual(
+      due.map((m) => m.id),
+      [2, 1, 4, 3],
+    );
+    db.close();
+  });
+
+  test("largest breaks ties by oldest-due, then id", () => {
+    const db = openDatabase(":memory:");
+    insertMandate(db, 1, 1_002, "700");
+    insertMandate(db, 2, 1_000, "700");
+    insertMandate(db, 3, 1_001, "700");
+    const due = orderingKeeper(db, "largest").findDue(2_000);
+    assert.deepEqual(
+      due.map((m) => m.id),
+      [2, 3, 1],
+      "equal amounts settle oldest-due first, so the order stays deterministic",
+    );
+    db.close();
+  });
+
+  test("largest still respects the batch limit", () => {
+    const db = openDatabase(":memory:");
+    insertMandate(db, 1, 1_000, "5");
+    insertMandate(db, 2, 1_001, "1000");
+    insertMandate(db, 3, 1_002, "70");
+    insertMandate(db, 4, 1_003, "400");
+    const due = orderingKeeper(db, "largest").findDue(2_000, 2);
+    assert.deepEqual(
+      due.map((m) => m.id),
+      [2, 4],
+      "the batch is the two largest amounts, not the first two rows",
+    );
+    db.close();
+  });
+
+  test("largest skips mandates that are backing off after a failure", async () => {
+    const db = openDatabase(":memory:");
+    insertMandate(db, 1, 1_000, "900");
+    insertMandate(db, 2, 1_001, "100");
+    // The largest mandate fails simulation, so it enters backoff.
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()])),
+      prepareTransaction: async (tx: Transaction) => {
+        // The charge call is operations[0].func.invokeContract.args[0].
+        const { func } = tx.operations[0] as unknown as {
+          func: { invokeContract: { args: Parameters<typeof scValToNative>[0][] } };
+        };
+        const mandateId = Number(scValToNative(func.invokeContract.args[0]!));
+        if (mandateId === 1) throw new Error("Simulation failed: InsufficientFunds");
+        return tx;
+      },
+    } as unknown as KeeperRpc;
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, "largest"),
+    );
+
+    const first = await keeper.tick(10_000);
+    assert.deepEqual(
+      first.map((r) => r.mandateId),
+      [1, 2],
+      "the pass tries the largest first, whatever the outcome",
+    );
+    assert.equal(first[0]!.status, "failed");
+    assert.equal(first[1]!.status, "settled");
+
+    const nextBatch = keeper.findDue(10_030);
+    assert.deepEqual(
+      nextBatch.map((m) => m.id),
+      [2],
+      "mandate 1 is backing off and cannot fill the next batch",
+    );
+    db.close();
+  });
+
+  test("tick settles mandates in the configured largest order", async () => {
+    const db = openDatabase(":memory:");
+    insertMandate(db, 1, 1_000, "5");
+    insertMandate(db, 2, 1_001, "1000000");
+    insertMandate(db, 3, 1_002, "700");
+    const server = fakeRpc(new Set([keyA.publicKey()]));
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, "largest"),
+    );
+
+    const results = await keeper.tick(10_000);
+    assert.deepEqual(
+      results.map((r) => r.mandateId),
+      [2, 3, 1],
+      "settlement follows the configured order, not the due date",
+    );
+    db.close();
   });
 });
