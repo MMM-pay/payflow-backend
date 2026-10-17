@@ -24,6 +24,9 @@ export function merchantsRouter(db: DatabaseSync): Router {
     // which is fine at base-unit (stroop) scale.
     const recurring = db
       .prepare(
+        // Only module-level constants are interpolated here; the address is a
+        // bound parameter, so no request data reaches the SQL text.
+        // eslint-disable-next-line no-restricted-syntax
         `SELECT COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_MONTH} / period), 0) AS mrr,
                 COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_YEAR} / period), 0) AS arr
            FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
