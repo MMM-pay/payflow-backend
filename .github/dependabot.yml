@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Dependencies are currently bumped by hand; this keeps them moving.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+  # The workflows pin actions; keep those current too.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

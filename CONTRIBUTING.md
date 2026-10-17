@@ -15,9 +15,14 @@ native TypeScript execution.
 
 | Job | Command |
 |---|---|
+| `lint` | `npm run lint` |
 | `typecheck` | `npm run typecheck` |
 | `test` | `npm test` |
 | `build` | `npm run build` |
+| `audit` | `npm audit --omit=dev --audit-level=high` |
+
+Dependencies are kept current by [Dependabot](.github/dependabot.yml), which
+opens weekly updates for npm packages and GitHub Actions.
 
 ## Code standards
 

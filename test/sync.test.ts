@@ -5,7 +5,7 @@ import { openDatabase, readCursor, writeCursor } from "../src/lib/db.ts";
 import { Indexer, type IndexerRpc } from "../src/indexer.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
 import { drain, every, serial } from "../src/lib/loop.ts";
-import type { Config } from "../src/config.ts";
+import type { Config, NetworkConfig } from "../src/config.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
@@ -21,6 +21,21 @@ const config = {
   // A throwaway testnet key; the fake RPC never submits anything.
   KEEPER_SECRET: "SBK2VIYYSVG76E7VC3QHYARNFLY2EAQXDHRC7BMXBBGIFG74ARPRMNQM",
 } as unknown as Config;
+
+/** The indexer reads the network it was constructed with. */
+function net(overrides: Partial<NetworkConfig> = {}): NetworkConfig {
+  return {
+    name: "testnet",
+    rpcUrl: "https://rpc.invalid",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    planRegistryId: CONTRACT,
+    vaultId: CONTRACT,
+    subscriptionId: CONTRACT,
+    startLedger: 0,
+    databasePath: ":memory:",
+    ...overrides,
+  };
+}
 
 /** A raw RPC event for a plan_created in `ledger`. */
 function rawEvent(ledger: number, planId: number): rpc.Api.EventResponse {
@@ -109,7 +124,7 @@ describe("indexer sync", () => {
       events: [rawEvent(900, 1), rawEvent(1_050, 2), rawEvent(1_100, 3)],
       calls: [],
     };
-    const ix = new Indexer(db, fakeRpc(chain), { ...config, INDEXER_START_LEDGER: 1_000 });
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 1_000 }));
 
     const r = await ix.tick();
 
@@ -123,7 +138,7 @@ describe("indexer sync", () => {
   test("with no start configured, begins at the oldest ledger RPC serves", async () => {
     const db = openDatabase(":memory:");
     const chain: FakeChain = { latest: 700, oldest: 600, events: [rawEvent(650, 1)], calls: [] };
-    await new Indexer(db, fakeRpc(chain), config).tick();
+    await new Indexer(db, fakeRpc(chain), net()).tick();
     assert.equal(chain.calls[0]!.startLedger, 600);
     assert.deepEqual(plans(db), [1]);
   });
@@ -132,7 +147,7 @@ describe("indexer sync", () => {
     const db = openDatabase(":memory:");
     writeCursor(db, 100);
     const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
-    await new Indexer(db, fakeRpc(chain), config).tick();
+    await new Indexer(db, fakeRpc(chain), net()).tick();
     assert.equal(chain.calls[0]!.startLedger, 600);
   });
 
@@ -146,7 +161,7 @@ describe("indexer sync", () => {
       events: [rawEvent(10, 1), rawEvent(11, 2), rawEvent(12, 3), rawEvent(15_000, 4)],
       calls: [],
     };
-    const ix = new Indexer(db, fakeRpc(chain, 2), { ...config, INDEXER_START_LEDGER: 10 });
+    const ix = new Indexer(db, fakeRpc(chain, 2), net({ startLedger: 10 }));
 
     const r = await ix.tick();
 
@@ -229,7 +244,7 @@ describe("indexer sync", () => {
       events: [rawEvent(10, 1), rawEvent(15_000, 2), rawEvent(19_999, 3)],
       calls: [],
     };
-    const ix = new Indexer(db, fakeRpc(chain), { ...config, INDEXER_START_LEDGER: 10 });
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 10 }));
 
     await ix.catchUp();
 
@@ -241,7 +256,7 @@ describe("indexer sync", () => {
   test("replaying a range does not duplicate rows", async () => {
     const db = openDatabase(":memory:");
     const chain: FakeChain = { latest: 200, oldest: 1, events: [rawEvent(150, 1)], calls: [] };
-    const ix = new Indexer(db, fakeRpc(chain), { ...config, INDEXER_START_LEDGER: 100 });
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 100 }));
     await ix.tick();
     writeCursor(db, 100);
     await ix.tick();

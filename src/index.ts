@@ -1,4 +1,4 @@
-import { loadConfig } from "./config.ts";
+import { loadConfig, networkConfigs } from "./config.ts";
 import { openDatabase } from "./lib/db.ts";
 import { makeRpc } from "./lib/stellar.ts";
 import { createApp } from "./app.ts";
@@ -11,35 +11,48 @@ import { initTelemetry, withSpan } from "./lib/telemetry.ts";
 
 const config = loadConfig();
 const stopTelemetry = initTelemetry(config.OTEL_EXPORTER_OTLP_ENDPOINT);
-const db = openDatabase(config.DATABASE_PATH);
-const server = makeRpc(config);
+const networks = networkConfigs(config);
 
-const indexer = new Indexer(db, server, config);
-const keeper = config.KEEPER_ENABLED ? new Keeper(db, server, config) : undefined;
+// One indexer and one database per network, so cursors and projections never
+// mix. `runtimes[0]` is the default network: it serves the unprefixed routes.
+const runtimes = networks.map((network) => {
+  const db = openDatabase(network.databasePath);
+  const server = makeRpc(network);
+  const indexer = new Indexer(db, server, network);
+  const runPass = serial(async () => {
+    try {
+      const r = await withSpan(`indexer.pass.${network.name}`, () => indexer.tick());
+      indexer.status.lastRunAt = Date.now();
+      indexer.status.lastError = null;
+      if (r.applied > 0) {
+        logger.info({ network: network.name, events: r.applied, cursor: r.cursor }, "indexed");
+      }
+      return r;
+    } catch (err) {
+      indexer.status.lastError = err instanceof Error ? err.message : String(err);
+      logger.error({ err, network: network.name }, "indexer pass failed");
+      throw err;
+    }
+  });
+  return { network, db, server, indexer, runPass };
+});
+const defaultRuntime = runtimes[0]!;
+
+const keeper = config.KEEPER_ENABLED
+  ? new Keeper(defaultRuntime.db, defaultRuntime.server, config)
+  : undefined;
 const activeKeeper = keeper;
 if (keeper) {
-  logger.info({ keeper: keeper.publicKey }, "keeper enabled");
+  if (runtimes.length > 1) {
+    logger.warn(
+      { network: defaultRuntime.network.name },
+      "keeper settles the default network only",
+    );
+  }
+  logger.info({ keeper: keeper.publicKey, network: defaultRuntime.network.name }, "keeper enabled");
 } else {
   logger.info("keeper disabled (KEEPER_ENABLED=false)");
 }
-
-// Each runner is serialized, and the scheduled loop and the /admin trigger
-// share it: a pass can take longer than the interval while backfilling, and
-// overlapping passes would race on the cursor and, for the keeper, on the
-// account sequence number.
-const runIndexerPass = serial(async () => {
-  try {
-    const r = await withSpan("indexer.pass", () => indexer.tick());
-    indexer.status.lastRunAt = Date.now();
-    indexer.status.lastError = null;
-    if (r.applied > 0) logger.info({ events: r.applied, cursor: r.cursor }, "indexed");
-    return r;
-  } catch (err) {
-    indexer.status.lastError = err instanceof Error ? err.message : String(err);
-    logger.error({ err }, "indexer pass failed");
-    throw err;
-  }
-});
 
 const runKeeperPass = keeper
   ? serial(async () => {
@@ -55,28 +68,49 @@ const runKeeperPass = keeper
     })
   : undefined;
 
-const adminHooks: AdminHooks = { reindex: () => runIndexerPass() };
+const adminHooks: AdminHooks = {
+  reindex: async () => {
+    const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
+    return results[0]!;
+  },
+};
 if (keeper && runKeeperPass) {
   adminHooks.keeperPass = () => runKeeperPass();
   adminHooks.keeperBackoff = () => keeper.backoffList();
 }
 
-const app = createApp(db, config, indexer.status, indexer.merchantCache, server, adminHooks);
+const app = createApp(
+  runtimes.map((rt) => ({
+    config: rt.network,
+    db: rt.db,
+    indexer: rt.indexer.status,
+    summaryCache: rt.indexer.merchantCache,
+    rpc: rt.server,
+  })),
+  config,
+  adminHooks,
+);
+
 const http = app.listen(config.PORT, () => {
-  logger.info({ port: config.PORT, network: config.STELLAR_NETWORK }, "api listening");
+  logger.info(
+    { port: config.PORT, networks: networks.map((n) => n.name) },
+    "api listening",
+  );
 });
 
 const loops: Loop[] = [];
 
-loops.push(
-  every(config.INDEXER_INTERVAL_MS, async () => {
-    try {
-      await runIndexerPass();
-    } catch {
-      // Handled in runIndexerPass
-    }
-  }),
-);
+for (const rt of runtimes) {
+  loops.push(
+    every(config.INDEXER_INTERVAL_MS, async () => {
+      try {
+        await rt.runPass();
+      } catch {
+        // Handled in runPass
+      }
+    }),
+  );
+}
 
 if (runKeeperPass) {
   loops.push(
@@ -128,7 +162,7 @@ async function shutdown(signal: string): Promise<void> {
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
   http.close(() => {
-    db.close();
+    for (const rt of runtimes) rt.db.close();
     process.exit(0);
   });
 }

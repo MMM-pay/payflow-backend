@@ -1,0 +1,48 @@
+# Fly.io deployment: one machine with a small volume holding the SQLite
+# projection, so it survives deploys and restarts without a paid Render plan.
+# The README ("Fly.io") lists the exact steps. `app` and `primary_region` are
+# examples: Fly app names are global, and the volume must live in
+# `primary_region`.
+app = "payflow-backend"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # The projection lives on the volume mounted below.
+  DATABASE_PATH = "/data/payflow.db"
+  STELLAR_NETWORK = "testnet"
+  SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org"
+  NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+  PLAN_REGISTRY_ID = "CDQ5EJTVXXX2CBMHWP3BGGUDHSK6D4I25IF5XXH3QGL2TNTBMJUOFKDB"
+  VAULT_ID = "CBNQEWSYYQOKNX5KB62OFT6ID5TCVSWN4PS4AXAJK6IWUEXOLVN6DXII"
+  SUBSCRIPTION_ID = "CD5YZUJU6WLFIHGAV4J2BV42GCVZE5ZGDUGSW5CBRIA47TQHSZZW3XMM"
+  INDEXER_START_LEDGER = "5110418"
+  # Settlement stays off unless a funded KEEPER_SECRET is set as a secret and
+  # KEEPER_ENABLED is flipped to "true".
+  KEEPER_ENABLED = "false"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/health"
+
+[[mounts]]
+  source = "payflow_data"
+  destination = "/data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"

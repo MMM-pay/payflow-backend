@@ -55,7 +55,7 @@ replays that range on restart. Every write is designed for that:
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 61 tests, no network needed
+npm test                  # 149 tests, no network needed
 npm run dev
 ```
 
@@ -130,6 +130,10 @@ answers 503 (`starting` until the indexer's first pass, then `catching_up`)
 while the projection trails the network by more than 120 ledgers, and 200
 `ready` once it is within that threshold. Point orchestration readiness
 checks at `/ready` and liveness checks at `/health`.
+
+When extra networks are configured (see below), every route also answers under
+`/api/<network>/...` — `/api/mainnet/plans`, `/api/testnet/stats` — while
+`/api/...` keeps serving the default network unchanged.
 
 | Method | Path | Returns |
 |---|---|---|
@@ -259,9 +263,10 @@ is logged; the next scheduled pass retries as usual.
 | `VAULT_ID` | — | Deployed vault contract |
 | `SUBSCRIPTION_ID` | — | Deployed subscription contract |
 | `TOKEN_ID` | — | Default token for the flat merchant-summary amounts. Unset, they span every token |
+| `NETWORKS` | *(empty)* | Extra networks to serve, comma-separated (see below) |
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
-| `KEEPER_SECRET` | â€” | `S...` key that pays settlement fees. Required when the keeper is on |
-| `KEEPER_SECRET_NEXT` | â€” | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
+| `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
+| `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
@@ -301,6 +306,31 @@ lagging endpoint — one that answers but from an older ledger — loses to the
 freshest endpoint the health probe finds. Reads get a 15-second timeout, so a
 hung provider fails over instead of stalling a pass forever.
 
+### Serving testnet and mainnet from one instance
+
+Everything above describes the default network. To serve additional networks
+beside it, list them in `NETWORKS` and configure each one with `<NAME>_`
+prefixed variables:
+
+```bash
+NETWORKS=mainnet
+MAINNET_SOROBAN_RPC_URL=https://mainnet.sorobanrpc.example
+MAINNET_NETWORK_PASSPHRASE=Public Global Stellar Network ; September 2015
+MAINNET_PLAN_REGISTRY_ID=C...
+MAINNET_VAULT_ID=C...
+MAINNET_SUBSCRIPTION_ID=C...
+MAINNET_INDEXER_START_LEDGER=5110418
+```
+
+Each network runs its own indexer with its own cursor and its own SQLite
+database — derived from `DATABASE_PATH` (`./payflow.db` becomes
+`./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise — so
+ledger numbers, replay windows and outages on one network never affect the
+other. Unprefixed `/api/...` routes always serve the default network
+(`STELLAR_NETWORK`); everything is also reachable under `/api/<name>/...`. The
+keeper settles the default network only.
+
+
 ## Deployment
 
 **API.** `render.yaml` is a Render blueprint for the free plan: Node 22 and
@@ -316,6 +346,35 @@ runs. A free web service sleeps when idle, so it is not a reliable place for
 the keeper. The key only pays fees: if the workflow stops, anyone can still
 call `charge`.
 
+**Fly.io.** [`fly.toml`](fly.toml) deploys the container image with a 1 GB
+volume mounted at `/data` for the SQLite file, so the projection survives
+restarts, plus `/health` checks and small-instance autostop. From a checkout:
+
+```bash
+fly auth login
+fly apps create payflow-backend        # pick another name if taken, then update fly.toml
+fly volumes create payflow_data --region sjc --size 1
+fly secrets set KEEPER_SECRET=S...     # optional; only to settle due mandates
+fly deploy
+curl https://payflow-backend.fly.dev/health
+```
+
+`fly.toml` ships with the deployed testnet contract IDs and
+`DATABASE_PATH=/data/payflow.db`; override either with
+`fly secrets set`. The image's entrypoint runs the app as a non-root user and
+takes ownership of the data directory, which a fresh root-owned volume
+requires.
+
+**Container image.** [`Dockerfile`](Dockerfile) builds a multi-stage image
+(`npm ci && npm run build`, then production dependencies only) that serves the
+API and runs the indexer loop on `node dist/index.js` as a non-root user.
+Pushing a `v*` tag publishes `ghcr.io/mmm-pay/payflow-backend:<version>` via
+[`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+```bash
+docker run --env-file .env -v payflow_data:/data ghcr.io/mmm-pay/payflow-backend:0.2.0
+```
+
 ## Related repositories
 
 | Repo | Role |
@@ -327,9 +386,9 @@ call `charge`.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `lint`, `typecheck`, `test`
-and `build`; all four must pass. Changes are recorded in
-[CHANGELOG.md](CHANGELOG.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `lint`, `typecheck`, `test`,
+`build` and a production `audit`; all five must pass, and Dependabot keeps
+dependencies current. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Security
 

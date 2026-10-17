@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.gitignore
+*.db
+*.db-*
+*.sqlite
+.env
+.env.local
+.DS_Store
+CHANGELOG.md
+CONTRIBUTING.md
+README.md
+SECURITY.md
+test

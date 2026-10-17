@@ -68,6 +68,19 @@ All notable changes to payflow-backend. The format follows
   `ADMIN_TOKEN` is set, require `Authorization: Bearer`, and the token is
   compared in constant time. Triggered passes queue behind any pass already
   running rather than overlapping it.
+- **Dependabot and an audit gate**: weekly npm and GitHub Actions updates, and
+  CI now fails on high or critical advisories in production dependencies
+  (`npm audit --omit=dev --audit-level=high`).
+- **Container image on release**: pushing a `v*` tag builds the Dockerfile and
+  publishes `ghcr.io/mmm-pay/payflow-backend:<version>` to GHCR.
+- **A Dockerfile and Fly.io configuration**: a multi-stage image that runs the
+  API and indexer as a non-root user, and a `fly.toml` with a volume for the
+  SQLite file, `/health` checks and autostop.
+- **Several networks from one instance**: `NETWORKS` lists extra networks
+  beside the default one. Each gets its own indexer, cursor and SQLite
+  database, and its routes under `/api/<name>/...`; unprefixed routes keep
+  serving the default network unchanged. `/health` reports every network.
+- A route test suite for two configured networks.
 
 ### Changed
 
@@ -77,7 +90,6 @@ All notable changes to payflow-backend. The format follows
   through the startup migration, so existing databases gain them without a
   rebuild. `EXPLAIN QUERY PLAN` now reports covering-index searches instead
   of table lookups.
-
 - **One router per resource (#74).** `src/routes/index.ts` is split into
   `plans.ts`, `mandates.ts`, `merchants.ts`, `subscribers.ts` and `stats.ts`
   with shared query helpers in `helpers.ts`. No change in behaviour: paths,
@@ -105,6 +117,12 @@ All notable changes to payflow-backend. The format follows
   several tokens. Revenue and MRR are now also grouped per token in a `tokens`
   array, and the flat fields report the default token (`TOKEN_ID`) when one is
   configured — without one they keep their previous all-token meaning.
+
+### Security
+
+- Patched transitive advisories in `proxy-addr` (critical) and `qs`
+  (moderate) with `npm audit fix`; the production audit is clean.
+
 
 ## [0.2.0] - 2026-10-09
 
@@ -155,4 +173,5 @@ Points at the v0.2.0 contract suite on testnet.
 Event indexer, settlement keeper and read API for the first testnet
 deployment.
 
+[Unreleased]: https://github.com/MMM-pay/payflow-backend/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/MMM-pay/payflow-backend/releases/tag/v0.2.0

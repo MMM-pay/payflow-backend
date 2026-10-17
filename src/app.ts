@@ -3,10 +3,10 @@ import cors from "cors";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
-import type { Config } from "./config.ts";
+import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
 import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
-import { buildRoutes, MerchantSummaryCache } from "./routes/index.ts";
+import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
@@ -80,6 +80,52 @@ function lagOf(indexer: IndexerStatus | undefined): number | null {
   return indexer && indexer.latest > 0 ? Math.max(0, indexer.latest - indexer.cursor) : null;
 }
 
+export interface NetworkRuntime {
+  config: NetworkConfig;
+  db: DatabaseSync;
+  indexer?: IndexerStatus | undefined;
+  summaryCache?: MerchantSummaryCache | undefined;
+  rpc?: RpcStatus | undefined;
+}
+
+function healthOf(runtime: NetworkRuntime): HealthResponse {
+  const indexer = runtime.indexer;
+  const lag = lagOf(indexer);
+  const freshnessSeconds = indexer
+    ? (indexer.freshnessSeconds ??
+       (indexer.lastLedgerCloseTime != null
+         ? Math.max(0, Math.floor(Date.now() / 1000) - indexer.lastLedgerCloseTime)
+         : null))
+    : null;
+  const rpc = runtime.rpc;
+  return {
+    status: lag === null ? "starting" : lag <= MAX_LAG ? "ok" : "catching_up",
+    network: runtime.config.name,
+    indexer: indexer
+      ? {
+          cursor: indexer.cursor,
+          latestLedger: indexer.latest,
+          lag,
+          freshnessSeconds,
+          lastRunAt: indexer.lastRunAt ? new Date(indexer.lastRunAt).toISOString() : null,
+          lastError: indexer.lastError,
+          mismatchedEvents: indexer.mismatchedEvents ?? 0,
+        }
+      : null,
+    rpc: rpc && "active" in rpc && Array.isArray(rpc.endpoints) ? { active: rpc.active, endpoints: rpc.endpoints } : null,
+    contracts: {
+      planRegistry: runtime.config.planRegistryId,
+      vault: runtime.config.vaultId,
+      subscription: runtime.config.subscriptionId,
+    },
+  };
+}
+
+export function createApp(
+  runtimes: NetworkRuntime[],
+  config: Config,
+  admin?: AdminHooks,
+): Express;
 export function createApp(
   db: DatabaseSync,
   config: Config,
@@ -87,20 +133,65 @@ export function createApp(
   arg3?: MerchantSummaryCache | RpcStatus | AdminHooks,
   arg4?: RpcStatus | AdminHooks,
   arg5?: AdminHooks,
+): Express;
+export function createApp(
+  dbOrRuntimes: DatabaseSync | NetworkRuntime[],
+  config: Config,
+  arg2?: IndexerStatus | AdminHooks,
+  arg3?: MerchantSummaryCache | RpcStatus | AdminHooks,
+  arg4?: RpcStatus | AdminHooks,
+  arg5?: AdminHooks,
 ): Express {
-  let merchantCache: MerchantSummaryCache | undefined;
-  let rpc: RpcStatus | undefined;
+  let runtimes: NetworkRuntime[];
   let admin: AdminHooks | undefined;
+  const isMulti = Array.isArray(dbOrRuntimes);
 
-  for (const arg of [arg3, arg4, arg5]) {
-    if (!arg) continue;
-    if (arg instanceof MerchantSummaryCache) {
-      merchantCache = arg;
-    } else if ("active" in arg && Array.isArray((arg as RpcStatus).endpoints)) {
-      rpc = arg as RpcStatus;
-    } else if (typeof arg === "object") {
-      admin = arg as AdminHooks;
+  if (isMulti) {
+    runtimes = dbOrRuntimes;
+    if (typeof arg2 === "object" && arg2 !== null && ("reindex" in arg2 || "keeperPass" in arg2)) {
+      admin = arg2 as AdminHooks;
     }
+  } else {
+    const db = dbOrRuntimes;
+    const indexer = arg2 as IndexerStatus | undefined;
+    let merchantCache: MerchantSummaryCache | undefined;
+    let rpc: RpcStatus | undefined;
+
+    for (const arg of [arg3, arg4, arg5]) {
+      if (!arg) continue;
+      if (arg instanceof MerchantSummaryCache) {
+        merchantCache = arg;
+      } else if ("active" in arg && Array.isArray((arg as RpcStatus).endpoints)) {
+        rpc = arg as RpcStatus;
+      } else if (typeof arg === "object") {
+        admin = arg as AdminHooks;
+      }
+    }
+
+    runtimes = [
+      {
+        config: {
+          name: config.STELLAR_NETWORK ?? "testnet",
+          rpcUrl: config.SOROBAN_RPC_URL ?? "",
+          networkPassphrase: config.NETWORK_PASSPHRASE ?? "",
+          planRegistryId: config.PLAN_REGISTRY_ID ?? "",
+          vaultId: config.VAULT_ID ?? "",
+          subscriptionId: config.SUBSCRIPTION_ID ?? "",
+          defaultToken: config.TOKEN_ID,
+          startLedger: config.INDEXER_START_LEDGER ?? 0,
+          databasePath: config.DATABASE_PATH ?? ":memory:",
+        },
+        db,
+        indexer,
+        summaryCache: merchantCache,
+        rpc,
+      },
+    ];
+  }
+
+  const defaultRuntime = runtimes[0];
+  if (!defaultRuntime) {
+    throw new Error("at least one network runtime is required");
   }
 
   const app = express();
@@ -137,34 +228,16 @@ export function createApp(
   // Always 200 so a slow backfill does not get the service restarted; the
   // body says whether the projection is current.
   app.get("/health", (_req, res) => {
-    const lag = lagOf(indexer);
-    const freshnessSeconds = indexer
-      ? (indexer.freshnessSeconds ??
-         (indexer.lastLedgerCloseTime != null
-           ? Math.max(0, Math.floor(Date.now() / 1000) - indexer.lastLedgerCloseTime)
-           : null))
-      : null;
+    const defaultHealth = healthOf(defaultRuntime);
     const body: HealthResponse = {
-
-      status: lag === null ? "starting" : lag <= MAX_LAG ? "ok" : "catching_up",
-      network: config.STELLAR_NETWORK,
-      indexer: indexer
+      ...defaultHealth,
+      ...(isMulti || runtimes.length > 1
         ? {
-            cursor: indexer.cursor,
-            latestLedger: indexer.latest,
-            lag,
-            freshnessSeconds,
-            lastRunAt: indexer.lastRunAt ? new Date(indexer.lastRunAt).toISOString() : null,
-            lastError: indexer.lastError,
-            mismatchedEvents: indexer.mismatchedEvents ?? 0,
+            networks: Object.fromEntries(
+              runtimes.map((rt) => [rt.config.name, healthOf(rt)]),
+            ),
           }
-        : null,
-      rpc: rpc ? { active: rpc.active, endpoints: rpc.endpoints } : null,
-      contracts: {
-        planRegistry: config.PLAN_REGISTRY_ID,
-        vault: config.VAULT_ID,
-        subscription: config.SUBSCRIPTION_ID,
-      },
+        : {}),
     };
     res.json(body);
   });
@@ -175,7 +248,7 @@ export function createApp(
   // run yet, or none is attached) is treated as not ready, since the
   // freshness of the projection cannot be established.
   app.get("/ready", (_req, res) => {
-    const lag = lagOf(indexer);
+    const lag = lagOf(defaultRuntime.indexer);
     const ready = lag !== null && lag <= MAX_LAG;
     res.status(ready ? 200 : 503).json({
       status: ready ? "ready" : lag === null ? "starting" : "catching_up",
@@ -189,8 +262,17 @@ export function createApp(
     app.use("/admin", buildAdminRoutes(config.ADMIN_TOKEN, admin));
   }
 
-  app.use("/api", buildRoutes(db, merchantCache, config.TOKEN_ID));
-
+  app.use(
+    "/api",
+    buildApiRouter(
+      runtimes.map((rt) => ({
+        name: rt.config.name,
+        db: rt.db,
+        summaryCache: rt.summaryCache,
+        defaultToken: rt.config.defaultToken ?? config.TOKEN_ID,
+      })),
+    ),
+  );
 
   // Anything no route answered: an unknown path, or a method the API does not
   // expose on a known one.

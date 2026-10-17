@@ -1,6 +1,6 @@
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import type { Account, FeeBumpTransaction, Transaction } from "@stellar/stellar-sdk";
-import type { Config } from "../config.ts";
+import type { Config, NetworkConfig } from "../config.ts";
 import { logger } from "./logger.ts";
 import { traceRpc } from "./telemetry.ts";
 import eventSpecFile from "./event_spec.json" with { type: "json" };
@@ -168,8 +168,19 @@ export class FailoverRpc implements RpcStatus {
   }
 }
 
-export function makeRpc(config: Config, dial: Dial = defaultDial): FailoverRpc {
-  return new FailoverRpc(config.SOROBAN_RPC_URL, dial);
+export function makeRpc(
+  target: Config | NetworkConfig | { SOROBAN_RPC_URL: string[] } | { rpcUrl: string },
+  dial: Dial = defaultDial,
+): FailoverRpc {
+  let urls: string[] = [];
+  if ("SOROBAN_RPC_URL" in target && Array.isArray(target.SOROBAN_RPC_URL)) {
+    urls = target.SOROBAN_RPC_URL;
+  } else if ("rpcUrls" in target && Array.isArray((target as { rpcUrls: string[] }).rpcUrls)) {
+    urls = (target as { rpcUrls: string[] }).rpcUrls;
+  } else if ("rpcUrl" in target && typeof target.rpcUrl === "string") {
+    urls = target.rpcUrl.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return new FailoverRpc(urls, dial);
 }
 
 /** A contract event flattened into plain JS values. */

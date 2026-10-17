@@ -1,13 +1,14 @@
-/** Run a single settlement pass and exit. */
-import { loadConfig } from "../config.ts";
+/** Run a single settlement pass on the default network and exit. */
+import { loadConfig, networkConfigs } from "../config.ts";
 import { openDatabase } from "../lib/db.ts";
 import { makeRpc } from "../lib/stellar.ts";
 import { Keeper } from "../keeper.ts";
 import { logger } from "../lib/logger.ts";
 
 const config = loadConfig();
-const db = openDatabase(config.DATABASE_PATH);
-const keeper = new Keeper(db, makeRpc(config), config);
+const network = networkConfigs(config)[0]!;
+const db = openDatabase(network.databasePath);
+const keeper = new Keeper(db, makeRpc(network), config);
 
 keeper
   .tick()

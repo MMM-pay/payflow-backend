@@ -6,7 +6,7 @@ import { openDatabase } from "../src/lib/db.ts";
 import { createApp, errorHandler, loggableError } from "../src/app.ts";
 import { logger } from "../src/lib/logger.ts";
 import { Indexer } from "../src/indexer.ts";
-import type { Config } from "../src/config.ts";
+import type { Config, NetworkConfig } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 import { MerchantSummaryCache } from "../src/routes/index.ts";
 import type { MerchantSummary } from "../src/routes/types.ts";
@@ -16,17 +16,23 @@ const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
 const YEARLY_MERCHANT = "GDLXOW3J5FEFW4UZ7XBHX6EFHL7POV7S2NG5RZ7ULYCGLJWGPUBFQO4U";
 const FORECAST_MERCHANT = "GA5WDTXMB5SW2DIVYCXKQ36M3LWPSGVPYQWRTMLERMZSPGYQXVQ2N55B";
 const CAPPED_MERCHANT = "GCP3XZ2Z4XLRTNBRD7KWWLE7K4LRBNTBVF37LWZRY2MEEK3GZ3RWZG7Y";
+const OTHER_MERCHANT = "GCMOCQFSVPXI45VOPXW2WWPBZBVJE6L45UQ47S46CUVK4ISNFRM34KXM";
+const OTHER_SUBSCRIBER = "GD2P7AV53TONBPXKX5NWQKGUTAF32VZWKMFHQ2QZ5XNTTQFTV7Q4USP";
 /** Frozen at load; forecast fixtures hang off it so the window maths is stable. */
 const NOW = Math.floor(Date.now() / 1000);
 
-const config = {
-  STELLAR_NETWORK: "testnet",
-  PLAN_REGISTRY_ID: "C".repeat(56),
-  VAULT_ID: "C".repeat(56),
-  SUBSCRIPTION_ID: "C".repeat(56),
-  CORS_ORIGIN: "*",
-  PORT: 0,
-} as unknown as Config;
+const testnet: NetworkConfig = {
+  name: "testnet",
+  rpcUrl: "https://rpc.invalid",
+  networkPassphrase: "Test SDF Network ; September 2015",
+  planRegistryId: "C".repeat(56),
+  vaultId: "C".repeat(56),
+  subscriptionId: "C".repeat(56),
+  startLedger: 0,
+  databasePath: ":memory:",
+};
+const mainnet: NetworkConfig = { ...testnet, name: "mainnet" };
+const config = { CORS_ORIGIN: "*" } as unknown as Config;
 
 let server: Server;
 let ix: Indexer;
@@ -38,8 +44,10 @@ const status = {
   lastLedgerCloseTime: 1_700_000_000,
   freshnessSeconds: 42,
 };
+const mainnetStatus = { cursor: 500, latest: 505, lastRunAt: Date.now(), lastError: null };
 let base: string;
 const db = openDatabase(":memory:");
+const mainnetDb = openDatabase(":memory:");
 
 const ev = (name: string, topics: unknown[], data: Record<string, unknown>, tx = "t"): DecodedEvent => ({
   name, contractId: "C", ledger: 1, txHash: tx, topics, data,
@@ -47,7 +55,6 @@ const ev = (name: string, topics: unknown[], data: Record<string, unknown>, tx =
 
 before(async () => {
   ix = new Indexer(db, {} as never, {} as never);
-
   ix.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
   ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
@@ -73,7 +80,23 @@ before(async () => {
     next_charge: BigInt(NOW + 3_600), max_charges: 2n, fee_bps: 0n,
   }, "tx4"));
 
-  const app = createApp(db, config, status, ix.merchantCache);
+  // A second projection with disjoint ids, so cross-network leakage is visible.
+  const ixMainnet = new Indexer(mainnetDb, {} as never, {} as never);
+  ixMainnet.apply(ev("plan_created", [OTHER_MERCHANT, 5n], {
+    token: "C", amount: 20_000_000n, period: 2_592_000n,
+  }, "tm1"));
+  ixMainnet.apply(ev("subscribed", [5n, OTHER_SUBSCRIBER, OTHER_MERCHANT], {
+    plan_id: 5n, amount: 20_000_000n, period: 2_592_000n, next_charge: 1n,
+  }, "tm2"));
+
+  const app = createApp(
+    [
+      { config: testnet, db, indexer: status, summaryCache: ix.merchantCache },
+      { config: mainnet, db: mainnetDb, indexer: mainnetStatus, summaryCache: ixMainnet.merchantCache },
+    ],
+    config,
+  );
+
   await new Promise<void>((resolve) => {
     server = app.listen(0, () => {
       const addr = server.address();
@@ -86,6 +109,7 @@ before(async () => {
 after(() => {
   server.close();
   db.close();
+  mainnetDb.close();
 });
 
 const get = async (path: string) => {
@@ -722,7 +746,6 @@ describe("subscriber upcoming charges", () => {
     assert.equal(body.truncated, false);
   });
 });
-
 describe("express 5 error boundary", () => {
   /** Listens on a random port and reports the base URL with a stop function. */
   async function serve(app: Express): Promise<{ url: string; stop: () => Promise<void> }> {
@@ -866,3 +889,51 @@ describe("express 5 error boundary", () => {
     assert.match(String((forwarded as Error).message), /late failure/);
   });
 });
+
+describe("multiple networks", () => {
+  test("the default network keeps serving the unprefixed routes", async () => {
+    const plain = await get("/api/plans");
+    const scoped = await get("/api/testnet/plans");
+    assert.deepEqual(scoped.body, plain.body);
+  });
+
+  test("each network serves its own projection", async () => {
+    const mainnet = await get("/api/mainnet/plans");
+    const rows = mainnet.body.plans as unknown as Array<{ id: number }>;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.id, 5);
+
+    // Ids are their own per network: plan 1 exists on testnet only.
+    assert.equal((await get("/api/mainnet/plans/1")).status, 404);
+    assert.equal((await get("/api/plans/1")).status, 200);
+  });
+
+  test("due and stats are computed per network", async () => {
+    const mainnetDue = await get("/api/mainnet/due");
+    assert.equal((mainnetDue.body.due as unknown[]).length, 1);
+    const plainDue = await get("/api/due");
+    assert.equal((plainDue.body.due as unknown[]).length, 0, "testnet has no due mandate");
+
+    const mainnetStats = await get("/api/mainnet/stats");
+    assert.equal(mainnetStats.body.plans, 1);
+    assert.equal(mainnetStats.body.charges, 0);
+    const testnetStats = await get("/api/stats");
+    assert.equal(testnetStats.body.charges, 1);
+  });
+
+  test("health reports every network alongside the default", async () => {
+    const { body } = await get("/health");
+    assert.equal(body.network, "testnet", "the top-level fields stay the default network");
+    const networks = body.networks as unknown as Record<string, { status: string; indexer: { cursor: number } }>;
+    assert.equal(networks.testnet.status, "ok");
+    assert.equal(networks.mainnet.status, "ok");
+    assert.equal(networks.mainnet.indexer.cursor, 500);
+  });
+
+  test("an unknown network segment is a 404", async () => {
+    const res = await get("/api/regtest/plans");
+    assert.equal(res.status, 404);
+    assert.equal(res.body.error, "not_found");
+  });
+});
+

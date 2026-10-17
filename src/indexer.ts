@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import { rpc } from "@stellar/stellar-sdk";
-import type { Config } from "./config.ts";
+import type { Config, NetworkConfig } from "./config.ts";
+
+export type IndexerConfig = Config | NetworkConfig;
 import { readCursor, writeCursor } from "./lib/db.ts";
 import {
   big,
@@ -76,7 +78,7 @@ export interface IndexerStatus {
 export class Indexer {
   private readonly db: DatabaseSync;
   private readonly server: IndexerRpc;
-  private readonly config: Config;
+  private readonly config: IndexerConfig;
   readonly merchantCache: MerchantSummaryCache;
   readonly status: IndexerStatus = {
     cursor: 0,
@@ -95,7 +97,7 @@ export class Indexer {
   constructor(
     db: DatabaseSync,
     server: IndexerRpc,
-    config: Config,
+    config: IndexerConfig,
     merchantCache: MerchantSummaryCache = defaultMerchantSummaryCache,
   ) {
     this.db = db;
@@ -105,6 +107,13 @@ export class Indexer {
   }
 
   private contractIds(): string[] {
+    if ("planRegistryId" in this.config) {
+      return [
+        this.config.planRegistryId,
+        this.config.vaultId,
+        this.config.subscriptionId,
+      ];
+    }
     return [
       this.config.PLAN_REGISTRY_ID,
       this.config.VAULT_ID,
@@ -121,7 +130,8 @@ export class Indexer {
   private async firstLedger(saved: number): Promise<number> {
     const health = await this.server.getHealth();
     const oldest = health.oldestLedger;
-    const wanted = saved > 0 ? saved : this.config.INDEXER_START_LEDGER;
+    const startSetting = "startLedger" in this.config ? this.config.startLedger : this.config.INDEXER_START_LEDGER;
+    const wanted = saved > 0 ? saved : startSetting;
     if (wanted > 0 && wanted >= oldest) return wanted;
     if (wanted > 0) {
       logger.warn(
@@ -232,7 +242,11 @@ export class Indexer {
     const filters: rpc.Api.EventFilter[] = [
       { type: "contract", contractIds: this.contractIds() },
     ];
-    const concurrency = Math.max(1, this.config.INDEXER_FETCH_CONCURRENCY ?? 1);
+    const concurrencySetting =
+      "INDEXER_FETCH_CONCURRENCY" in this.config
+        ? this.config.INDEXER_FETCH_CONCURRENCY
+        : undefined;
+    const concurrency = Math.max(1, concurrencySetting ?? 1);
     const windows: Array<{ start: number; end: number }> = [];
     for (let s = start; s < latest && windows.length < concurrency; s += LEDGER_WINDOW) {
       windows.push({ start: s, end: Math.min(s + LEDGER_WINDOW, latest) });

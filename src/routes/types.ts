@@ -174,6 +174,7 @@ export interface HealthResponse {
     vault: string;
     subscription: string;
   };
+  networks?: Record<string, HealthResponse>;
 }
 
 /** Error bodies are `{ error: <code> }`; codes are stable per endpoint. */
