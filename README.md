@@ -78,9 +78,12 @@ npm run keeper
   (the ledger the contracts were deployed at); with neither, the oldest ledger
   the RPC node still serves. A cursor older than the node's retention window is
   moved forward with a warning, since RPC rejects ranges that start before it.
-- **Exact ranges.** Each pass reads `[cursor, cursor + 8000)` and never the
-  ledger RPC is still closing, and it keeps paging until a page is empty or
-  passes the range end: a short page does not mean the range is exhausted.
+- **Exact ranges.** Each pass reads `[cursor, cursor + 8000)` windows and
+  never a ledger the RPC node is still closing. Up to
+  `INDEXER_FETCH_CONCURRENCY` windows are fetched at once, but they are
+  applied in ledger order and the cursor advances only after a window is
+  applied. Paging continues until a page is empty or passes the range end: a
+  short page does not mean the range is exhausted.
 - **Failing mandates back off.** A mandate whose charge fails (usually an
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
@@ -124,13 +127,18 @@ Base path `/api`. All amounts are strings in the token's smallest unit
 | `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag and spec-mismatch count, contract IDs |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
-| `GET` | `/api/mandates?subscriber=&merchant=&status=` | Mandates |
+| `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
 | `GET` | `/api/mandates/:id` | One mandate |
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
 | `GET` | `/api/due` | Mandates chargeable right now |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/subscribers/:address/summary` | Mandates and total paid |
 | `GET` | `/api/stats` | Protocol totals and last indexed ledger |
+
+`/api/mandates` also accepts `ids`, a comma-separated batch of up to 100
+mandate ids (`?ids=1,2,3`). Ids that do not exist are omitted; more than 100
+ids returns `400 { "error": "too_many_ids" }` and a non-numeric id returns
+`400 { "error": "invalid_ids" }`.
 
 Example:
 
@@ -199,6 +207,7 @@ registry is a release-time step for maintainers.
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
+| `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |

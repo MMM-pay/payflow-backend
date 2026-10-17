@@ -28,8 +28,28 @@ All notable changes to payflow-backend. The format follows
 - **`arr` on the merchant summary.** `/api/merchants/:address/summary` now
   reports annual recurring revenue next to `mrr`: every active mandate
   normalised to a 365-day year. Both formulas are documented in the README.
+- **Parallel window backfill (#59).** The indexer fetches up to
+  `INDEXER_FETCH_CONCURRENCY` (default 4, max 16) 8,000-ledger windows at
+  once and applies them in ledger order. The cursor advances only after a
+  window is applied, so a failed later window resumes at the last applied
+  one; `1` restores strictly sequential reads.
+- **Batch mandate lookup (#61).** `/api/mandates?ids=1,2,3` returns up to 100
+  mandates in one request. Unknown ids are omitted, more than 100 ids is
+  `400 too_many_ids`, and a non-numeric id is `400 invalid_ids`. The typed
+  client's `MandatesQuery` gained `ids`.
+- **SQL template lint rule (#65).** ESLint rejects `prepare()` calls whose
+  SQL is an interpolated template literal. Vetted static fragments carry an
+  explained `eslint-disable-next-line` comment, and a test runs the real
+  config against a deliberately bad query to prove the rule fires.
 
 ### Changed
+
+- **Summary query indexes (#66).** Covering indexes for the merchant and
+  subscriber summary aggregates (`mandates(merchant, status, period, amount)`,
+  `charges(merchant, amount)`, `charges(subscriber, amount, fee)`) are added
+  through the startup migration, so existing databases gain them without a
+  rebuild. `EXPLAIN QUERY PLAN` now reports covering-index searches instead
+  of table lookups.
 
 - **One router per resource (#74).** `src/routes/index.ts` is split into
   `plans.ts`, `mandates.ts`, `merchants.ts`, `subscribers.ts` and `stats.ts`
