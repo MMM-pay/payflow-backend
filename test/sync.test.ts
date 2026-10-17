@@ -236,6 +236,8 @@ describe("keeper", () => {
 });
 
 describe("loop", () => {
+  // Wall-clock budgets are generous: the assertion is about ordering, not
+  // speed, and a starved timer under parallel CI load must not fail them.
   test("never runs two passes at once", async () => {
     let running = 0;
     let maxRunning = 0;
@@ -247,7 +249,7 @@ describe("loop", () => {
       running -= 1;
       passes += 1;
     });
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 400));
     loop.stop();
     assert.ok(passes >= 2, "the loop kept going");
     assert.equal(maxRunning, 1);
@@ -259,7 +261,7 @@ describe("loop", () => {
       passes += 1;
       throw new Error("boom");
     });
-    await new Promise((r) => setTimeout(r, 30));
+    await new Promise((r) => setTimeout(r, 150));
     loop.stop();
     assert.ok(passes >= 2);
   });

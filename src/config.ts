@@ -11,6 +11,12 @@ const schema = z.object({
   TOKEN_ID: z.string().min(56).optional(),
 
   KEEPER_SECRET: z.string().optional(),
+  /**
+   * Standby key for zero-downtime rotation. When set, the keeper falls back
+   * to it if `KEEPER_SECRET` becomes unusable mid-pass, and accepts it as the
+   * new primary on SIGHUP without a restart.
+   */
+  KEEPER_SECRET_NEXT: z.string().optional(),
   KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   KEEPER_ENABLED: z
     .string()

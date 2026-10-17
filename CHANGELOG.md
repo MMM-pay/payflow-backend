@@ -8,9 +8,34 @@ All notable changes to payflow-backend. The format follows
 
 ### Added
 
+- **Zero-downtime keeper key rotation (#71).** The keeper accepts a standby
+  key in `KEEPER_SECRET_NEXT`: if the active key's source account is unusable
+  it rotates mid-pass and retries the same mandate, and after a pass settles
+  with the new key it logs that the previous key can be retired. Secrets are
+  reloaded on `SIGHUP` (`.env` re-read, config re-validated) so promotion of
+  the standby needs no restart. Tested by swapping keys between passes.
+- **Typed API client (#72).** `src/client/index.ts` is a small typed fetch
+  client for every endpoint, returning the same response types the route
+  handlers annotate their bodies with (`src/routes/types.ts`) — shared, not
+  copied. Exposed as the `payflow-backend/client` subpath after `npm run
+  build` and tested against the HTTP test server.
+- **Spec-driven event decoding (#73).** Event shapes live in the committed
+  contract spec `src/lib/event_spec.json`. The indexer validates every
+  decoded event before projecting it: mismatches (renamed fields, wrong
+  types, extra data or topics) are logged with the exact problems, counted
+  per pass in `TickResult.mismatched` and in `/health`'s
+  `indexer.mismatchedEvents`, and never stored as zeros.
 - **`arr` on the merchant summary.** `/api/merchants/:address/summary` now
   reports annual recurring revenue next to `mrr`: every active mandate
   normalised to a 365-day year. Both formulas are documented in the README.
+
+### Changed
+
+- **One router per resource (#74).** `src/routes/index.ts` is split into
+  `plans.ts`, `mandates.ts`, `merchants.ts`, `subscribers.ts` and `stats.ts`
+  with shared query helpers in `helpers.ts`. No change in behaviour: paths,
+  query handling and response shapes are identical and the existing API
+  tests pass unchanged.
 
 ## [0.2.0] - 2026-10-09
 
