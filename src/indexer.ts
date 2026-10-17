@@ -98,11 +98,47 @@ export class Indexer {
   }
 
   /**
-   * Index ledgers [cursor, min(cursor + LEDGER_WINDOW, latest)).
+   * Fetch every page of one ledger window. Cursor pages cannot carry
+   * `endLedger`, so events at or past `end` are dropped here; a short page does
+   * not prove the range is exhausted, only an empty page or the range end does.
+   */
+  private async fetchWindow(
+    start: number,
+    end: number,
+    filters: rpc.Api.EventFilter[],
+  ): Promise<rpc.Api.EventResponse[]> {
+    const events: rpc.Api.EventResponse[] = [];
+    let page = await this.server.getEvents({
+      startLedger: start,
+      endLedger: end,
+      filters,
+      limit: PAGE_LIMIT,
+    });
+
+    for (;;) {
+      let pastEnd = false;
+      for (const raw of page.events ?? []) {
+        if (raw.ledger >= end) {
+          pastEnd = true;
+          break;
+        }
+        events.push(raw);
+      }
+      if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
+      page = await this.server.getEvents({ cursor: page.cursor, filters, limit: PAGE_LIMIT });
+    }
+    return events;
+  }
+
+  /**
+   * Index ledgers [cursor, min(cursor + LEDGER_WINDOW * concurrency, latest)).
    *
-   * The cursor is the next ledger to read and only advances after the whole
-   * range is applied, so a crash mid-range replays it on restart. Every apply
-   * path is idempotent to make that safe.
+   * Up to `INDEXER_FETCH_CONCURRENCY` windows are fetched in parallel, but
+   * their events are applied in ledger order and the cursor only advances after
+   * a window has been applied. If a fetch fails, windows already applied keep
+   * their cursor and the next pass resumes at the failed one. A crash mid-range
+   * replays that range on restart; every apply path is idempotent so that is
+   * safe.
    */
   async tick(): Promise<TickResult> {
     const latest = (await this.server.getLatestLedger()).sequence;
@@ -125,37 +161,41 @@ export class Indexer {
     const filters: rpc.Api.EventFilter[] = [
       { type: "contract", contractIds: this.contractIds() },
     ];
+    const concurrency = Math.max(1, this.config.INDEXER_FETCH_CONCURRENCY ?? 1);
+    const windows: Array<{ start: number; end: number }> = [];
+    for (let s = start; s < latest && windows.length < concurrency; s += LEDGER_WINDOW) {
+      windows.push({ start: s, end: Math.min(s + LEDGER_WINDOW, latest) });
+    }
+
+    const fetched = await Promise.allSettled(
+      windows.map((w) => this.fetchWindow(w.start, w.end, filters)),
+    );
     let applied = 0;
     let mismatched = 0;
-    let page = await this.server.getEvents({
-      startLedger: start,
-      endLedger: end,
-      filters,
-      limit: PAGE_LIMIT,
-    });
+    let cursor = start;
+    let failure: unknown;
 
-    for (;;) {
-      let pastEnd = false;
-      for (const raw of page.events ?? []) {
-        // Cursor pages cannot carry endLedger, so stop at the boundary here.
-        if (raw.ledger >= end) {
-          pastEnd = true;
-          break;
-        }
+    for (let i = 0; i < windows.length; i += 1) {
+      const result = fetched[i]!;
+      if (result.status === "rejected") {
+        failure = result.reason;
+        break;
+      }
+      for (const raw of result.value) {
         const decoded = decodeEvent(raw);
         if (!decoded) continue;
         if (this.apply(decoded) !== "mismatched") applied += 1;
         else mismatched += 1;
       }
-      // A short page does not prove the range is exhausted: RPC caps how many
-      // ledgers one request scans. Only an empty page or the range end does.
-      if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
-      page = await this.server.getEvents({ cursor: page.cursor, filters, limit: PAGE_LIMIT });
+      // Only advance after this window is applied, so a later failure resumes
+      // here instead of replaying what already landed.
+      cursor = windows[i]!.end;
+      writeCursor(this.db, cursor);
     }
 
-    writeCursor(this.db, end);
-    this.status.cursor = end;
-    return { applied, mismatched, cursor: end, latest };
+    this.status.cursor = cursor;
+    if (failure !== undefined) throw failure;
+    return { applied, mismatched, cursor, latest };
   }
 
   /** Run passes until the cursor reaches the RPC's latest ledger. */
