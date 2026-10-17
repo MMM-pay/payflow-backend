@@ -102,6 +102,12 @@ describe("typed api client", () => {
     const mandates = await client.mandates({ subscriber: SUBSCRIBER });
     assert.equal(mandates.mandates.length, 1);
 
+    // The client serialises `ids` as a comma-separated list; unknown ids are
+    // omitted server-side.
+    const batch = await client.mandates({ ids: [1, 999] });
+    assert.equal(batch.mandates.length, 1);
+    assert.equal(batch.mandates[0]?.id, 1);
+
     const charges = await client.charges(1);
     assert.equal(charges.charges.length, 1);
     assert.equal(charges.charges[0]?.fee, "100000");

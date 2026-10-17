@@ -10,14 +10,48 @@ import type {
   MandateRow,
 } from "./types.ts";
 
+/** Upper bound on ids in one batch request. */
+const MAX_IDS = 100;
+
+/**
+ * Parse `?ids=1,2,3`. Returns null when any token is not a positive integer
+ * and `tooMany` when the raw list exceeds MAX_IDS — checked before de-duping,
+ * so a client cannot send an unbounded list.
+ */
+function parseIds(raw: unknown): { ids: number[]; tooMany: boolean } | null {
+  const tokens = String(raw).split(",");
+  const ids: number[] = [];
+  for (const token of tokens) {
+    const text = token.trim();
+    if (!/^\d+$/.test(text)) return null;
+    const id = Number(text);
+    if (!Number.isSafeInteger(id) || id <= 0) return null;
+    ids.push(id);
+  }
+  return { ids: [...new Set(ids)], tooMany: tokens.length > MAX_IDS };
+}
+
 /** `GET /mandates*` and the keeper-facing `GET /due`. */
 export function mandatesRouter(db: DatabaseSync): Router {
   const r = Router();
 
   r.get("/mandates", (req, res) => {
-    const { subscriber, merchant, status } = req.query;
+    const { ids, subscriber, merchant, status } = req.query;
     const where: string[] = [];
     const args: unknown[] = [];
+    if (ids !== undefined) {
+      const parsed = parseIds(ids);
+      if (parsed === null) {
+        res.status(400).json({ error: "invalid_ids" });
+        return;
+      }
+      if (parsed.tooMany) {
+        res.status(400).json({ error: "too_many_ids" });
+        return;
+      }
+      where.push(`id IN (${parsed.ids.map(() => "?").join(",")})`);
+      args.push(...parsed.ids);
+    }
     if (subscriber) {
       where.push("subscriber = ?");
       args.push(String(subscriber));
@@ -33,6 +67,9 @@ export function mandatesRouter(db: DatabaseSync): Router {
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
     args.push(limitOf(req.query.limit));
     const rows = db
+      // `clause` is assembled above from fixed predicates; every value is a
+      // bound parameter, so this interpolation is structural, not user data.
+      // eslint-disable-next-line no-restricted-syntax
       .prepare(`SELECT * FROM mandates ${clause} ORDER BY id DESC LIMIT ?`)
       .all(...(args as never[]));
     const body: MandatePage = { mandates: rows as unknown as MandateRow[] };

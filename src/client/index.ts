@@ -50,6 +50,8 @@ export interface PlansQuery {
 }
 
 export interface MandatesQuery {
+  /** Batch lookup; at most 100 ids, serialised as `1,2,3`. */
+  ids?: number[];
   subscriber?: string;
   merchant?: string;
   status?: string;
