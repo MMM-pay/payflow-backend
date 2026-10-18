@@ -1,13 +1,16 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
+import {
+  getMandateById,
+  listDueMandates,
+  listMandateCharges,
+  listMandates,
+} from "../lib/queries.ts";
 import { limitOf } from "./helpers.ts";
 import type {
   ChargePage,
-  ChargeRow,
-  DueMandateRow,
   DuePage,
   MandatePage,
-  MandateRow,
 } from "./types.ts";
 
 /** Upper bound on ids in one batch request. */
@@ -37,8 +40,7 @@ export function mandatesRouter(db: DatabaseSync): Router {
 
   r.get("/mandates", (req, res) => {
     const { ids, subscriber, merchant, status } = req.query;
-    const where: string[] = [];
-    const args: unknown[] = [];
+    let parsedIds: number[] | undefined;
     if (ids !== undefined) {
       const parsed = parseIds(ids);
       if (parsed === null) {
@@ -49,37 +51,21 @@ export function mandatesRouter(db: DatabaseSync): Router {
         res.status(400).json({ error: "too_many_ids" });
         return;
       }
-      where.push(`id IN (${parsed.ids.map(() => "?").join(",")})`);
-      args.push(...parsed.ids);
+      parsedIds = parsed.ids;
     }
-    if (subscriber) {
-      where.push("subscriber = ?");
-      args.push(String(subscriber));
-    }
-    if (merchant) {
-      where.push("merchant = ?");
-      args.push(String(merchant));
-    }
-    if (status) {
-      where.push("status = ?");
-      args.push(String(status));
-    }
-    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-    args.push(limitOf(req.query.limit));
-    const rows = db
-      // `clause` is assembled above from fixed predicates; every value is a
-      // bound parameter, so this interpolation is structural, not user data.
-      // eslint-disable-next-line no-restricted-syntax
-      .prepare(`SELECT * FROM mandates ${clause} ORDER BY id DESC LIMIT ?`)
-      .all(...(args as never[]));
-    const body: MandatePage = { mandates: rows as unknown as MandateRow[] };
+    const mandates = listMandates(db, {
+      ids: parsedIds,
+      subscriber: subscriber ? String(subscriber) : undefined,
+      merchant: merchant ? String(merchant) : undefined,
+      status: status ? String(status) : undefined,
+      limit: limitOf(req.query.limit),
+    });
+    const body: MandatePage = { mandates };
     res.json(body);
   });
 
   r.get("/mandates/:id", (req, res) => {
-    const row = db
-      .prepare("SELECT * FROM mandates WHERE id = ?")
-      .get(Number(req.params.id)) as unknown as MandateRow | undefined;
+    const row = getMandateById(db, Number(req.params.id));
     if (!row) {
       res.status(404).json({ error: "mandate_not_found" });
       return;
@@ -88,26 +74,20 @@ export function mandatesRouter(db: DatabaseSync): Router {
   });
 
   r.get("/mandates/:id/charges", (req, res) => {
-    const rows = db
-      .prepare("SELECT * FROM charges WHERE mandate_id = ? ORDER BY ledger DESC LIMIT ?")
-      .all(Number(req.params.id), limitOf(req.query.limit));
-    const body: ChargePage = { charges: rows as unknown as ChargeRow[] };
+    const charges = listMandateCharges(
+      db,
+      Number(req.params.id),
+      limitOf(req.query.limit),
+    );
+    const body: ChargePage = { charges };
     res.json(body);
   });
 
   /** Mandates chargeable right now, per the indexed projection. */
   r.get("/due", (req, res) => {
     const now = Math.floor(Date.now() / 1000);
-    const rows = db
-      .prepare(
-        `SELECT id, subscriber, merchant, next_charge, amount
-           FROM mandates
-          WHERE status = 'Active' AND next_charge <= ?
-            AND (max_charges = 0 OR charges_made < max_charges)
-          ORDER BY next_charge ASC LIMIT ?`,
-      )
-      .all(now, limitOf(req.query.limit));
-    const body: DuePage = { now, due: rows as unknown as DueMandateRow[] };
+    const due = listDueMandates(db, now, limitOf(req.query.limit));
+    const body: DuePage = { now, due };
     res.json(body);
   });
 

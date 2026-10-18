@@ -1,6 +1,9 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
-import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "./helpers.ts";
+import {
+  getMerchantSummary,
+  listMerchantForecastMandates,
+} from "../lib/queries.ts";
 import type { ForecastResponse, MerchantSummary } from "./types.ts";
 
 /**
@@ -56,47 +59,6 @@ export class MerchantSummaryCache {
 
 export const defaultMerchantSummaryCache = new MerchantSummaryCache();
 
-/** Revenue per token: sums from charges and active mandates, joined via plans. */
-function tokensOf(
-  db: DatabaseSync,
-  merchant: string,
-): { token: string; totalCollected: string; mrr: string }[] {
-  // A charge carries no token of its own; its mandate's plan does. Both
-  // series read as bigint so no sum round-trips through a JS number.
-  const collected = db.prepare(
-    `SELECT p.token AS token, COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total
-       FROM charges c
-       JOIN mandates m ON m.id = c.mandate_id
-       JOIN plans p ON p.id = m.plan_id
-      WHERE c.merchant = ?
-      GROUP BY p.token`,
-  );
-  collected.setReadBigInts(true);
-  const recurring = db.prepare(
-    // eslint-disable-next-line no-restricted-syntax
-    `SELECT p.token AS token,
-            COALESCE(SUM(CAST(m.amount AS INTEGER) * ${SECONDS_PER_MONTH} / m.period), 0) AS mrr
-       FROM mandates m
-       JOIN plans p ON p.id = m.plan_id
-      WHERE m.merchant = ? AND m.status = 'Active' AND m.period > 0
-      GROUP BY p.token`,
-  );
-  recurring.setReadBigInts(true);
-
-  const tokens = new Map<string, { totalCollected: string; mrr: string }>();
-  for (const row of collected.all(merchant) as { token: string; total: bigint }[]) {
-    tokens.set(row.token, { totalCollected: String(row.total), mrr: "0" });
-  }
-  for (const row of recurring.all(merchant) as { token: string; mrr: bigint }[]) {
-    const entry = tokens.get(row.token) ?? { totalCollected: "0", mrr: "0" };
-    entry.mrr = String(row.mrr);
-    tokens.set(row.token, entry);
-  }
-  return [...tokens]
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([token, sums]) => ({ token, ...sums }));
-}
-
 const DAY_S = 86_400;
 /** Longest forecast horizon, to keep the arithmetic bounded. */
 const MAX_FORECAST_DAYS = 365;
@@ -144,48 +106,7 @@ export function merchantsRouter(
       return;
     }
 
-    const active = db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM mandates WHERE merchant = ? AND status = 'Active'",
-      )
-      .get(address) as { n: number };
-    const collected = db
-      .prepare(
-        "SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) AS total, COUNT(*) AS n FROM charges WHERE merchant = ?",
-      )
-      .get(address) as { total: number; n: number };
-    // Recurring revenue, normalised from each mandate's own period: MRR over a
-    // 30-day month and ARR over a 365-day year. Integer division truncates,
-    // which is fine at base-unit (stroop) scale.
-    const recurring = db
-      .prepare(
-        // Only module-level constants are interpolated here; the address is a
-        // bound parameter, so no request data reaches the SQL text.
-        // eslint-disable-next-line no-restricted-syntax
-        `SELECT COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_MONTH} / period), 0) AS mrr,
-                COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_YEAR} / period), 0) AS arr
-           FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
-      )
-      .get(address) as { mrr: number; arr: number };
-
-    // The flat totals stop at one token only when a default exists. Without
-    // TOKEN_ID they keep the previous all-token meaning.
-    const tokens = tokensOf(db, address);
-    const scoped = defaultToken
-      ? tokens.find((t) => t.token === defaultToken)
-      : undefined;
-
-    const body: MerchantSummary = {
-      merchant: address,
-      activeMandates: active.n,
-      totalCollected: defaultToken
-        ? (scoped?.totalCollected ?? "0")
-        : String(collected.total),
-      chargeCount: collected.n,
-      mrr: defaultToken ? (scoped?.mrr ?? "0") : String(recurring.mrr),
-      arr: String(recurring.arr),
-      tokens,
-    };
+    const body = getMerchantSummary(db, address, defaultToken);
     cache.set(cacheKey, body);
     res.json(body);
   });
@@ -197,19 +118,7 @@ export function merchantsRouter(
     const from = Math.floor(Date.now() / 1000);
     const to = from + days * DAY_S;
 
-    const mandates = db
-      .prepare(
-        `SELECT amount, period, next_charge, charges_made, max_charges, fee_bps
-           FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
-      )
-      .all(address) as {
-      amount: string;
-      period: number;
-      next_charge: number;
-      charges_made: number;
-      max_charges: number;
-      fee_bps: number;
-    }[];
+    const mandates = listMerchantForecastMandates(db, address);
 
     let net = 0n;
     let counted = 0;

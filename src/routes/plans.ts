@@ -1,7 +1,8 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
+import { getPlanById, listPlans } from "../lib/queries.ts";
 import { limitOf } from "./helpers.ts";
-import type { PlanPage, PlanRow } from "./types.ts";
+import type { PlanPage } from "./types.ts";
 
 /** `GET /plans` and `GET /plans/:id`. */
 export function plansRouter(db: DatabaseSync): Router {
@@ -9,21 +10,16 @@ export function plansRouter(db: DatabaseSync): Router {
 
   r.get("/plans", (req, res) => {
     const { merchant } = req.query;
-    const rows = merchant
-      ? db
-          .prepare("SELECT * FROM plans WHERE merchant = ? ORDER BY id DESC LIMIT ?")
-          .all(String(merchant), limitOf(req.query.limit))
-      : db
-          .prepare("SELECT * FROM plans ORDER BY id DESC LIMIT ?")
-          .all(limitOf(req.query.limit));
-    const body: PlanPage = { plans: rows as unknown as PlanRow[] };
+    const plans = listPlans(db, {
+      merchant: merchant ? String(merchant) : undefined,
+      limit: limitOf(req.query.limit),
+    });
+    const body: PlanPage = { plans };
     res.json(body);
   });
 
   r.get("/plans/:id", (req, res) => {
-    const row = db
-      .prepare("SELECT * FROM plans WHERE id = ?")
-      .get(Number(req.params.id)) as unknown as PlanRow | undefined;
+    const row = getPlanById(db, Number(req.params.id));
     if (!row) {
       res.status(404).json({ error: "plan_not_found" });
       return;

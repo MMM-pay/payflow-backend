@@ -1,0 +1,315 @@
+import type { DatabaseSync } from "node:sqlite";
+import { readCursor } from "./db.ts";
+import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "../routes/helpers.ts";
+import type {
+  ChargeRow,
+  DueMandateRow,
+  MandateRow,
+  MerchantSummary,
+  PlanRow,
+  StatsResponse,
+  SubscriberSummary,
+  TokenRevenue,
+} from "../routes/types.ts";
+
+export interface ListPlansFilter {
+  merchant?: string | undefined;
+  limit: number;
+}
+
+export interface ListMandatesFilter {
+  ids?: number[] | undefined;
+  subscriber?: string | undefined;
+  merchant?: string | undefined;
+  status?: string | undefined;
+  limit: number;
+}
+
+export interface ForecastMandateRow {
+  amount: string;
+  period: number;
+  next_charge: number;
+  charges_made: number;
+  max_charges: number;
+  fee_bps: number;
+}
+
+export interface UpcomingMandateRow {
+  id: number;
+  merchant: string;
+  amount: string;
+  period: number;
+  next_charge: number;
+  charges_made: number;
+  max_charges: number;
+}
+
+/** List plans ordered newest-first, optionally filtered by merchant. */
+export function listPlans(db: DatabaseSync, filter: ListPlansFilter): PlanRow[] {
+  const rows = filter.merchant
+    ? db
+        .prepare("SELECT * FROM plans WHERE merchant = ? ORDER BY id DESC LIMIT ?")
+        .all(filter.merchant, filter.limit)
+    : db
+        .prepare("SELECT * FROM plans ORDER BY id DESC LIMIT ?")
+        .all(filter.limit);
+  return rows as unknown as PlanRow[];
+}
+
+/** Look up a single plan by on-chain id. */
+export function getPlanById(db: DatabaseSync, id: number): PlanRow | undefined {
+  return db
+    .prepare("SELECT * FROM plans WHERE id = ?")
+    .get(id) as unknown as PlanRow | undefined;
+}
+
+/** List mandates ordered newest-first with optional id batch, subscriber, merchant, and status filters. */
+export function listMandates(
+  db: DatabaseSync,
+  filter: ListMandatesFilter,
+): MandateRow[] {
+  const where: string[] = [];
+  const args: unknown[] = [];
+  if (filter.ids !== undefined) {
+    if (filter.ids.length === 0) return [];
+    where.push(`id IN (${filter.ids.map(() => "?").join(",")})`);
+    args.push(...filter.ids);
+  }
+  if (filter.subscriber) {
+    where.push("subscriber = ?");
+    args.push(filter.subscriber);
+  }
+  if (filter.merchant) {
+    where.push("merchant = ?");
+    args.push(filter.merchant);
+  }
+  if (filter.status) {
+    where.push("status = ?");
+    args.push(filter.status);
+  }
+  const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  args.push(filter.limit);
+  const rows = db
+    // `clause` is assembled above from fixed predicates; every value is a
+    // bound parameter, so this interpolation is structural, not user data.
+    // eslint-disable-next-line no-restricted-syntax
+    .prepare(`SELECT * FROM mandates ${clause} ORDER BY id DESC LIMIT ?`)
+    .all(...(args as never[]));
+  return rows as unknown as MandateRow[];
+}
+
+/** Look up a single mandate by on-chain id. */
+export function getMandateById(
+  db: DatabaseSync,
+  id: number,
+): MandateRow | undefined {
+  return db
+    .prepare("SELECT * FROM mandates WHERE id = ?")
+    .get(id) as unknown as MandateRow | undefined;
+}
+
+/** List charge events for a mandate ordered by ledger descending. */
+export function listMandateCharges(
+  db: DatabaseSync,
+  mandateId: number,
+  limit: number,
+): ChargeRow[] {
+  return db
+    .prepare("SELECT * FROM charges WHERE mandate_id = ? ORDER BY ledger DESC LIMIT ?")
+    .all(mandateId, limit) as unknown as ChargeRow[];
+}
+
+/** List active mandates currently eligible for settlement at `now`. */
+export function listDueMandates(
+  db: DatabaseSync,
+  now: number,
+  limit: number,
+): DueMandateRow[] {
+  return db
+    .prepare(
+      `SELECT id, subscriber, merchant, next_charge, amount
+         FROM mandates
+        WHERE status = 'Active' AND next_charge <= ?
+          AND (max_charges = 0 OR charges_made < max_charges)
+        ORDER BY next_charge ASC LIMIT ?`,
+    )
+    .all(now, limit) as unknown as DueMandateRow[];
+}
+
+/** Revenue per token: sums from charges and active mandates, joined via plans. */
+export function listMerchantTokenRevenue(
+  db: DatabaseSync,
+  merchant: string,
+): TokenRevenue[] {
+  // A charge carries no token of its own; its mandate's plan does. Both
+  // series read as bigint so no sum round-trips through a JS number.
+  const collected = db.prepare(
+    `SELECT p.token AS token, COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total
+       FROM charges c
+       JOIN mandates m ON m.id = c.mandate_id
+       JOIN plans p ON p.id = m.plan_id
+      WHERE c.merchant = ?
+      GROUP BY p.token`,
+  );
+  collected.setReadBigInts(true);
+  const recurring = db.prepare(
+    // eslint-disable-next-line no-restricted-syntax
+    `SELECT p.token AS token,
+            COALESCE(SUM(CAST(m.amount AS INTEGER) * ${SECONDS_PER_MONTH} / m.period), 0) AS mrr
+       FROM mandates m
+       JOIN plans p ON p.id = m.plan_id
+      WHERE m.merchant = ? AND m.status = 'Active' AND m.period > 0
+      GROUP BY p.token`,
+  );
+  recurring.setReadBigInts(true);
+
+  const tokens = new Map<string, { totalCollected: string; mrr: string }>();
+  for (const row of collected.all(merchant) as { token: string; total: bigint }[]) {
+    tokens.set(row.token, { totalCollected: String(row.total), mrr: "0" });
+  }
+  for (const row of recurring.all(merchant) as { token: string; mrr: bigint }[]) {
+    const entry = tokens.get(row.token) ?? { totalCollected: "0", mrr: "0" };
+    entry.mrr = String(row.mrr);
+    tokens.set(row.token, entry);
+  }
+  return [...tokens]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([token, sums]) => ({ token, ...sums }));
+}
+
+/** Compute merchant revenue summary and per-token breakdown. */
+export function getMerchantSummary(
+  db: DatabaseSync,
+  merchant: string,
+  defaultToken?: string,
+): MerchantSummary {
+  const active = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM mandates WHERE merchant = ? AND status = 'Active'",
+    )
+    .get(merchant) as { n: number };
+  const collected = db
+    .prepare(
+      "SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) AS total, COUNT(*) AS n FROM charges WHERE merchant = ?",
+    )
+    .get(merchant) as { total: number; n: number };
+  // Recurring revenue, normalised from each mandate's own period: MRR over a
+  // 30-day month and ARR over a 365-day year. Integer division truncates,
+  // which is fine at base-unit (stroop) scale.
+  const recurring = db
+    .prepare(
+      // Only module-level constants are interpolated here; the address is a
+      // bound parameter, so no request data reaches the SQL text.
+      // eslint-disable-next-line no-restricted-syntax
+      `SELECT COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_MONTH} / period), 0) AS mrr,
+              COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_YEAR} / period), 0) AS arr
+         FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
+    )
+    .get(merchant) as { mrr: number; arr: number };
+
+  // The flat totals stop at one token only when a default exists. Without
+  // TOKEN_ID they keep the previous all-token meaning.
+  const tokens = listMerchantTokenRevenue(db, merchant);
+  const scoped = defaultToken
+    ? tokens.find((t) => t.token === defaultToken)
+    : undefined;
+
+  return {
+    merchant,
+    activeMandates: active.n,
+    totalCollected: defaultToken
+      ? (scoped?.totalCollected ?? "0")
+      : String(collected.total),
+    chargeCount: collected.n,
+    mrr: defaultToken ? (scoped?.mrr ?? "0") : String(recurring.mrr),
+    arr: String(recurring.arr),
+    tokens,
+  };
+}
+
+/** Active positive-period mandates for a merchant's revenue forecast. */
+export function listMerchantForecastMandates(
+  db: DatabaseSync,
+  merchant: string,
+): ForecastMandateRow[] {
+  return db
+    .prepare(
+      `SELECT amount, period, next_charge, charges_made, max_charges, fee_bps
+         FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
+    )
+    .all(merchant) as unknown as ForecastMandateRow[];
+}
+
+/** Subscriber mandates and cumulative gross amount paid (amount + fee). */
+export function getSubscriberSummary(
+  db: DatabaseSync,
+  subscriber: string,
+): SubscriberSummary {
+  const mandates = db
+    .prepare("SELECT * FROM mandates WHERE subscriber = ? ORDER BY id DESC")
+    .all(subscriber) as unknown as MandateRow[];
+  const paid = db
+    .prepare(
+      "SELECT COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS total FROM charges WHERE subscriber = ?",
+    )
+    .get(subscriber) as { total: number };
+  return {
+    subscriber,
+    mandates,
+    totalPaid: String(paid.total),
+  };
+}
+
+/** Active positive-period mandates for a subscriber's upcoming schedule. */
+export function listSubscriberUpcomingMandates(
+  db: DatabaseSync,
+  subscriber: string,
+): UpcomingMandateRow[] {
+  return db
+    .prepare(
+      `SELECT id, merchant, amount, period, next_charge, charges_made, max_charges
+         FROM mandates WHERE subscriber = ? AND status = 'Active' AND period > 0`,
+    )
+    .all(subscriber) as unknown as UpcomingMandateRow[];
+}
+
+/** Run an aggregate returning one `total` column; decimal string out. */
+function sumOf(db: DatabaseSync, sql: string, ...args: unknown[]): string {
+  const stmt = db.prepare(sql);
+  // Read as bigint so a large sum never round-trips through a JS number.
+  stmt.setReadBigInts(true);
+  const row = stmt.get(...(args as never[])) as { total: bigint } | undefined;
+  return String(row?.total ?? 0n);
+}
+
+/** Protocol-wide counts, gross volume (24h and all-time), fees, and indexer cursor. */
+export function getProtocolStats(
+  db: DatabaseSync,
+  since: number,
+): StatsResponse {
+  const one = (sql: string): number =>
+    (db.prepare(sql).get() as { n: number } | undefined)?.n ?? 0;
+  return {
+    plans: one("SELECT COUNT(*) AS n FROM plans"),
+    mandates: one("SELECT COUNT(*) AS n FROM mandates"),
+    activeMandates: one("SELECT COUNT(*) AS n FROM mandates WHERE status = 'Active'"),
+    charges: one("SELECT COUNT(*) AS n FROM charges"),
+    volume24h: sumOf(
+      db,
+      "SELECT COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS total FROM charges WHERE created_at >= ?",
+      since,
+    ),
+    volumeAllTime: sumOf(
+      db,
+      "SELECT COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS total FROM charges",
+    ),
+    totalFees: sumOf(
+      db,
+      "SELECT COALESCE(SUM(CAST(fee AS INTEGER)), 0) AS total FROM charges",
+    ),
+    activeMerchants: one(
+      "SELECT COUNT(DISTINCT merchant) AS n FROM mandates WHERE status = 'Active'",
+    ),
+    lastIndexedLedger: readCursor(db, 0),
+  };
+}
