@@ -43,6 +43,7 @@ const status = {
   lastError: null,
   lastLedgerCloseTime: 1_700_000_000,
   freshnessSeconds: 42,
+  paused: false,
 };
 const mainnetStatus = { cursor: 500, latest: 505, lastRunAt: Date.now(), lastError: null };
 let base: string;
@@ -137,6 +138,24 @@ describe("http api", () => {
     assert.equal(ixStatus.freshnessSeconds, 42);
   });
 
+  test("health reports the indexer's default running state", async () => {
+    const { body } = await get("/health");
+    const ixStatus = body.indexer as unknown as { paused: boolean };
+    assert.equal(ixStatus.paused, false);
+  });
+
+  test("health reports paused while the indexer is held back, and stays 200", async () => {
+    status.paused = true;
+    try {
+      const res = await get("/health");
+      assert.equal(res.status, 200);
+      const ixStatus = res.body.indexer as unknown as { paused: boolean };
+      assert.equal(ixStatus.paused, true);
+    } finally {
+      status.paused = false;
+    }
+  });
+
   test("health says catching_up while far behind, but stays 200", async () => {
     status.latest = 50_000;
     try {
@@ -213,13 +232,13 @@ describe("http api", () => {
     const ids = Array.from({ length: 101 }, (_, i) => i + 1).join(",");
     const { status, body } = await get(`/api/mandates?ids=${ids}`);
     assert.equal(status, 400);
-    assert.equal(body.error, "too_many_ids");
+    assert.equal((body.error as unknown as { code: string }).code, "too_many_ids");
   });
 
   test("batch mandate lookup rejects a non-numeric id", async () => {
     const { status, body } = await get("/api/mandates?ids=1,nope");
     assert.equal(status, 400);
-    assert.equal(body.error, "invalid_ids");
+    assert.equal((body.error as unknown as { code: string }).code, "invalid_ids");
   });
 
   test("merchant summary computes MRR, ARR and revenue", async () => {
@@ -290,7 +309,7 @@ describe("http api", () => {
   test("unknown route is 404 json", async () => {
     const { status, body } = await get("/nope");
     assert.equal(status, 404);
-    assert.equal(body.error, "not_found");
+    assert.equal((body.error as unknown as { code: string }).code, "not_found");
   });
 
   test("every response carries an X-Request-Id, reusing the caller's", async () => {
@@ -305,6 +324,43 @@ describe("http api", () => {
   test("X-Request-Id is exposed to browsers through CORS", async () => {
     const res = await fetch(`${base}/health`, { headers: { Origin: "http://localhost:3000" } });
     assert.match(res.headers.get("access-control-expose-headers") ?? "", /x-request-id/i);
+  });
+});
+
+describe("structured error responses", () => {
+  type ErrBody = { error: { code: string; message: string; requestId: string | null } };
+
+  test("a 404 on a known resource is a structured envelope", async () => {
+    const { status, body } = await get("/api/plans/999");
+    assert.equal(status, 404);
+    const err = (body as unknown as ErrBody).error;
+    assert.equal(err.code, "plan_not_found");
+    assert.equal(typeof err.message, "string");
+    assert.ok(err.message.length > 0);
+    assert.ok(typeof err.requestId === "string" && err.requestId.length > 0);
+  });
+
+  test("the envelope's requestId matches the X-Request-Id header", async () => {
+    const res = await fetch(`${base}/api/plans/999`, { headers: { "X-Request-Id": "corr-42" } });
+    assert.equal(res.status, 404);
+    const body = (await res.json()) as ErrBody;
+    assert.equal(body.error.requestId, "corr-42");
+    assert.equal(res.headers.get("x-request-id"), "corr-42");
+  });
+
+  test("a 400 from batch mandate validation is a structured envelope", async () => {
+    const { status, body } = await get("/api/mandates?ids=1,nope");
+    assert.equal(status, 400);
+    const err = (body as unknown as ErrBody).error;
+    assert.equal(err.code, "invalid_ids");
+    assert.equal(typeof err.message, "string");
+    assert.ok(err.message.length > 0);
+  });
+
+  test("an unknown path is a structured not_found", async () => {
+    const { status, body } = await get("/definitely/not/a/route");
+    assert.equal(status, 404);
+    assert.equal((body as unknown as ErrBody).error.code, "not_found");
   });
 });
 
@@ -780,7 +836,9 @@ describe("express 5 error boundary", () => {
       const res = await fetch(`${srv.url}/boom`, { signal: AbortSignal.timeout(5_000) });
       assert.equal(res.status, 500);
       // The fixed shape also proves nothing of the message reached the caller.
-      assert.deepEqual(await res.json(), { error: "internal_error" });
+      assert.deepEqual(await res.json(), {
+        error: { code: "internal_error", message: "An internal error occurred.", requestId: null },
+      });
       await new Promise((resolve) => setTimeout(resolve, 50));
       assert.deepEqual(reasons, []);
     } finally {
@@ -809,7 +867,12 @@ describe("express 5 error boundary", () => {
       });
       assert.equal(res.status, 500);
       // Neither the parser's message nor any part of the request body leaks.
-      assert.deepEqual(await res.json(), { error: "internal_error" });
+      const body = (await res.json()) as {
+        error: { code: string; message: string; requestId: string | null };
+      };
+      assert.equal(body.error.code, "internal_error");
+      assert.equal(body.error.message, "An internal error occurred.");
+      assert.ok(!JSON.stringify(body).includes("do-not-log-me"));
 
       // pino is called as `logger.error(obj, msg)`; only the boundary's own
       // line is inspected, as a request line holds a live IncomingMessage.
@@ -868,7 +931,9 @@ describe("express 5 error boundary", () => {
       () => {},
     );
     assert.equal(code, 500);
-    assert.deepEqual(sent, { error: "internal_error" });
+    assert.deepEqual(sent, {
+      error: { code: "internal_error", message: "An internal error occurred.", requestId: null },
+    });
   });
 
   test("hands back a response whose headers are already out", () => {
@@ -933,7 +998,7 @@ describe("multiple networks", () => {
   test("an unknown network segment is a 404", async () => {
     const res = await get("/api/regtest/plans");
     assert.equal(res.status, 404);
-    assert.equal(res.body.error, "not_found");
+    assert.equal((res.body.error as unknown as { code: string }).code, "not_found");
   });
 });
 

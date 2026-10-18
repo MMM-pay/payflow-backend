@@ -137,7 +137,7 @@ When extra networks are configured (see below), every route also answers under
 
 | Method | Path | Returns |
 |---|---|---|
-| `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
+| `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, `paused` state, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
 | `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
@@ -153,8 +153,48 @@ When extra networks are configured (see below), every route also answers under
 
 `/api/mandates` also accepts `ids`, a comma-separated batch of up to 100
 mandate ids (`?ids=1,2,3`). Ids that do not exist are omitted; more than 100
-ids returns `400 { "error": "too_many_ids" }` and a non-numeric id returns
-`400 { "error": "invalid_ids" }`.
+ids returns `400` with `error.code = "too_many_ids"` and a non-numeric id
+returns `400` with `error.code = "invalid_ids"`.
+
+### Error responses
+
+Every non-2xx response uses one structured envelope, so a client can branch on
+a stable `code` and show the human-readable `message` without parsing prose:
+
+```json
+{
+  "error": {
+    "code": "plan_not_found",
+    "message": "No plan exists with that id.",
+    "requestId": "b1e4..."
+  }
+}
+```
+
+- `code` is machine-readable and stable per condition (the closed set below);
+  new variants are added, never renamed.
+- `message` is safe to display. It never carries an exception string, a bound
+  SQL value, or an RPC URL — `internal_error` always uses fixed copy.
+- `requestId` echoes the response's `X-Request-Id` header so a report can be
+  tied to the matching server log line. It is `null` only if no id was minted.
+
+> **Migration note.** This envelope replaces the earlier `{ "error": "<code>" }`
+> string body. Consumers that read the error must now read `error.code`.
+
+| `error.code` | HTTP | Where |
+|---|---|---|
+| `not_found` | 404 | An unknown path, or a method/path the API does not expose |
+| `plan_not_found` | 404 | `GET /api/plans/:id` with no such plan |
+| `mandate_not_found` | 404 | `GET /api/mandates/:id` with no such mandate |
+| `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
+| `too_many_ids` | 400 | `?ids=` lists more than 100 ids |
+| `unauthorized` | 401 | A `/admin/*` request without a valid bearer token |
+| `reindex_unavailable` | 503 | `POST /admin/reindex` on a process without an indexer |
+| `indexer_unavailable` | 503 | `/admin/indexer/pause`/`resume` on a process without an indexer |
+| `keeper_unavailable` | 503 | A keeper endpoint while `KEEPER_ENABLED=false` |
+| `reindex_failed` | 500 | `POST /admin/reindex` threw (operator message retained) |
+| `keeper_pass_failed` | 500 | `POST /admin/keeper/run` threw (operator message retained) |
+| `internal_error` | 500 | Any unhandled failure at the API boundary |
 
 Example:
 
@@ -243,6 +283,8 @@ variable the paths are absent and 404 like any other unknown route.
 | Method | Path | Action |
 |---|---|---|
 | `POST` | `/admin/reindex` | Run one indexer pass now |
+| `POST` | `/admin/indexer/pause` | Hold the indexer loop back without stopping the API |
+| `POST` | `/admin/indexer/resume` | Let indexer passes run again |
 | `POST` | `/admin/keeper/run` | Run one settlement pass now |
 | `GET` | `/admin/keeper/backoff` | Mandates backing off after failed charges |
 
@@ -252,6 +294,13 @@ overlap would race the cursor and, for the keeper, the account sequence
 number. The keeper endpoints answer `503 keeper_unavailable` when the keeper
 is off (`KEEPER_ENABLED=false`). A pass that fails answers 500 and the failure
 is logged; the next scheduled pass retries as usual.
+
+Pausing the indexer makes each scheduled pass a no-op: no RPC reads, no
+writes, and the saved cursor is preserved, so resuming continues exactly where
+it left off. The API keeps serving the projection as it stands throughout, and
+`/health` reports `indexer.paused: true` while held back. This is the runtime
+investigation switch — it does not stop the process, so a bad event can be
+examined without API downtime.
 
 ## Configuration
 

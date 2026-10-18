@@ -73,6 +73,17 @@ const adminHooks: AdminHooks = {
     const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
     return results[0]!;
   },
+  // Runtime indexer control: hold every network's loop back without taking the
+  // API down. While paused, each tick is a no-op, so the cursor and projection
+  // are preserved and /health reports `indexer.paused: true`.
+  pauseIndexer: () => {
+    for (const rt of runtimes) rt.indexer.pause();
+    return null;
+  },
+  resumeIndexer: () => {
+    for (const rt of runtimes) rt.indexer.resume();
+    return null;
+  },
 };
 if (keeper && runKeeperPass) {
   adminHooks.keeperPass = () => runKeeperPass();

@@ -7,6 +7,7 @@ import {
   listMandates,
 } from "../lib/queries.ts";
 import { limitOf } from "./helpers.ts";
+import { sendApiError } from "./errors.ts";
 import type {
   ChargePage,
   DuePage,
@@ -44,11 +45,11 @@ export function mandatesRouter(db: DatabaseSync): Router {
     if (ids !== undefined) {
       const parsed = parseIds(ids);
       if (parsed === null) {
-        res.status(400).json({ error: "invalid_ids" });
+        sendApiError(res, req, 400, "invalid_ids");
         return;
       }
       if (parsed.tooMany) {
-        res.status(400).json({ error: "too_many_ids" });
+        sendApiError(res, req, 400, "too_many_ids");
         return;
       }
       parsedIds = parsed.ids;
@@ -67,7 +68,7 @@ export function mandatesRouter(db: DatabaseSync): Router {
   r.get("/mandates/:id", (req, res) => {
     const row = getMandateById(db, Number(req.params.id));
     if (!row) {
-      res.status(404).json({ error: "mandate_not_found" });
+      sendApiError(res, req, 404, "mandate_not_found");
       return;
     }
     res.json(row);

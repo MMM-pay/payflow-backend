@@ -73,6 +73,13 @@ export interface IndexerStatus {
    * Data freshness in seconds (seconds elapsed since the last indexed ledger closed).
    */
   freshnessSeconds?: number | null;
+  /**
+   * True when an operator has held the indexer loop back at runtime
+   * (`POST /admin/indexer/pause`). Passes become no-ops until it is resumed;
+   * the cursor is preserved so the projection picks up where it left off and
+   * the API keeps serving. Reported on `/health`.
+   */
+  paused?: boolean;
 }
 
 export class Indexer {
@@ -88,10 +95,26 @@ export class Indexer {
     mismatchedEvents: 0,
     lastLedgerCloseTime: null,
     freshnessSeconds: null,
+    paused: false,
   };
   /** Events since process start that failed spec validation. */
   get mismatchedEvents(): number {
     return this.status.mismatchedEvents ?? 0;
+  }
+
+  /**
+   * Hold the indexer loop back at runtime without stopping the process. The
+   * next `tick` becomes a no-op (no RPC, no writes, cursor preserved) until
+   * {@link resume} — so the API keeps serving the current projection while an
+   * operator investigates.
+   */
+  pause(): void {
+    this.status.paused = true;
+  }
+
+  /** Let passes run again after {@link pause}. */
+  resume(): void {
+    this.status.paused = false;
   }
 
   constructor(
@@ -218,6 +241,12 @@ export class Indexer {
    * safe.
    */
   async tick(): Promise<TickResult> {
+    // Held back by an operator (`POST /admin/indexer/pause`): read nothing and
+    // write nothing, so the saved cursor and projection are untouched and the
+    // loop resumes exactly where it left off on resume.
+    if (this.status.paused) {
+      return { applied: 0, mismatched: 0, cursor: this.status.cursor, latest: this.status.latest };
+    }
     const latestRes = await this.server.getLatestLedger();
     const latest = latestRes.sequence;
     const latestCloseTime = parseCloseTime((latestRes as { closeTime?: unknown }).closeTime);

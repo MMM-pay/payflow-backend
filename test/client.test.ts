@@ -138,7 +138,10 @@ describe("typed api client", () => {
       (err: unknown) => {
         assert.ok(err instanceof PayflowApiError);
         assert.equal(err.status, 404);
-        assert.deepEqual(err.body, { error: "plan_not_found" });
+        const body = err.body as { error: { code: string; message: string; requestId: string | null } };
+        assert.equal(body.error.code, "plan_not_found");
+        assert.equal(typeof body.error.message, "string");
+        assert.ok(body.error.requestId === null || typeof body.error.requestId === "string");
         return true;
       },
     );

@@ -266,3 +266,55 @@ describe("schema migration", () => {
     );
   });
 });
+
+describe("runtime pause and resume", () => {
+  /** A fake RPC that records whether any pass actually reached the network. */
+  function fakeRpc() {
+    const calls = { latest: 0, health: 0, events: 0 };
+    const server = {
+      getLatestLedger: async () => {
+        calls.latest += 1;
+        return { sequence: 2_000 };
+      },
+      getHealth: async () => {
+        calls.health += 1;
+        return { oldestLedger: 1 };
+      },
+      getEvents: async () => {
+        calls.events += 1;
+        return [];
+      },
+    };
+    return { server, calls };
+  }
+
+  test("a paused tick reads nothing and advances nothing", async () => {
+    const d = db();
+    const { server, calls } = fakeRpc();
+    const ix = new Indexer(d, server as never, { startLedger: 1_500 } as never);
+    ix.status.cursor = 1_500;
+    ix.status.latest = 1_600;
+    ix.pause();
+    assert.equal(ix.status.paused, true);
+
+    const r = await ix.tick();
+    assert.deepEqual(r, { applied: 0, mismatched: 0, cursor: 1_500, latest: 1_600 });
+    assert.equal(calls.latest, 0, "no RPC while paused");
+    assert.equal(calls.health, 0);
+    assert.equal(calls.events, 0);
+    assert.equal(ix.status.cursor, 1_500, "cursor preserved while paused");
+    d.close();
+  });
+
+  test("resume lets passes run again", async () => {
+    const d = db();
+    const { server, calls } = fakeRpc();
+    const ix = new Indexer(d, server as never, { startLedger: 1_500 } as never);
+    ix.pause();
+    ix.resume();
+    assert.equal(ix.status.paused, false);
+    await ix.tick();
+    assert.ok(calls.latest >= 1, "the network is read again after resume");
+    d.close();
+  });
+});

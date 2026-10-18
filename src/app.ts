@@ -7,6 +7,7 @@ import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
 import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
 import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
+import { sendApiError } from "./routes/errors.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
@@ -69,7 +70,9 @@ export function errorHandler(
     return;
   }
   logger.error({ err: loggableError(err) }, "unhandled request error");
-  res.status(500).json({ error: "internal_error" });
+  // Fixed copy from the code's default message: `err.message` can carry a bound
+  // SQL value or an RPC URL, so it never reaches the response body.
+  sendApiError(res, _req, 500, "internal_error");
 }
 
 /** Ledgers the indexer may trail the network by before it is considered behind. */
@@ -106,6 +109,7 @@ function healthOf(runtime: NetworkRuntime): HealthResponse {
           cursor: indexer.cursor,
           latestLedger: indexer.latest,
           lag,
+          paused: indexer.paused ?? false,
           freshnessSeconds,
           lastRunAt: indexer.lastRunAt ? new Date(indexer.lastRunAt).toISOString() : null,
           lastError: indexer.lastError,
@@ -276,8 +280,8 @@ export function createApp(
 
   // Anything no route answered: an unknown path, or a method the API does not
   // expose on a known one.
-  app.use((_req, res) => {
-    res.status(404).json({ error: "not_found" });
+  app.use((req, res) => {
+    sendApiError(res, req, 404, "not_found");
   });
 
   // Four arguments, so Express treats this as the error middleware and routes

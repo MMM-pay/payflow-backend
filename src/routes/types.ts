@@ -159,6 +159,8 @@ export interface HealthResponse {
     cursor: number;
     latestLedger: number;
     lag: number | null;
+    /** True when the indexer loop is held back at runtime (see /admin/indexer/pause). */
+    paused: boolean;
     freshnessSeconds: number | null;
     lastRunAt: string | null;
     lastError: string | null;
@@ -177,7 +179,10 @@ export interface HealthResponse {
   networks?: Record<string, HealthResponse>;
 }
 
-/** Error bodies are `{ error: <code> }`; codes are stable per endpoint. */
-export interface ApiErrorResponse {
-  error: string;
-}
+/**
+ * Error bodies are the structured envelope `{ error: { code, message, requestId } }`;
+ * `code` is stable per endpoint (see `src/routes/errors.ts` for the closed set
+ * and how to extend it). This replaces the previous `{ error: <code> }` string
+ * body — consumers now read `error.code`.
+ */
+export type { ApiErrorBody as ApiErrorResponse, ApiErrorCode } from "./errors.ts";

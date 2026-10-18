@@ -65,7 +65,7 @@ describe("admin routes", () => {
       // mounted at all when no token is configured.
       const reindex = await call(app.base, "POST", "/admin/reindex", TOKEN);
       assert.equal(reindex.status, 404);
-      assert.equal(reindex.body.error, "not_found");
+      assert.equal((reindex.body.error as { code: string }).code, "not_found");
 
       const backoff = await call(app.base, "GET", "/admin/keeper/backoff", TOKEN);
       assert.equal(backoff.status, 404);
@@ -79,7 +79,7 @@ describe("admin routes", () => {
     try {
       const missing = await call(app.base, "POST", "/admin/reindex");
       assert.equal(missing.status, 401);
-      assert.equal(missing.body.error, "unauthorized");
+      assert.equal((missing.body.error as { code: string }).code, "unauthorized");
 
       const wrong = await call(app.base, "POST", "/admin/reindex", "not-the-token");
       assert.equal(wrong.status, 401);
@@ -137,11 +137,11 @@ describe("admin routes", () => {
     try {
       const run = await call(app.base, "POST", "/admin/keeper/run", TOKEN);
       assert.equal(run.status, 503);
-      assert.equal(run.body.error, "keeper_unavailable");
+      assert.equal((run.body.error as { code: string }).code, "keeper_unavailable");
 
       const backoff = await call(app.base, "GET", "/admin/keeper/backoff", TOKEN);
       assert.equal(backoff.status, 503);
-      assert.equal(backoff.body.error, "keeper_unavailable");
+      assert.equal((backoff.body.error as { code: string }).code, "keeper_unavailable");
     } finally {
       app.stop();
     }
@@ -152,7 +152,7 @@ describe("admin routes", () => {
     try {
       const { status, body } = await call(app.base, "POST", "/admin/reindex", TOKEN);
       assert.equal(status, 503);
-      assert.equal(body.error, "reindex_unavailable");
+      assert.equal((body.error as { code: string }).code, "reindex_unavailable");
     } finally {
       app.stop();
     }
@@ -167,8 +167,66 @@ describe("admin routes", () => {
     try {
       const { status, body } = await call(app.base, "POST", "/admin/reindex", TOKEN);
       assert.equal(status, 500);
-      assert.equal(body.error, "reindex_failed");
-      assert.equal(body.message, "rpc unreachable");
+      const err = body.error as { code: string; message: string; requestId: string | null };
+      assert.equal(err.code, "reindex_failed");
+      assert.equal(err.message, "rpc unreachable");
+      assert.ok(typeof err.requestId === "string" && err.requestId.length > 0);
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("pause and resume the indexer at runtime", async () => {
+    let paused = false;
+    const app = await startApp(testConfig(TOKEN), {
+      pauseIndexer: () => {
+        paused = true;
+        return null;
+      },
+      resumeIndexer: () => {
+        paused = false;
+        return null;
+      },
+    });
+    try {
+      const pause = await call(app.base, "POST", "/admin/indexer/pause", TOKEN);
+      assert.equal(pause.status, 200);
+      assert.equal(pause.body.paused, true);
+      assert.equal(paused, true);
+
+      const resume = await call(app.base, "POST", "/admin/indexer/resume", TOKEN);
+      assert.equal(resume.status, 200);
+      assert.equal(resume.body.paused, false);
+      assert.equal(paused, false);
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("say the indexer is unavailable when the process cannot control it", async () => {
+    const app = await startApp(testConfig(TOKEN), { reindex: async () => ({}) });
+    try {
+      const { status, body } = await call(app.base, "POST", "/admin/indexer/pause", TOKEN);
+      assert.equal(status, 503);
+      assert.equal((body.error as { code: string }).code, "indexer_unavailable");
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("reject an unauthenticated pause before running the hook", async () => {
+    let paused = false;
+    const app = await startApp(testConfig(TOKEN), {
+      pauseIndexer: () => {
+        paused = true;
+        return null;
+      },
+    });
+    try {
+      const { status, body } = await call(app.base, "POST", "/admin/indexer/pause");
+      assert.equal(status, 401);
+      assert.equal((body.error as { code: string }).code, "unauthorized");
+      assert.equal(paused, false);
     } finally {
       app.stop();
     }
