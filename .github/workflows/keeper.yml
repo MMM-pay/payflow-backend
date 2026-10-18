@@ -45,7 +45,7 @@ jobs:
       - run: npm ci
       # Restore the projection from the previous run so each run only indexes
       # the ledgers since then. A cache miss just means a full re-index.
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         with:
           path: keeper.db
           key: keeper-db-${{ env.SUBSCRIPTION_ID }}-${{ github.run_id }}
@@ -55,7 +55,7 @@ jobs:
       - name: Settle due mandates
         if: env.KEEPER_SECRET != ''
         run: npm run keeper
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: always()
         with:
           path: keeper.db
