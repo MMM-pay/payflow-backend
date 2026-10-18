@@ -1,0 +1,42 @@
+{
+  "status": "ok",
+  "network": "testnet",
+  "indexer": {
+    "cursor": 1000,
+    "latestLedger": 1010,
+    "lag": 10,
+    "paused": false,
+    "freshnessSeconds": 42,
+    "lastRunAt": "2025-06-15T15:06:40.000Z",
+    "lastError": null,
+    "mismatchedEvents": 0
+  },
+  "rpc": null,
+  "contracts": {
+    "planRegistry": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "vault": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "subscription": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  },
+  "networks": {
+    "testnet": {
+      "status": "ok",
+      "network": "testnet",
+      "indexer": {
+        "cursor": 1000,
+        "latestLedger": 1010,
+        "lag": 10,
+        "paused": false,
+        "freshnessSeconds": 42,
+        "lastRunAt": "2025-06-15T15:06:40.000Z",
+        "lastError": null,
+        "mismatchedEvents": 0
+      },
+      "rpc": null,
+      "contracts": {
+        "planRegistry": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        "vault": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        "subscription": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+      }
+    }
+  }
+}

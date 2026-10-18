@@ -1,0 +1,22 @@
+{
+  "subscriber": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+  "mandates": [
+    {
+      "id": 1,
+      "subscriber": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+      "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+      "plan_id": 1,
+      "amount": "10000000",
+      "period": 2592000,
+      "next_charge": 1752592000,
+      "last_charge": 1750000000,
+      "charges_made": 1,
+      "max_charges": 0,
+      "fee_bps": 0,
+      "status": "Active",
+      "ended_by": null,
+      "ledger": 1
+    }
+  ],
+  "totalPaid": "10000000"
+}

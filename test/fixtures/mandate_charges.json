@@ -1,0 +1,16 @@
+{
+  "charges": [
+    {
+      "tx_hash": "tx-charge-1",
+      "mandate_id": 1,
+      "subscriber": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+      "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+      "amount": "9900000",
+      "fee": "100000",
+      "charges_made": 1,
+      "next_charge": 1752592000,
+      "ledger": 1,
+      "created_at": 1750000000000
+    }
+  ]
+}

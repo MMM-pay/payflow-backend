@@ -224,6 +224,29 @@ A yearly plan of 120,000000 stroops therefore reports `arr` of 120000000 and
 an `mrr` of 9863013. A short-period demo plan produces a very large figure;
 that is arithmetic, not a bug.
 
+### Golden response fixtures
+
+`test/golden.test.ts` captures every route's JSON for a seeded in-memory
+database and compares it against a checked-in snapshot in `test/fixtures/`.
+Because the comparison is a full deep-equal, a renamed field, a dropped field,
+or a changed value fails the test even when the targeted assertions still pass
+— this is what stops a response shape drifting silently out from under the
+frontend.
+
+The capture is deterministic by construction: the clock is frozen for the whole
+run, the indexer status is fixed, and a fixed `x-request-id` header is echoed
+into every error envelope. No test touches the network.
+
+Update the snapshots **intentionally** when a response change is meant to land:
+
+```bash
+UPDATE_GOLDEN=1 npm test         # rewrites test/fixtures/*.json from the API
+git diff test/fixtures           # review it like any other contract change
+```
+
+A snapshot should only move because you asked it to; an unexpected diff is the
+regression the fixture exists to catch.
+
 ### Typed API client
 
 Response shapes are declared once, in `src/routes/types.ts`. The route

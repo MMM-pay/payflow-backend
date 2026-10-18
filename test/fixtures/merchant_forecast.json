@@ -1,0 +1,16 @@
+{
+  "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+  "days": 30,
+  "from": 1750000000,
+  "to": 1752592000,
+  "forecast": "0",
+  "mandateCount": 0,
+  "assumptions": [
+    "Only Active mandates are projected; paused, cancelled, and completed mandates are excluded.",
+    "Charges count where they fall due in [from, to); one falling due exactly at `to` is excluded.",
+    "Charges already due before `from` are not counted here — see /api/due and the charge history.",
+    "Each occurrence is net of the mandate's fee_bps: amount × (10000 − fee_bps) ÷ 10000.",
+    "Vault funding is not modelled; an underfunded vault will not settle on schedule.",
+    "A mandate with max_charges > 0 stops being projected once charges_made reaches the cap."
+  ]
+}

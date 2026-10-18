@@ -1,0 +1,11 @@
+{
+  "plans": 1,
+  "mandates": 1,
+  "activeMandates": 1,
+  "charges": 1,
+  "volume24h": "10000000",
+  "volumeAllTime": "10000000",
+  "totalFees": "100000",
+  "activeMerchants": 1,
+  "lastIndexedLedger": 0
+}

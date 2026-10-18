@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "too_many_ids",
+    "message": "The `ids` parameter accepts at most 100 mandate ids.",
+    "requestId": "golden"
+  }
+}

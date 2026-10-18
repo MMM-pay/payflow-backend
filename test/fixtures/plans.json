@@ -1,0 +1,14 @@
+{
+  "plans": [
+    {
+      "id": 1,
+      "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+      "name": "",
+      "token": "C",
+      "amount": "10000000",
+      "period": 2592000,
+      "active": 1,
+      "ledger": 1
+    }
+  ]
+}

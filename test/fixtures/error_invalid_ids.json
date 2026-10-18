@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "invalid_ids",
+    "message": "The `ids` parameter must be a comma-separated list of positive integers.",
+    "requestId": "golden"
+  }
+}

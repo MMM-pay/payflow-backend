@@ -1,0 +1,18 @@
+{
+  "subscriber": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+  "days": 30,
+  "now": 1750000000,
+  "until": 1752592000,
+  "upcoming": [],
+  "totalUpcoming": "0",
+  "truncated": false,
+  "assumptions": [
+    "Only Active mandates are projected; paused, cancelled, and completed mandates are excluded.",
+    "A mandate already due is projected at `now` (the next keeper pass settles it), then every `period`; missed periods are not replayed, matching the contract, which sets next_charge = charge time + period.",
+    "Occurrences fall in [now, until); one falling due exactly at `until` is excluded.",
+    "`amount` is the gross per-charge the subscriber pays, the same figure the contract pulls from the vault; `totalUpcoming` sums the listed occurrences.",
+    "A mandate with max_charges > 0 is projected only up to its remaining allowance (max_charges − charges_made).",
+    "At most 400 occurrences per mandate are listed; `truncated` says when that cap clipped the output.",
+    "Vault funding is not modelled; an underfunded vault will not settle on schedule."
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+  "activeMandates": 1,
+  "totalCollected": "9900000",
+  "chargeCount": 1,
+  "mrr": "10000000",
+  "arr": "121666666",
+  "tokens": [
+    {
+      "token": "C",
+      "totalCollected": "9900000",
+      "mrr": "10000000"
+    }
+  ]
+}

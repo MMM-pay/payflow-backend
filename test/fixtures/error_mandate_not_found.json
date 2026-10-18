@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "mandate_not_found",
+    "message": "No mandate exists with that id.",
+    "requestId": "golden"
+  }
+}
