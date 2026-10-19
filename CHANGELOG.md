@@ -7,6 +7,13 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **An OpenAPI description of the API (#7).** `GET /api/openapi.json` serves an
+  OpenAPI 3.1 document covering every route and `/health`, with the parameters
+  each route takes, the responses it answers and the schema of each body.
+  Amounts are documented as decimal strings in the token's smallest unit, so a
+  generated client knows not to read them as numbers. A test compares the
+  document with the routes Express registers, so a route that is added without
+  being documented fails the build.
 - **Merchant revenue over time (#12).** `GET /api/merchants/:address/revenue`
   reports what a merchant took in, what the protocol took and what was left,
   in `day`, `week` or `month` buckets: `gross`, `fee` and `net` per bucket,

@@ -58,7 +58,7 @@ replays that range on restart. Every write is designed for that:
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 326 tests, no network needed
+npm test                  # 394 tests, no network needed
 npm run dev
 ```
 
@@ -202,6 +202,7 @@ When extra networks are configured (see below), every route also answers under
 |---|---|---|
 | `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, `paused` state, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
 | `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
+| `GET` | `/api/openapi.json` | The OpenAPI 3.1 description of this API |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
 | `GET` | `/api/plans/:id/stats` | Per-plan statistics: active and total mandates, cancellations, total collected, average charges per mandate |
@@ -233,6 +234,26 @@ Every address the API takes is checked as a Stellar StrKey — an account
 invalid_request` rather than an empty page. The checksum is checked too: a
 one-character typo has the right shape but the wrong checksum, and it names
 no merchant.
+
+### The OpenAPI description
+
+`GET /api/openapi.json` serves an [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0)
+document describing every route above, with the parameters each one takes, the
+responses it answers and the schema of each body. Amounts are documented as
+decimal strings in the token's smallest unit, so a generated client knows not
+to read them as numbers.
+
+The document is served by the instance it belongs to, so it lists the routes
+that instance actually has: the operator endpoints (`/admin/...`), the metrics
+endpoint and the keeper history are in it whatever the configuration says,
+and each says in its description what has to be true for it to answer.
+
+```bash
+curl -s localhost:8080/api/openapi.json | jq '.paths | keys'
+```
+
+A test compares the document with the routes Express registers, so a route
+that is added without being documented fails the build.
 
 ### Merchant churn
 

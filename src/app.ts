@@ -10,6 +10,7 @@ import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
 import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
 import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
+import { buildOpenApiDocument } from "./routes/openapi.ts";
 import { asReader, TokenMetadataService } from "./lib/tokens.ts";
 import { sendApiError } from "./routes/errors.ts";
 import type { HealthResponse } from "./routes/types.ts";
@@ -267,6 +268,17 @@ export function createApp(
       handler: (req, res) => sendApiError(res, req, 429, "rate_limited"),
     }),
   );
+
+  // The API's own description: an OpenAPI 3.1 document covering every route
+  // this instance serves. It is built once and cached, so a scrape costs
+  // nothing beyond the JSON response.
+  const openApiDocument = buildOpenApiDocument({
+    networks: runtimes.map((rt) => rt.config.name),
+  });
+  app.get("/api/openapi.json", (_req, res) => {
+    res.setHeader("Cache-Control", "public, max-age=60");
+    res.json(openApiDocument);
+  });
 
   // Always 200 so a slow backfill does not get the service restarted; the
   // body says whether the projection is current.

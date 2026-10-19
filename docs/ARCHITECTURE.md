@@ -141,6 +141,7 @@ Every source file in `src/` fulfills a distinct, decoupled responsibility:
 
 ### API Routes & Client (`src/routes/` and `src/client/`)
 - [`src/routes/index.ts`](file:///home/ademola/drips_wave_workspace/kd-payflow-backend/src/routes/index.ts): Route aggregator combining resource routers into `/api`. Declares and exports the `MerchantSummaryCache` and `defaultMerchantSummaryCache`.
+- [`src/routes/openapi.ts`](file:///home/ademola/drips_wave_workspace/kd-payflow-backend/src/routes/openapi.ts): The OpenAPI 3.1 description of the API, built by hand and served at `GET /api/openapi.json`. A test compares it with the routes Express registers.
 - [`src/routes/types.ts`](file:///home/ademola/drips_wave_workspace/kd-payflow-backend/src/routes/types.ts): Canonical TypeScript types for API response bodies (`HealthResponse`, `PlanRow`, `MandateRow`, `ChargeRow`, `MerchantSummary`, `SubscriberSummary`, `StatsResponse`). Serves as the single source of truth across routes and client.
 - [`src/routes/helpers.ts`](file:///home/ademola/drips_wave_workspace/kd-payflow-backend/src/routes/helpers.ts): Query parsing utilities, pagination limits, and time constants (`SECONDS_PER_MONTH`, `SECONDS_PER_YEAR`).
 - [`src/routes/validate.ts`](file:///home/ademola/drips_wave_workspace/kd-payflow-backend/src/routes/validate.ts): Request validation. Zod schemas for the parameters the API takes (Stellar addresses, ids, status, limit, bucket, days, unix seconds) and the helper that answers `400 invalid_request` with the details of what was wrong.
