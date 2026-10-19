@@ -98,6 +98,18 @@ describe("typed api client", () => {
     assert.equal(mandate.fee_bps, 100);
   });
 
+  test("fetches per-plan statistics", async () => {
+    const stats = await client.planStats(1);
+    assert.equal(stats.planId, 1);
+    assert.equal(stats.activeMandates, 1);
+    assert.equal(stats.totalMandates, 1);
+    assert.equal(stats.cancellations, 0);
+    // Amounts stay strings end to end; the client never turns money into a float.
+    assert.equal(stats.totalCollected, "9900000");
+    assert.equal(stats.totalCharges, 1);
+    assert.equal(stats.averageChargesPerMandate, 1);
+  });
+
   test("mandate list, charges and due pages", async () => {
     const mandates = await client.mandates({ subscriber: SUBSCRIBER });
     assert.equal(mandates.mandates.length, 1);

@@ -245,6 +245,27 @@ describe("http api", () => {
     assert.equal(status, 404);
   });
 
+  test("plan stats returns per-plan numbers", async () => {
+    const { body } = await get("/api/plans/1/stats");
+    assert.equal(body.planId, 1);
+    // All four seeded mandates reference plan 1 (the yearly, forecast and
+    // capped fixtures all point at it), and all four are Active.
+    assert.equal(body.activeMandates, 4);
+    assert.equal(body.totalMandates, 4);
+    assert.equal(body.cancellations, 0);
+    // Only mandate 1 has settled a charge, of 9_900_000.
+    assert.equal(body.totalCollected, "9900000");
+    assert.equal(body.totalCharges, 1);
+    assert.equal(body.averageChargesPerMandate, 0.25);
+  });
+
+  test("unknown plan stats is 404", async () => {
+    const { status } = await get("/api/plans/999/stats");
+    assert.equal(status, 404);
+    const { body } = await get("/api/plans/999/stats");
+    assert.equal((body as { error: { code: string } }).error.code, "plan_not_found");
+  });
+
   test("mandate charge history", async () => {
     const { body } = await get("/api/mandates/1/charges");
     assert.equal((body.charges as unknown[]).length, 1);
@@ -852,6 +873,94 @@ describe("merchant revenue per token", () => {
     assert.deepEqual(body.tokens, []);
     assert.equal(body.totalCollected, "0");
     assert.equal(body.mrr, "0");
+  });
+});
+
+describe("per-plan statistics", () => {
+  const STATS_SUB_A = `GSTATSA${"A".repeat(49)}`;
+  const STATS_SUB_B = `GSTATSB${"B".repeat(49)}`;
+  const statsDb = openDatabase(":memory:");
+  const statsIx = new Indexer(statsDb, {} as never, {} as never);
+  let statsServer: Server;
+  let statsBase: string;
+
+  const ev = (
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+    tx = "t",
+  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+
+  before(async () => {
+    // Plan 1: one Active mandate with two settled charges, one Cancelled.
+    statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
+      token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Popular",
+    }));
+    statsIx.apply(ev("subscribed", [1n, STATS_SUB_A, MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }));
+    statsIx.apply(ev("subscribed", [2n, STATS_SUB_B, MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }));
+    statsIx.apply(ev("cancelled", [2n, STATS_SUB_B], { charges_made: 0 }, "tx-cancel"));
+    statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "tx-c1"));
+    statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 2n, next_charge: 4_000_000_000n,
+    }, "tx-c2"));
+    // Plan 2: published but never subscribed to.
+    statsIx.apply(ev("plan_created", [MERCHANT, 2n], {
+      token: "C", amount: 5_000_000n, period: 2_592_000n, name: "Unused",
+    }));
+
+    const app = createApp(statsDb, config);
+    await new Promise<void>((resolve) => {
+      statsServer = app.listen(0, () => {
+        const addr = statsServer.address();
+        statsBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    statsServer.close();
+    statsDb.close();
+  });
+
+  const statsGet = async (path: string) => {
+    const res = await fetch(statsBase + path);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  test("stats count mandates, cancellations and settled charges per plan", async () => {
+    const { body } = await statsGet("/api/plans/1/stats");
+    assert.equal(body.planId, 1);
+    assert.equal(body.activeMandates, 1);
+    assert.equal(body.totalMandates, 2);
+    assert.equal(body.cancellations, 1);
+    assert.equal(body.totalCollected, "19800000");
+    assert.equal(body.totalCharges, 2);
+    // Two settled charges spread over two mandates.
+    assert.equal(body.averageChargesPerMandate, 1);
+  });
+
+  test("a plan with no mandates reports zero, not NaN", async () => {
+    const { body } = await statsGet("/api/plans/2/stats");
+    assert.equal(body.activeMandates, 0);
+    assert.equal(body.totalMandates, 0);
+    assert.equal(body.cancellations, 0);
+    assert.equal(body.totalCollected, "0");
+    assert.equal(body.totalCharges, 0);
+    assert.equal(body.averageChargesPerMandate, 0);
+  });
+
+  test("an unknown or malformed plan id is 404", async () => {
+    assert.equal((await statsGet("/api/plans/999/stats")).status, 404);
+    assert.equal((await statsGet("/api/plans/abc/stats")).status, 404);
+    const { body } = await statsGet("/api/plans/999/stats");
+    assert.equal((body as { error: { code: string } }).error.code, "plan_not_found");
   });
 });
 

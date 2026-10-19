@@ -24,6 +24,7 @@ import type {
   MerchantSummary,
   PlanPage,
   PlanRow,
+  PlanStatsResponse,
   ProtocolResponse,
   StatsResponse,
   SubscriberSummary,
@@ -51,6 +52,7 @@ export type {
   MerchantSummary,
   PlanPage,
   PlanRow,
+  PlanStatsResponse,
   ProtocolFeeChange,
   ProtocolResponse,
   StatsResponse,
@@ -147,6 +149,10 @@ export class PayflowClient {
 
   plan(id: number): Promise<PlanRow> {
     return this.get<PlanRow>(`/api/plans/${id}`);
+  }
+
+  planStats(id: number): Promise<PlanStatsResponse> {
+    return this.get<PlanStatsResponse>(`/api/plans/${id}/stats`);
   }
 
   mandates(query: MandatesQuery = {}): Promise<MandatePage> {

@@ -10,6 +10,7 @@ import {
   getMerchantSummary,
   getPlanById,
   getProtocolStats,
+  getPlanStats,
   getSubscriberSummary,
   listDueMandates,
   listMandateCharges,
@@ -342,6 +343,36 @@ describe("direct database queries", () => {
     const rows = listMerchantForecastMandates(db, MERCHANT_A);
     assert.equal(rows.length, 3);
     assert.deepEqual(listMerchantForecastMandates(db, MERCHANT_B), []);
+  });
+
+  test("getPlanStats aggregates mandates, cancellations, and collected per plan", () => {
+    // Plan 1: mandates 1 & 4 (both Active), 3 charges of 9_900_000 = 29_700_000
+    const plan1 = getPlanStats(db, 1);
+    assert.equal(plan1.planId, 1);
+    assert.equal(plan1.activeMandates, 2);
+    assert.equal(plan1.totalMandates, 2);
+    assert.equal(plan1.cancellations, 0);
+    assert.equal(plan1.totalCollected, 29_700_000n);
+    assert.equal(plan1.totalCharges, 3);
+
+    // Plan 2: mandate 2 (Active), no settled charges
+    const plan2 = getPlanStats(db, 2);
+    assert.equal(plan2.activeMandates, 1);
+    assert.equal(plan2.totalMandates, 1);
+    assert.equal(plan2.cancellations, 0);
+    assert.equal(plan2.totalCollected, 0n);
+    assert.equal(plan2.totalCharges, 0);
+
+    // Plan 3: mandate 3 (Cancelled), no settled charges
+    const plan3 = getPlanStats(db, 3);
+    assert.equal(plan3.activeMandates, 0);
+    assert.equal(plan3.totalMandates, 1);
+    assert.equal(plan3.cancellations, 1);
+    assert.equal(plan3.totalCollected, 0n);
+    assert.equal(plan3.totalCharges, 0);
+
+    // Unknown plan yields zero stats without throwing.
+    assert.equal(getPlanStats(db, 999).totalMandates, 0);
   });
 
   test("listMerchantSubscribers groups distinct subscribers across mandates", () => {
