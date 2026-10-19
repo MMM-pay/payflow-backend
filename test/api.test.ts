@@ -45,6 +45,8 @@ const status = {
   lastLedgerCloseTime: 1_700_000_000,
   freshnessSeconds: 42,
   paused: false,
+  reconciliations: 0,
+  corrections: 0,
 };
 const mainnetStatus = { cursor: 500, latest: 505, lastRunAt: Date.now(), lastError: null };
 let base: string;
@@ -168,6 +170,20 @@ describe("http api", () => {
       assert.equal(ixStatus.paused, true);
     } finally {
       status.paused = false;
+    }
+  });
+
+  test("health reports reconcile passes and corrections", async () => {
+    status.reconciliations = 4;
+    status.corrections = 2;
+    try {
+      const { body } = await get("/health");
+      const ixStatus = body.indexer as unknown as { reconciliations: number; corrections: number };
+      assert.equal(ixStatus.reconciliations, 4);
+      assert.equal(ixStatus.corrections, 2);
+    } finally {
+      status.reconciliations = 0;
+      status.corrections = 0;
     }
   });
 

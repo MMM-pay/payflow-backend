@@ -122,6 +122,8 @@ function healthOf(runtime: NetworkRuntime): HealthResponse {
           lastRunAt: indexer.lastRunAt ? new Date(indexer.lastRunAt).toISOString() : null,
           lastError: indexer.lastError,
           mismatchedEvents: indexer.mismatchedEvents ?? 0,
+          reconciliations: indexer.reconciliations ?? 0,
+          corrections: indexer.corrections ?? 0,
         }
       : null,
     rpc: rpc && "active" in rpc && Array.isArray(rpc.endpoints) ? { active: rpc.active, endpoints: rpc.endpoints } : null,

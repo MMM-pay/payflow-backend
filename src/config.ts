@@ -82,6 +82,18 @@ const schema = z.object({
   INDEXER_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
   INDEXER_START_LEDGER: z.coerce.number().int().nonnegative().default(0),
   /**
+   * How often the reconciler re-checks a sample of active mandates against the
+   * contract state. An indexer pass can miss an event (RPC gap, bug); this
+   * pass repairs drift the projection would otherwise keep forever.
+   */
+  RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(600_000),
+  /**
+   * How many active mandates one reconcile pass samples. Each sampled mandate
+   * costs one read-only RPC simulation, so keep this small relative to the
+   * interval.
+   */
+  RECONCILE_SAMPLE_SIZE: z.coerce.number().int().positive().default(25),
+  /**
    * How many ledger windows one pass may fetch at once. Events are still
    * applied in ledger order and the cursor advances per applied window; set
    * this to 1 for strictly sequential reads.

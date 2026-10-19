@@ -102,6 +102,20 @@ function env(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   };
 }
 
+describe("reconciliation", () => {
+  test("defaults to a ten-minute interval and a 25-mandate sample", () => {
+    const config = loadConfig(env());
+    assert.equal(config.RECONCILE_INTERVAL_MS, 600_000);
+    assert.equal(config.RECONCILE_SAMPLE_SIZE, 25);
+  });
+
+  test("rejects a non-positive interval and sample size", () => {
+    assert.throws(() => loadConfig(env({ RECONCILE_INTERVAL_MS: "0" })), /RECONCILE_INTERVAL_MS/);
+    assert.throws(() => loadConfig(env({ RECONCILE_INTERVAL_MS: "-1" })), /RECONCILE_INTERVAL_MS/);
+    assert.throws(() => loadConfig(env({ RECONCILE_SAMPLE_SIZE: "0" })), /RECONCILE_SAMPLE_SIZE/);
+  });
+});
+
 describe("network configs", () => {
   test("with no NETWORKS there is exactly the default network", () => {
     const config = loadConfig(env());

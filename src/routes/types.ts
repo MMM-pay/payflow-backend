@@ -249,6 +249,10 @@ export interface HealthResponse {
     lastError: string | null;
     /** Contract events that failed spec validation since process start. */
     mismatchedEvents: number;
+    /** Reconcile passes run since process start. */
+    reconciliations: number;
+    /** Mandate rows the reconciler has brought back in line with the chain. */
+    corrections: number;
   } | null;
   rpc?: {
     active: string;

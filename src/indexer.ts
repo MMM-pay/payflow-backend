@@ -81,6 +81,18 @@ export interface IndexerStatus {
    * the API keeps serving. Reported on `/health`.
    */
   paused?: boolean;
+  /**
+   * Reconcile passes run since process start. Each pass re-reads a sample of
+   * active mandates from the contract and repairs drift the indexer may have
+   * missed.
+   */
+  reconciliations?: number;
+  /**
+   * Mandate rows the reconciler has brought back in line with the chain since
+   * process start. Reported on `/health`; a growing count means the indexer
+   * is silently missing on-chain state.
+   */
+  corrections?: number;
 }
 
 export class Indexer {

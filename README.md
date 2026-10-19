@@ -97,6 +97,19 @@ npm run keeper
   never silently stored as zeros. Update the spec file together with the
   contracts.
 
+### Reconciling the projection with the chain
+
+Idempotent indexing repairs replays, but it cannot repair a missed event: an
+RPC gap or a bug can leave the projection wrong forever. Every
+`RECONCILE_INTERVAL_MS` the reconciler samples `RECONCILE_SAMPLE_SIZE` active
+mandates from the projection, re-reads each one from the subscription
+contract through a read-only `get_mandate` simulation, and compares `status`,
+`charges_made` and `next_charge`. Anything that differs is rewritten in place,
+keyed on the mandate id, so re-running the pass is a no-op once the row
+matches the chain. A failed RPC read is logged and retried on the next pass;
+it never crashes the loop. Corrections are logged and reported on `/health`
+under `indexer.reconciliations` and `indexer.corrections`.
+
 ### Rotating the keeper key without downtime
 
 `charge` is permissionless, so the keeper key is only a fee payer â€” but losing
@@ -355,6 +368,8 @@ examined without API downtime.
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
+| `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
+| `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |

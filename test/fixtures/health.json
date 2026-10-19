@@ -9,7 +9,9 @@
     "freshnessSeconds": 42,
     "lastRunAt": "2025-06-15T15:06:40.000Z",
     "lastError": null,
-    "mismatchedEvents": 0
+    "mismatchedEvents": 0,
+    "reconciliations": 0,
+    "corrections": 0
   },
   "rpc": null,
   "contracts": {
@@ -29,7 +31,9 @@
         "freshnessSeconds": 42,
         "lastRunAt": "2025-06-15T15:06:40.000Z",
         "lastError": null,
-        "mismatchedEvents": 0
+        "mismatchedEvents": 0,
+        "reconciliations": 0,
+        "corrections": 0
       },
       "rpc": null,
       "contracts": {
