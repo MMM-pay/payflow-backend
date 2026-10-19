@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import {
   getMerchantSummary,
   listMerchantForecastMandates,
@@ -91,13 +91,13 @@ function occurrencesIn(
 
 /** `GET /merchants/:address/summary`. */
 export function merchantsRouter(
-  db: DatabaseSync,
+  db: Storage,
   cache: MerchantSummaryCache = defaultMerchantSummaryCache,
   defaultToken?: string,
 ): Router {
   const r = Router();
 
-  r.get("/merchants/:address/summary", (req, res) => {
+  r.get("/merchants/:address/summary", async (req, res) => {
     const address = String(req.params.address);
     const cacheKey = defaultToken ? `${address}:${defaultToken}` : address;
     const cached = cache.get(cacheKey);
@@ -106,19 +106,19 @@ export function merchantsRouter(
       return;
     }
 
-    const body = getMerchantSummary(db, address, defaultToken);
+    const body = await getMerchantSummary(db, address, defaultToken);
     cache.set(cacheKey, body);
     res.json(body);
   });
 
   /** Projected charges over the next `days`, net of the protocol fee. */
-  r.get("/merchants/:address/forecast", (req, res) => {
+  r.get("/merchants/:address/forecast", async (req, res) => {
     const address = String(req.params.address);
     const days = daysOf(req.query.days);
     const from = Math.floor(Date.now() / 1000);
     const to = from + days * DAY_S;
 
-    const mandates = listMerchantForecastMandates(db, address);
+    const mandates = await listMerchantForecastMandates(db, address);
 
     let net = 0n;
     let counted = 0;

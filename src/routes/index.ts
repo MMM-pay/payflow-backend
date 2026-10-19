@@ -2,6 +2,8 @@ import { Router } from "express";
 import type { EventEmitter } from "node:events";
 import type { DatabaseSync } from "node:sqlite";
 import type { TokenMetadataService } from "../lib/tokens.ts";
+import type { Storage } from "../lib/store/types.ts";
+import { asStorage } from "../lib/store/index.ts";
 import { mandatesRouter } from "./mandates.ts";
 import {
   defaultMerchantSummaryCache,
@@ -20,7 +22,7 @@ export { defaultMerchantSummaryCache, MerchantSummaryCache };
 
 export interface NetworkRoutes {
   name: string;
-  db: DatabaseSync;
+  db: Storage | DatabaseSync;
   summaryCache?: MerchantSummaryCache | undefined;
   defaultToken?: string | undefined;
   /** Resolves this network's token contract ids to symbol/name/decimals. */
@@ -44,7 +46,7 @@ export function buildApiRouter(networks: NetworkRoutes[]): Router {
     router.use(
       `/${network.name}`,
       buildRoutes(
-        network.db,
+        asStorage(network.db),
         network.tokens,
         network.summaryCache,
         network.defaultToken,
@@ -54,7 +56,7 @@ export function buildApiRouter(networks: NetworkRoutes[]): Router {
   }
   router.use(
     buildRoutes(
-      defaultNetwork.db,
+      asStorage(defaultNetwork.db),
       defaultNetwork.tokens,
       defaultNetwork.summaryCache,
       defaultNetwork.defaultToken,
@@ -80,7 +82,7 @@ export function buildApiRouter(networks: NetworkRoutes[]): Router {
  * amounts and `tokensRouter` serves them directly.
  */
 export function buildRoutes(
-  db: DatabaseSync,
+  db: Storage,
   tokens: TokenMetadataService,
   summaryCache: MerchantSummaryCache = defaultMerchantSummaryCache,
   defaultToken?: string,

@@ -41,13 +41,13 @@ before(async () => {
     tx = "t",
   ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
 
-  ix.apply(ev("plan_created", [MERCHANT, 1n], {
+  await ix.apply(ev("plan_created", [MERCHANT, 1n], {
     token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Pro Monthly",
   }));
-  ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n, fee_bps: 100,
   }));
-  ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
 

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import {
   getMandateById,
   listDueMandates,
@@ -38,7 +38,7 @@ function parseIds(raw: unknown): { ids: number[]; tooMany: boolean } | null {
 }
 
 /** `GET /mandates*` and the keeper-facing `GET /due`. */
-export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): Router {
+export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Router {
   const r = Router();
 
   r.get("/mandates", async (req, res) => {
@@ -56,7 +56,7 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
       }
       parsedIds = parsed.ids;
     }
-    const rows = listMandates(db, {
+    const rows = await listMandates(db, {
       ids: parsedIds,
       subscriber: subscriber ? String(subscriber) : undefined,
       merchant: merchant ? String(merchant) : undefined,
@@ -65,7 +65,7 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     });
     // A mandate carries no token of its own; it inherits its plan's, batched
     // into one read per page (see lib/queries.ts).
-    const planTokens = planTokensByIds(db, rows.map((row) => row.plan_id));
+    const planTokens = await planTokensByIds(db, rows.map((row) => row.plan_id));
     const mandates = await Promise.all(
       rows.map(async (row) => ({
         ...row,
@@ -77,17 +77,17 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
   });
 
   r.get("/mandates/:id", async (req, res) => {
-    const row = getMandateById(db, Number(req.params.id));
+    const row = await getMandateById(db, Number(req.params.id));
     if (!row) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
     }
-    const tokenId = planTokensByIds(db, [row.plan_id]).get(row.plan_id);
+    const tokenId = (await planTokensByIds(db, [row.plan_id])).get(row.plan_id);
     res.json({ ...row, ...(await tokenFields(tokens, tokenId)) });
   });
 
-  r.get("/mandates/:id/charges", (req, res) => {
-    const charges = listMandateCharges(
+  r.get("/mandates/:id/charges", async (req, res) => {
+    const charges = await listMandateCharges(
       db,
       Number(req.params.id),
       limitOf(req.query.limit),
@@ -97,9 +97,9 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
   });
 
   /** Mandates chargeable right now, per the indexed projection. */
-  r.get("/due", (req, res) => {
+  r.get("/due", async (req, res) => {
     const now = Math.floor(Date.now() / 1000);
-    const due = listDueMandates(db, now, limitOf(req.query.limit));
+    const due = await listDueMandates(db, now, limitOf(req.query.limit));
     const body: DuePage = { now, due };
     res.json(body);
   });

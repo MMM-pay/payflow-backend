@@ -1,10 +1,11 @@
-import type { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
+import type { DatabaseSync } from "node:sqlite";
 import { rpc } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
 
 export type IndexerConfig = Config | NetworkConfig;
-import { readCursor, writeCursor } from "./lib/db.ts";
+import type { Storage } from "./lib/store/types.ts";
+import { asStorage } from "./lib/store/index.ts";
 import {
   big,
   decodeEvent,
@@ -96,7 +97,7 @@ export interface IndexerStatus {
 }
 
 export class Indexer {
-  private readonly db: DatabaseSync;
+  private readonly db: Storage;
   private readonly server: IndexerRpc;
   private readonly config: IndexerConfig;
   readonly events = new EventEmitter();
@@ -132,12 +133,12 @@ export class Indexer {
   }
 
   constructor(
-    db: DatabaseSync,
+    db: Storage | DatabaseSync,
     server: IndexerRpc,
     config: IndexerConfig,
     merchantCache: MerchantSummaryCache = defaultMerchantSummaryCache,
   ) {
-    this.db = db;
+    this.db = asStorage(db);
     this.server = server;
     this.config = config;
     this.merchantCache = merchantCache;
@@ -264,7 +265,10 @@ export class Indexer {
     const latestRes = await this.server.getLatestLedger();
     const latest = latestRes.sequence;
     const latestCloseTime = parseCloseTime((latestRes as { closeTime?: unknown }).closeTime);
-    const start = await this.firstLedger(readCursor(this.db, 0));
+    const savedCursor = await this.db.get<{ last_ledger: number }>(
+      "SELECT last_ledger FROM cursor WHERE id = 1",
+    );
+    const start = await this.firstLedger(savedCursor?.last_ledger ?? 0);
 
     this.status.latest = latest;
     if (start > latest) {
@@ -310,18 +314,32 @@ export class Indexer {
         failure = result.reason;
         break;
       }
-      for (const raw of result.value) {
-        const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
-        if (ct !== null) lastSeenCloseTime = ct;
-        const decoded = decodeEvent(raw);
-        if (!decoded) continue;
-        if (this.apply(decoded) !== "mismatched") applied += 1;
-        else mismatched += 1;
+      const nextCursor = windows[i]!.end;
+      const windowResult = await this.db.transaction(async (storage) => {
+        let windowApplied = 0;
+        let windowMismatched = 0;
+        const notifications: DecodedEvent[] = [];
+        for (const raw of result.value) {
+          const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
+          if (ct !== null) lastSeenCloseTime = ct;
+          const decoded = decodeEvent(raw);
+          if (!decoded) continue;
+          if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
+          else windowMismatched += 1;
+        }
+        await storage.run(
+          `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
+          [nextCursor],
+        );
+        return { applied: windowApplied, mismatched: windowMismatched, notifications };
+      });
+      applied += windowResult.applied;
+      mismatched += windowResult.mismatched;
+      cursor = nextCursor;
+      for (const notification of windowResult.notifications) {
+        this.events.emit("applied", notification);
       }
-      // Only advance after this window is applied, so a later failure resumes
-      // here instead of replaying what already landed.
-      cursor = windows[i]!.end;
-      writeCursor(this.db, cursor);
     }
 
     this.status.cursor = cursor;
@@ -351,7 +369,11 @@ export class Indexer {
    * the spec does not cover are left to the switch below, which ignores
    * unknown names.
    */
-  apply(e: DecodedEvent): ApplyOutcome {
+  async apply(
+    e: DecodedEvent,
+    storage: Storage = this.db,
+    notifications?: DecodedEvent[],
+  ): Promise<ApplyOutcome> {
     const problems = specProblems(e);
     if (problems !== null && problems.length > 0) {
       this.status.mismatchedEvents = this.mismatchedEvents + 1;
@@ -370,40 +392,40 @@ export class Indexer {
 
     switch (e.name) {
       case "plan_created":
-        this.onPlanCreated(e);
+        await this.onPlanCreated(e, storage);
         return "applied";
       case "plan_status_changed":
-        this.onPlanStatus(e);
+        await this.onPlanStatus(e, storage);
         return "applied";
       case "subscribed":
-        this.onSubscribed(e);
-        this.events.emit("applied", e);
+        await this.onSubscribed(e, storage);
+        this.notify(e, notifications);
         return "applied";
       case "charged":
-        this.onCharged(e);
-        this.events.emit("applied", e);
+        await this.onCharged(e, storage);
+        this.notify(e, notifications);
         return "applied";
       case "cancelled":
-        this.onStatus(e, "Cancelled", "subscriber");
-        this.events.emit("applied", e);
+        await this.onStatus(e, "Cancelled", "subscriber", storage);
+        this.notify(e, notifications);
         return "applied";
       case "mandate_ended":
-        this.onStatus(e, "Cancelled", "merchant");
+        await this.onStatus(e, "Cancelled", "merchant", storage);
         this.events.emit("applied", e);
         return "applied";
       case "mandate_completed":
-        this.onStatus(e, "Completed");
+        await this.onStatus(e, "Completed", null, storage);
         return "applied";
       case "pause_changed":
-        this.onPauseChanged(e);
+        await this.onPauseChanged(e, storage);
         return "applied";
       case "fee_changed":
-        this.onFeeChanged(e);
+        await this.onFeeChanged(e, storage);
         return "applied";
       case "deposit":
       case "withdraw":
       case "debit":
-        this.onVaultEvent(e);
+        await this.onVaultEvent(e, storage);
         return "applied";
       default:
         logger.debug({ name: e.name }, "unhandled event");
@@ -411,19 +433,22 @@ export class Indexer {
     }
   }
 
-  private onPlanCreated(e: DecodedEvent): void {
+  private notify(event: DecodedEvent, notifications?: DecodedEvent[]): void {
+    if (notifications) notifications.push(event);
+    else this.events.emit("applied", event);
+  }
+
+  private async onPlanCreated(e: DecodedEvent, storage: Storage): Promise<void> {
     const [merchant, planId] = e.topics;
     this.merchantCache.invalidate(str(merchant));
-    this.db
-      .prepare(
-        `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
+    await storage.run(
+      `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
          VALUES (?, ?, ?, ?, ?, ?, 1, ?)
          ON CONFLICT(id) DO UPDATE SET
            merchant = excluded.merchant, name = excluded.name,
            token = excluded.token,
            amount = excluded.amount, period = excluded.period`,
-      )
-      .run(
+      [
         num(planId),
         str(merchant),
         str(e.data.name),
@@ -431,22 +456,20 @@ export class Indexer {
         big(e.data.amount),
         num(e.data.period),
         e.ledger,
-      );
+      ],
+    );
   }
 
-  private onPlanStatus(e: DecodedEvent): void {
+  private async onPlanStatus(e: DecodedEvent, storage: Storage): Promise<void> {
     const [, planId] = e.topics;
-    this.db
-      .prepare("UPDATE plans SET active = ? WHERE id = ?")
-      .run(e.data.active ? 1 : 0, num(planId));
+    await storage.run("UPDATE plans SET active = ? WHERE id = ?", [e.data.active ? 1 : 0, num(planId)]);
   }
 
-  private onSubscribed(e: DecodedEvent): void {
+  private async onSubscribed(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId, subscriber, merchant] = e.topics;
     this.merchantCache.invalidate(str(merchant));
-    this.db
-      .prepare(
-        `INSERT INTO mandates
+    await storage.run(
+      `INSERT INTO mandates
            (id, subscriber, merchant, plan_id, amount, period, next_charge,
             last_charge, charges_made, max_charges, fee_bps, status, ledger)
          VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'Active', ?)
@@ -455,8 +478,7 @@ export class Indexer {
            merchant    = excluded.merchant,
            max_charges = excluded.max_charges,
            fee_bps     = excluded.fee_bps`,
-      )
-      .run(
+      [
         num(mandateId),
         str(subscriber),
         str(merchant),
@@ -467,22 +489,22 @@ export class Indexer {
         num(e.data.max_charges),
         num(e.data.fee_bps),
         e.ledger,
-      );
+      ],
+    );
   }
 
-  private onCharged(e: DecodedEvent): void {
+  private async onCharged(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId, subscriber, merchant] = e.topics;
     const id = num(mandateId);
     this.merchantCache.invalidate(str(merchant));
 
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO charges
+    await storage.run(
+      `INSERT INTO charges
            (tx_hash, mandate_id, subscriber, merchant, amount, fee,
             charges_made, next_charge, ledger, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (tx_hash, mandate_id) DO NOTHING`,
+      [
         e.txHash,
         id,
         str(subscriber),
@@ -493,66 +515,73 @@ export class Indexer {
         num(e.data.next_charge),
         e.ledger,
         Date.now(),
-      );
+      ],
+    );
 
     // The Charged event carries next_charge but not last_charge. The contract
     // sets next_charge = now + period, so the settlement time is recoverable
     // from the mandate's own period.
     // Guard against out-of-order delivery: never move a mandate backwards.
-    this.db
-      .prepare(
-        `UPDATE mandates
+    await storage.run(
+      `UPDATE mandates
             SET charges_made = ?,
                 next_charge  = ?,
                 last_charge  = MAX(0, ? - period)
           WHERE id = ? AND charges_made < ?`,
-      )
-      .run(
+      [
         num(e.data.charges_made),
         num(e.data.next_charge),
         num(e.data.next_charge),
         id,
         num(e.data.charges_made),
-      );
+      ],
+    );
   }
 
   /** `endedBy` records which side cancelled; completion leaves it null. */
-  private onStatus(e: DecodedEvent, status: string, endedBy: string | null = null): void {
+  private async onStatus(
+    e: DecodedEvent,
+    status: string,
+    endedBy: string | null,
+    storage: Storage,
+  ): Promise<void> {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
-    const row = this.db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(mid) as
-      | { merchant: string }
-      | undefined;
+    const row = await storage.get<{ merchant: string }>(
+      "SELECT merchant FROM mandates WHERE id = ?",
+      [mid],
+    );
     if (row) this.merchantCache.invalidate(row.merchant);
-    this.db
-      .prepare("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?")
-      .run(status, endedBy, mid);
+    await storage.run("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?", [
+      status,
+      endedBy,
+      mid,
+    ]);
   }
 
-  private onPauseChanged(e: DecodedEvent): void {
+  private async onPauseChanged(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
-    const row = this.db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(mid) as
-      | { merchant: string }
-      | undefined;
+    const row = await storage.get<{ merchant: string }>(
+      "SELECT merchant FROM mandates WHERE id = ?",
+      [mid],
+    );
     if (row) this.merchantCache.invalidate(row.merchant);
-    this.db
-      .prepare(
-        `UPDATE mandates SET status = ?
+    await storage.run(
+      `UPDATE mandates SET status = ?
           WHERE id = ? AND status IN ('Active','Paused')`,
-      )
-      .run(e.data.paused ? "Paused" : "Active", mid);
+      [e.data.paused ? "Paused" : "Active", mid],
+    );
   }
 
-  private onVaultEvent(e: DecodedEvent): void {
+  private async onVaultEvent(e: DecodedEvent, storage: Storage): Promise<void> {
     const [user, token, counterparty] = e.topics;
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO vault_events
-           (tx_hash, kind, user, token, counterparty, amount, balance, ledger)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    await storage.run(
+      `INSERT INTO vault_events
+           (tx_hash, kind, "user", token, counterparty, amount, balance, ledger)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tx_hash, kind, "user", amount) DO NOTHING`,
+      [
         e.txHash,
         e.name,
         str(user),
@@ -561,20 +590,20 @@ export class Indexer {
         big(e.data.amount),
         big(e.data.balance),
         e.ledger,
-      );
+      ],
+    );
   }
 
-  private onFeeChanged(e: DecodedEvent): void {
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO fee_history (tx_hash, old_fee_bps, new_fee_bps, ledger)
-         VALUES (?, ?, ?, ?)`,
-      )
-      .run(
+  private async onFeeChanged(e: DecodedEvent, storage: Storage): Promise<void> {
+    await storage.run(
+      `INSERT INTO fee_history (tx_hash, old_fee_bps, new_fee_bps, ledger)
+         VALUES (?, ?, ?, ?) ON CONFLICT (tx_hash) DO NOTHING`,
+      [
         e.txHash,
         num(e.data.old_fee_bps),
         num(e.data.new_fee_bps),
         e.ledger,
-      );
+      ],
+    );
   }
 }

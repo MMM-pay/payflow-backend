@@ -116,19 +116,19 @@ before(async () => {
   Date.now = () => FIXED_NOW_MS;
 
   const ix = new Indexer(db, {} as never, {} as never);
-  ix.apply(ev("plan_created", [MERCHANT, 1n], {
+  await ix.apply(ev("plan_created", [MERCHANT, 1n], {
     token: "C", amount: 10_000_000n, period: 2_592_000n,
   }));
-  ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n,
     next_charge: BigInt(FIXED_NOW_S - 100),
   }));
-  ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n,
     next_charge: BigInt(FIXED_NOW_S + 2_592_000),
   }, "tx-charge-1"));
-  ix.apply(ev("deposit", [SUBSCRIBER, "C"], { amount: 1_000_000n, balance: 1_000_000n }, "tx-vault"));
-  ix.apply(ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "tx-fee"));
+  await ix.apply(ev("deposit", [SUBSCRIBER, "C"], { amount: 1_000_000n, balance: 1_000_000n }, "tx-vault"));
+  await ix.apply(ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "tx-fee"));
 
   const app = createApp(
     [{ config: testnet, db, indexer: status, summaryCache: ix.merchantCache }],

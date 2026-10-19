@@ -59,43 +59,43 @@ const ev = (name: string, topics: unknown[], data: Record<string, unknown>, tx =
 
 before(async () => {
   ix = new Indexer(db, {} as never, {} as never);
-  ix.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
-  ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
+  await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
   }));
-  ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
-  ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_A"], { amount: 9_007_199_254_740_993n, balance: 9_007_199_254_740_993n }, "vault-a"), ledger: 9 });
-  ix.apply({ ...ev("withdraw", [SUBSCRIBER, "TOKEN_A"], { amount: 3n, balance: 9_007_199_254_740_990n }, "vault-b"), ledger: 10 });
-  ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_B"], { amount: 20n, balance: 20n }, "vault-c"), ledger: 10 });
-  ix.apply({ ...ev("debit", [SUBSCRIBER, "TOKEN_A"], { amount: 5n, balance: 9_007_199_254_740_985n }, "vault-d"), ledger: 10 });
-  ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "fee-1"), ledger: 8 });
-  ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 125n, new_fee_bps: 150n }, "fee-2"), ledger: 12 });
+  await ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_A"], { amount: 9_007_199_254_740_993n, balance: 9_007_199_254_740_993n }, "vault-a"), ledger: 9 });
+  await ix.apply({ ...ev("withdraw", [SUBSCRIBER, "TOKEN_A"], { amount: 3n, balance: 9_007_199_254_740_990n }, "vault-b"), ledger: 10 });
+  await ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_B"], { amount: 20n, balance: 20n }, "vault-c"), ledger: 10 });
+  await ix.apply({ ...ev("debit", [SUBSCRIBER, "TOKEN_A"], { amount: 5n, balance: 9_007_199_254_740_985n }, "vault-d"), ledger: 10 });
+  await ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "fee-1"), ledger: 8 });
+  await ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 125n, new_fee_bps: 150n }, "fee-2"), ledger: 12 });
 
   // A yearly plan: one charge of 120_000_000 per 365-day period, next charge
   // far in the future so it never lands in the due list.
-  ix.apply(ev("subscribed", [2n, SUBSCRIBER, YEARLY_MERCHANT], {
+  await ix.apply(ev("subscribed", [2n, SUBSCRIBER, YEARLY_MERCHANT], {
     plan_id: 1n, amount: 120_000_000n, period: 31_536_000n, next_charge: 4_000_000_000n,
   }, "tx2"));
 
   // Forecast fixtures: a daily mandate net of a 1% fee, and one capped at two
   // charges. The first charge is an hour away, so /due stays empty.
-  ix.apply(ev("subscribed", [3n, SUBSCRIBER, FORECAST_MERCHANT], {
+  await ix.apply(ev("subscribed", [3n, SUBSCRIBER, FORECAST_MERCHANT], {
     plan_id: 1n, amount: 5_000_000n, period: 86_400n,
     next_charge: BigInt(NOW + 3_600), max_charges: 0n, fee_bps: 100n,
   }, "tx3"));
-  ix.apply(ev("subscribed", [4n, SUBSCRIBER, CAPPED_MERCHANT], {
+  await ix.apply(ev("subscribed", [4n, SUBSCRIBER, CAPPED_MERCHANT], {
     plan_id: 1n, amount: 2_000_000n, period: 86_400n,
     next_charge: BigInt(NOW + 3_600), max_charges: 2n, fee_bps: 0n,
   }, "tx4"));
 
   // A second projection with disjoint ids, so cross-network leakage is visible.
   const ixMainnet = new Indexer(mainnetDb, {} as never, {} as never);
-  ixMainnet.apply(ev("plan_created", [OTHER_MERCHANT, 5n], {
+  await ixMainnet.apply(ev("plan_created", [OTHER_MERCHANT, 5n], {
     token: "C", amount: 20_000_000n, period: 2_592_000n,
   }, "tm1"));
-  ixMainnet.apply(ev("subscribed", [5n, OTHER_SUBSCRIBER, OTHER_MERCHANT], {
+  await ixMainnet.apply(ev("subscribed", [5n, OTHER_SUBSCRIBER, OTHER_MERCHANT], {
     plan_id: 5n, amount: 20_000_000n, period: 2_592_000n, next_charge: 1n,
   }, "tm2"));
 
@@ -493,11 +493,11 @@ describe("merchant summary caching", () => {
     const memDb = openDatabase(":memory:");
     const cache = new MerchantSummaryCache();
     const indexer = new Indexer(memDb, {} as never, {} as never, cache);
-    indexer.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
-    indexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+    await indexer.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
+    await indexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
     }));
-    indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "tx1"));
 
@@ -513,7 +513,7 @@ describe("merchant summary caching", () => {
       assert.equal(first.totalCollected, "9900000");
 
       // Apply a second charge
-      indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      await indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
         amount: 5_000_000n, fee: 50_000n, charges_made: 2n, next_charge: 5_000_000_000n,
       }, "tx2"));
 
@@ -527,7 +527,7 @@ describe("merchant summary caching", () => {
     }
   });
 
-  test("memory is bounded by evicting oldest entries", () => {
+  test("memory is bounded by evicting oldest entries", async () => {
     const cache = new MerchantSummaryCache(2);
     const mockSummary = (m: string): MerchantSummary => ({
       merchant: m,
@@ -559,7 +559,7 @@ describe("server-sent event stream", () => {
   test("streams a charge and removes its listener when the client disconnects", async () => {
     const streamDb = openDatabase(":memory:");
     const streamIndexer = new Indexer(streamDb, {} as never, {} as never);
-    streamIndexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+    await streamIndexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n,
       amount: 10_000_000n,
       period: 2_592_000n,
@@ -596,7 +596,7 @@ describe("server-sent event stream", () => {
       const reader = response.body!.getReader();
       await reader.read();
 
-      streamIndexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      await streamIndexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
         amount: 9_900_000n,
         fee: 100_000n,
         charges_made: 1n,
@@ -666,29 +666,29 @@ describe("stats volume", () => {
   before(async () => {
     // One active merchant with a recent charge and one from two days ago, and
     // a cancelled merchant that must not count as active.
-    statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
+    await statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
       token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
     }));
-    statsIx.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+    await statsIx.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }));
-    statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 2_000_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "tx-old"));
-    statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 3_000_000n, fee: 150_000n, charges_made: 2n, next_charge: 4_000_000_000n,
     }, "tx-recent"));
     statsDb
       .prepare("UPDATE charges SET created_at = ? WHERE tx_hash = ?")
       .run(Date.now() - 2 * 86_400_000, "tx-old");
 
-    statsIx.apply(ev("plan_created", [MERCHANT2, 2n], {
+    await statsIx.apply(ev("plan_created", [MERCHANT2, 2n], {
       token: "CTOKEN", amount: 1_000_000n, period: 2_592_000n, name: "p2",
     }));
-    statsIx.apply(ev("subscribed", [2n, SUBSCRIBER, MERCHANT2], {
+    await statsIx.apply(ev("subscribed", [2n, SUBSCRIBER, MERCHANT2], {
       plan_id: 2n, amount: 1_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }));
-    statsIx.apply(ev("cancelled", [2n, SUBSCRIBER], { charges_made: 0 }));
+    await statsIx.apply(ev("cancelled", [2n, SUBSCRIBER], { charges_made: 0 }));
 
     const app = createApp(statsDb, config);
     await new Promise<void>((resolve) => {
@@ -767,17 +767,17 @@ describe("merchant revenue per token", () => {
       [3n, TOKEN_C, 2_000_000n],
     ];
     for (const [id, token, amount] of plans) {
-      tokenIx.apply(ev("plan_created", [MERCHANT, id], {
+      await tokenIx.apply(ev("plan_created", [MERCHANT, id], {
         token, amount, period: 2_592_000n, name: `p${id}`,
       }));
-      tokenIx.apply(ev("subscribed", [id, SUBSCRIBER, MERCHANT], {
+      await tokenIx.apply(ev("subscribed", [id, SUBSCRIBER, MERCHANT], {
         plan_id: id, amount, period: 2_592_000n, next_charge: 4_000_000_000n,
       }));
     }
-    tokenIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await tokenIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "ta1"));
-    tokenIx.apply(ev("charged", [2n, SUBSCRIBER, MERCHANT], {
+    await tokenIx.apply(ev("charged", [2n, SUBSCRIBER, MERCHANT], {
       amount: 4_950_000n, fee: 50_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "tb1"));
 
@@ -871,40 +871,40 @@ describe("subscriber upcoming charges", () => {
     const upEv = (name: string, topics: unknown[], data: Record<string, unknown>, tx: string): DecodedEvent => ({
       name, contractId: "C", ledger: 1, txHash: tx, topics, data,
     });
-    const sub = (id: number, subscriber: string, merchant: string, data: Record<string, unknown>): void =>
-      ix.apply(upEv("subscribed", [BigInt(id), subscriber, merchant], { plan_id: 1n, ...data }, `sub-${id}`));
+    const sub = async (id: number, subscriber: string, merchant: string, data: Record<string, unknown>): Promise<void> =>
+      await ix.apply(upEv("subscribed", [BigInt(id), subscriber, merchant], { plan_id: 1n, ...data }, `sub-${id}`));
 
     // Due an hour ago: projected from now, not from the stale next_charge.
-    sub(101, DUE_SUB, M_DUE, {
+    await sub(101, DUE_SUB, M_DUE, {
       amount: 5_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW - 3_600), max_charges: 0n, fee_bps: 0n,
     });
     // First charge an hour out: the anchor is exactly its next_charge.
-    sub(102, FUTURE_SUB, M_FUTURE, {
+    await sub(102, FUTURE_SUB, M_FUTURE, {
       amount: 2_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 0n, fee_bps: 0n,
     });
     // One of two allowed charges already made: one remains.
-    sub(103, CAPPED_SUB, M_CAPPED, {
+    await sub(103, CAPPED_SUB, M_CAPPED, {
       amount: 1_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 2n, fee_bps: 0n,
     });
-    ix.apply(upEv("charged", [103n, CAPPED_SUB, M_CAPPED], {
+    await ix.apply(upEv("charged", [103n, CAPPED_SUB, M_CAPPED], {
       amount: 1_000_000n, fee: 0n, charges_made: 1n, next_charge: BigInt(UP_NOW + 3_600),
     }, "charge-103"));
     // Allowance used up: nothing more will ever be charged.
-    sub(104, SPENT_SUB, M_SPENT, {
+    await sub(104, SPENT_SUB, M_SPENT, {
       amount: 2_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 2n, fee_bps: 0n,
     });
-    ix.apply(upEv("charged", [104n, SPENT_SUB, M_SPENT], {
+    await ix.apply(upEv("charged", [104n, SPENT_SUB, M_SPENT], {
       amount: 2_000_000n, fee: 0n, charges_made: 2n, next_charge: BigInt(UP_NOW + 86_400),
     }, "charge-104"));
     // A 60s period over 30 days is 43,200 occurrences: the cap kicks in.
-    sub(105, FAST_SUB, M_FAST, {
+    await sub(105, FAST_SUB, M_FAST, {
       amount: 1_000n, period: 60n, next_charge: BigInt(UP_NOW + 60), max_charges: 0n, fee_bps: 0n,
     });
     // Two mandates with different rhythms, to check the merge order.
-    sub(106, MIXED_SUB, M_WEEKLY, {
+    await sub(106, MIXED_SUB, M_WEEKLY, {
       amount: 3_000_000n, period: 604_800n, next_charge: BigInt(UP_NOW + 100), max_charges: 0n, fee_bps: 0n,
     });
-    sub(107, MIXED_SUB, M_DAILY, {
+    await sub(107, MIXED_SUB, M_DAILY, {
       amount: 1_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 200), max_charges: 0n, fee_bps: 0n,
     });
 
@@ -1104,7 +1104,7 @@ describe("express 5 error boundary", () => {
     }
   });
 
-  test("strips the caller's payload from the logged error", () => {
+  test("strips the caller's payload from the logged error", async () => {
     // body-parser hangs the raw request body off its error, and pino would
     // serialize it as an own enumerable property of `err`.
     const err = Object.assign(new SyntaxError("Unexpected end of JSON input"), {
@@ -1122,7 +1122,7 @@ describe("express 5 error boundary", () => {
     assert.ok(!(kept.stack ?? "").includes("do-not-log-me"));
   });
 
-  test("answers a fixed shape and never echoes the failure", () => {
+  test("answers a fixed shape and never echoes the failure", async () => {
     let code = 0;
     let sent: unknown;
     const res = {
@@ -1149,7 +1149,7 @@ describe("express 5 error boundary", () => {
     });
   });
 
-  test("hands back a response whose headers are already out", () => {
+  test("hands back a response whose headers are already out", async () => {
     let forwarded: unknown;
     const res = {
       headersSent: true,

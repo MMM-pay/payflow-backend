@@ -59,8 +59,8 @@ describe("indexer projections", () => {
     ix = indexer(d);
   });
 
-  test("projects a created plan", () => {
-    ix.apply(planCreated);
+  test("projects a created plan", async () => {
+    await ix.apply(planCreated);
     const row = d.prepare("SELECT * FROM plans WHERE id = 1").get() as Record<string, unknown>;
     assert.equal(row.merchant, MERCHANT);
     assert.equal(row.amount, "10000000");
@@ -69,9 +69,9 @@ describe("indexer projections", () => {
     assert.equal(row.name, "Pro Monthly");
   });
 
-  test("projects a plan with no name as an empty label", () => {
+  test("projects a plan with no name as an empty label", async () => {
     // The contract allows an empty name; the UI falls back to the plan number.
-    ix.apply(event("plan_created", [MERCHANT, 2n], {
+    await ix.apply(event("plan_created", [MERCHANT, 2n], {
       token: TOKEN,
       amount: 1n,
       period: 60n,
@@ -81,8 +81,8 @@ describe("indexer projections", () => {
     assert.equal(row.name, "");
   });
 
-  test("projects the fee rate frozen into a mandate", () => {
-    ix.apply(subscribed);
+  test("projects the fee rate frozen into a mandate", async () => {
+    await ix.apply(subscribed);
     const row = d.prepare("SELECT fee_bps FROM mandates WHERE id = 1").get() as Record<
       string,
       unknown
@@ -90,14 +90,14 @@ describe("indexer projections", () => {
     assert.equal(row.fee_bps, 100);
   });
 
-  test("fee changes are projected once and preserve the latest rate", () => {
+  test("fee changes are projected once and preserve the latest rate", async () => {
     const changed = event("fee_changed", [MERCHANT], {
       old_fee_bps: 100n,
       new_fee_bps: 125n,
     });
-    ix.apply(changed);
-    ix.apply(changed);
-    ix.apply({
+    await ix.apply(changed);
+    await ix.apply(changed);
+    await ix.apply({
       ...changed,
       txHash: "tx-fee-2",
       ledger: 101,
@@ -113,15 +113,15 @@ describe("indexer projections", () => {
     ]);
   });
 
-  test("deactivating a plan flips the flag", () => {
-    ix.apply(planCreated);
-    ix.apply(event("plan_status_changed", [MERCHANT, 1n], { active: false }));
+  test("deactivating a plan flips the flag", async () => {
+    await ix.apply(planCreated);
+    await ix.apply(event("plan_status_changed", [MERCHANT, 1n], { active: false }));
     const row = d.prepare("SELECT active FROM plans WHERE id = 1").get() as { active: number };
     assert.equal(row.active, 0);
   });
 
-  test("records the spend cap from the subscribe event", () => {
-    ix.apply(
+  test("records the spend cap from the subscribe event", async () => {
+    await ix.apply(
       event("subscribed", [2n, SUBSCRIBER, MERCHANT], {
         plan_id: 1n,
         amount: 10_000_000n,
@@ -140,8 +140,8 @@ describe("indexer projections", () => {
     );
   });
 
-  test("projects a mandate on subscribe", () => {
-    ix.apply(subscribed);
+  test("projects a mandate on subscribe", async () => {
+    await ix.apply(subscribed);
     const row = d.prepare("SELECT * FROM mandates WHERE id = 1").get() as Record<string, unknown>;
     assert.equal(row.subscriber, SUBSCRIBER);
     assert.equal(row.merchant, MERCHANT);
@@ -149,13 +149,13 @@ describe("indexer projections", () => {
     assert.equal(row.charges_made, 0);
   });
 
-  test("emits a live event only after its projection has been applied", () => {
+  test("emits a live event only after its projection has been applied", async () => {
     const received: DecodedEvent[] = [];
     ix.events.on("applied", (e: DecodedEvent) => received.push(e));
 
-    ix.apply(subscribed);
-    ix.apply(charged(1, 1_700_060_000, "tx-live"));
-    ix.apply(event("some_future_event", [], { x: 1n }));
+    await ix.apply(subscribed);
+    await ix.apply(charged(1, 1_700_060_000, "tx-live"));
+    await ix.apply(event("some_future_event", [], { x: 1n }));
 
     assert.deepEqual(received.map((e) => e.name), ["subscribed", "charged"]);
     assert.equal(
@@ -165,9 +165,9 @@ describe("indexer projections", () => {
     );
   });
 
-  test("a charge appends history and advances the mandate", () => {
-    ix.apply(subscribed);
-    ix.apply(charged(1, 1_700_060_000, "tx-a"));
+  test("a charge appends history and advances the mandate", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(charged(1, 1_700_060_000, "tx-a"));
 
     const mandate = d.prepare("SELECT * FROM mandates WHERE id = 1").get() as Record<string, unknown>;
     assert.equal(mandate.charges_made, 1);
@@ -177,9 +177,9 @@ describe("indexer projections", () => {
     assert.equal(rows.length, 1);
   });
 
-  test("last_charge is derived from next_charge minus the period", () => {
-    ix.apply(subscribed);
-    ix.apply(charged(1, 1_700_060_000, "tx-a"));
+  test("last_charge is derived from next_charge minus the period", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(charged(1, 1_700_060_000, "tx-a"));
 
     const row = d.prepare("SELECT last_charge, next_charge, period FROM mandates WHERE id = 1").get() as {
       last_charge: number;
@@ -195,10 +195,10 @@ describe("indexer projections", () => {
     assert.ok(row.last_charge < row.next_charge);
   });
 
-  test("replaying the same charge is idempotent", () => {
-    ix.apply(subscribed);
-    ix.apply(charged(1, 1_700_060_000, "tx-a"));
-    ix.apply(charged(1, 1_700_060_000, "tx-a"));
+  test("replaying the same charge is idempotent", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(charged(1, 1_700_060_000, "tx-a"));
+    await ix.apply(charged(1, 1_700_060_000, "tx-a"));
 
     const rows = d.prepare("SELECT * FROM charges WHERE mandate_id = 1").all();
     assert.equal(rows.length, 1, "duplicate tx must not double-count revenue");
@@ -209,53 +209,53 @@ describe("indexer projections", () => {
     assert.equal(mandate.charges_made, 1);
   });
 
-  test("out-of-order charges never move a mandate backwards", () => {
-    ix.apply(subscribed);
-    ix.apply(charged(2, 1_700_120_000, "tx-b"));
-    ix.apply(charged(1, 1_700_060_000, "tx-a")); // stale, arrives late
+  test("out-of-order charges never move a mandate backwards", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(charged(2, 1_700_120_000, "tx-b"));
+    await ix.apply(charged(1, 1_700_060_000, "tx-a")); // stale, arrives late
 
     const mandate = d.prepare("SELECT * FROM mandates WHERE id = 1").get() as Record<string, unknown>;
     assert.equal(mandate.charges_made, 2);
     assert.equal(mandate.next_charge, 1_700_120_000);
   });
 
-  test("cancel and completion set terminal status", () => {
-    ix.apply(subscribed);
-    ix.apply(event("cancelled", [1n, SUBSCRIBER], { charges_made: 1n }));
+  test("cancel and completion set terminal status", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(event("cancelled", [1n, SUBSCRIBER], { charges_made: 1n }));
     let row = d.prepare("SELECT status FROM mandates WHERE id = 1").get() as { status: string };
     assert.equal(row.status, "Cancelled");
 
-    ix.apply(event("mandate_completed", [1n, SUBSCRIBER], { charges_made: 3n }));
+    await ix.apply(event("mandate_completed", [1n, SUBSCRIBER], { charges_made: 3n }));
     row = d.prepare("SELECT status FROM mandates WHERE id = 1").get() as { status: string };
     assert.equal(row.status, "Completed");
   });
 
-  test("a merchant ending a mandate cancels it and records who ended it", () => {
-    ix.apply(subscribed);
-    ix.apply(event("mandate_ended", [1n, MERCHANT], { subscriber: SUBSCRIBER, charges_made: 0 }));
+  test("a merchant ending a mandate cancels it and records who ended it", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(event("mandate_ended", [1n, MERCHANT], { subscriber: SUBSCRIBER, charges_made: 0 }));
     const row = d.prepare("SELECT status, ended_by FROM mandates WHERE id = 1").get() as Record<string, unknown>;
     assert.equal(row.status, "Cancelled");
     assert.equal(row.ended_by, "merchant");
   });
 
-  test("a subscriber cancel records the subscriber as the one who ended it", () => {
-    ix.apply(subscribed);
-    ix.apply(event("cancelled", [1n, SUBSCRIBER], { charges_made: 0 }));
+  test("a subscriber cancel records the subscriber as the one who ended it", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(event("cancelled", [1n, SUBSCRIBER], { charges_made: 0 }));
     const row = d.prepare("SELECT status, ended_by FROM mandates WHERE id = 1").get() as Record<string, unknown>;
     assert.equal(row.status, "Cancelled");
     assert.equal(row.ended_by, "subscriber");
   });
 
-  test("pause toggles only from active states", () => {
-    ix.apply(subscribed);
-    ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: true }));
+  test("pause toggles only from active states", async () => {
+    await ix.apply(subscribed);
+    await ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: true }));
     assert.equal(
       (d.prepare("SELECT status FROM mandates WHERE id = 1").get() as { status: string }).status,
       "Paused",
     );
 
-    ix.apply(event("cancelled", [1n, SUBSCRIBER], { charges_made: 1n }));
-    ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: false }));
+    await ix.apply(event("cancelled", [1n, SUBSCRIBER], { charges_made: 1n }));
+    await ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: false }));
     assert.equal(
       (d.prepare("SELECT status FROM mandates WHERE id = 1").get() as { status: string }).status,
       "Cancelled",
@@ -263,28 +263,28 @@ describe("indexer projections", () => {
     );
   });
 
-  test("vault events are recorded", () => {
+  test("vault events are recorded", async () => {
     const deposit = event("deposit", [SUBSCRIBER, TOKEN], {
       amount: 50_000_000n,
       balance: 50_000_000n,
     });
-    ix.apply(deposit);
-    ix.apply(deposit);
+    await ix.apply(deposit);
+    await ix.apply(deposit);
     const rows = d.prepare("SELECT * FROM vault_events").all() as Record<string, unknown>[];
     assert.equal(rows.length, 1, "replaying the event cannot duplicate history");
     assert.equal(rows[0]!.kind, "deposit");
     assert.equal(rows[0]!.balance, "50000000");
   });
 
-  test("unknown events are ignored", () => {
-    ix.apply(event("some_future_event", [], { x: 1n }));
+  test("unknown events are ignored", async () => {
+    await ix.apply(event("some_future_event", [], { x: 1n }));
     const rows = d.prepare("SELECT * FROM mandates").all();
     assert.equal(rows.length, 0);
   });
 });
 
 describe("schema migration", () => {
-  test("adds columns to a database created before they existed", () => {
+  test("adds columns to a database created before they existed", async () => {
     // Reproduce the pre-migration shape, which is what a deployed indexer
     // already has on disk: CREATE TABLE IF NOT EXISTS would skip it silently.
     const raw = new DatabaseSync(":memory:");

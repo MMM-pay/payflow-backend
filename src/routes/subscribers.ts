@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import {
   getSubscriberSummary,
   listSubscriberUpcomingMandates,
@@ -18,12 +18,12 @@ function daysOf(raw: unknown, fallback = DEFAULT_FORECAST_DAYS): number {
 }
 
 /** `GET /subscribers/:address/summary` and `GET /subscribers/:address/upcoming`. */
-export function subscribersRouter(db: DatabaseSync): Router {
+export function subscribersRouter(db: Storage): Router {
   const r = Router();
 
-  r.get("/subscribers/:address/summary", (req, res) => {
+  r.get("/subscribers/:address/summary", async (req, res) => {
     const address = String(req.params.address);
-    const body = getSubscriberSummary(db, address);
+    const body = await getSubscriberSummary(db, address);
     res.json(body);
   });
 
@@ -38,13 +38,13 @@ export function subscribersRouter(db: DatabaseSync): Router {
    * `now + period` rather than walking the ones it skipped. Subsequent
    * occurrences step by `period` while they stay inside `[now, until)`.
    */
-  r.get("/subscribers/:address/upcoming", (req, res) => {
+  r.get("/subscribers/:address/upcoming", async (req, res) => {
     const subscriber = String(req.params.address);
     const days = daysOf(req.query.days);
     const now = Math.floor(Date.now() / 1000);
     const until = now + days * DAY_S;
 
-    const mandates = listSubscriberUpcomingMandates(db, subscriber);
+    const mandates = await listSubscriberUpcomingMandates(db, subscriber);
 
     const upcoming: UpcomingCharge[] = [];
     let truncated = false;

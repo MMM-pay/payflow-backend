@@ -125,6 +125,29 @@ describe("network configs", () => {
     assert.equal(networks[0]!.databasePath, "./payflow.db");
   });
 
+  test("DATABASE_URL selects PostgreSQL for every configured network", () => {
+    const overrides = {
+      DATABASE_URL: "postgres://payflow:secret@db.example/payflow",
+      NETWORKS: "mainnet",
+      MAINNET_SOROBAN_RPC_URL: "https://mainnet.sorobanrpc.example",
+      MAINNET_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+      MAINNET_PLAN_REGISTRY_ID: VALID_CONTRACT_ID,
+      MAINNET_VAULT_ID: VALID_CONTRACT_ID,
+      MAINNET_SUBSCRIPTION_ID: VALID_CONTRACT_ID,
+    };
+    const config = loadConfig({ ...BASE, ...overrides });
+    const networks = networkConfigs(config, { ...BASE, ...overrides });
+    assert.deepEqual(networks.map((network) => network.databaseUrl), [overrides.DATABASE_URL, overrides.DATABASE_URL]);
+  });
+
+  test("DATABASE_URL must use PostgreSQL protocol", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, DATABASE_URL: "https://db.example/payflow" }),
+      /DATABASE_URL: must use a postgres URL/,
+    );
+    assert.equal(loadConfig({ ...BASE, DATABASE_URL: "" }).DATABASE_URL, undefined);
+  });
+
   test("an extra network is built from its prefixed variables", () => {
     const overrides = {
       NETWORKS: "mainnet",

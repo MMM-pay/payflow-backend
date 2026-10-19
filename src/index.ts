@@ -1,5 +1,5 @@
 import { loadConfig, networkConfigs } from "./config.ts";
-import { openDatabase } from "./lib/db.ts";
+import { openStorage } from "./lib/store/index.ts";
 import { makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
 import { createApp } from "./app.ts";
@@ -17,8 +17,8 @@ const networks = networkConfigs(config);
 
 // One indexer and one database per network, so cursors and projections never
 // mix. `runtimes[0]` is the default network: it serves the unprefixed routes.
-const runtimes = networks.map((network) => {
-  const db = openDatabase(network.databasePath);
+const runtimes = await Promise.all(networks.map(async (network) => {
+  const db = await openStorage(network);
   const server = makeRpc(network);
   const indexer = new Indexer(db, server, network);
   const runPass = serial(async () => {
@@ -55,7 +55,7 @@ const runtimes = networks.map((network) => {
     (merchant) => indexer.merchantCache.invalidate(merchant),
   );
   return { network, db, server, indexer, runPass, tokens, reconciler };
-});
+}));
 const defaultRuntime = runtimes[0]!;
 
 const keeper = config.KEEPER_ENABLED
@@ -224,8 +224,8 @@ async function shutdown(signal: string): Promise<void> {
   const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
-  http.close(() => {
-    for (const rt of runtimes) rt.db.close();
+  http.close(async () => {
+    await Promise.all(runtimes.map((rt) => rt.db.close()));
     process.exit(0);
   });
 }

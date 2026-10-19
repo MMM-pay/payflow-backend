@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import { getPlanById, listPlans } from "../lib/queries.ts";
 import type { TokenMetadataService } from "../lib/tokens.ts";
 import { limitOf, tokenFields } from "./helpers.ts";
@@ -14,23 +14,23 @@ import type { PlanPage } from "./types.ts";
  * contract, cached). When the contract cannot be read those are `null` and the
  * amount stays a string — the endpoint never fails just because RPC is down.
  */
-export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Router {
+export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
   const r = Router();
 
   r.get("/plans", async (req, res) => {
     const { merchant } = req.query;
     const plans = await Promise.all(
-      listPlans(db, {
+      (await listPlans(db, {
         merchant: merchant ? String(merchant) : undefined,
         limit: limitOf(req.query.limit),
-      }).map(async (row) => ({ ...row, ...(await tokenFields(tokens, row.token)) })),
+      })).map(async (row) => ({ ...row, ...(await tokenFields(tokens, row.token)) })),
     );
     const body: PlanPage = { plans };
     res.json(body);
   });
 
   r.get("/plans/:id", async (req, res) => {
-    const row = getPlanById(db, Number(req.params.id));
+    const row = await getPlanById(db, Number(req.params.id));
     if (!row) {
       sendApiError(res, req, 404, "plan_not_found");
       return;

@@ -32,6 +32,14 @@ const optionalSecret = z
     (value) => value === undefined || StrKey.isValidEd25519SecretSeed(value),
     "must be a valid Stellar secret seed",
   );
+const postgresUrl = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z
+    .string()
+    .url()
+    .refine((value) => ["postgres:", "postgresql:"].includes(new URL(value).protocol), "must use a postgres URL")
+    .optional(),
+);
 
 const schema = z.object({
   STELLAR_NETWORK: z.string().default("testnet"),
@@ -103,6 +111,7 @@ const schema = z.object({
   PORT: z.coerce.number().int().positive().default(8080),
   API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   API_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
+  DATABASE_URL: postgresUrl,
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),
@@ -127,8 +136,10 @@ export interface NetworkConfig {
   defaultToken?: string | undefined;
   /** Where the indexer starts when its database has no cursor. */
   startLedger: number;
-  /** SQLite file holding this network's projection. */
+  /** SQLite file holding this network's projection when DATABASE_URL is unset. */
   databasePath: string;
+  /** Shared PostgreSQL server, isolated by per-network schema when configured. */
+  databaseUrl?: string | undefined;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -178,6 +189,7 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
       subscriptionId: config.SUBSCRIPTION_ID,
       startLedger: config.INDEXER_START_LEDGER,
       databasePath: config.DATABASE_PATH,
+      databaseUrl: config.DATABASE_URL,
     },
     ...names.map((name) => extraNetwork(name, config, env)),
   ];
@@ -213,6 +225,7 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     startLedger: Number(data[`${prefix}_INDEXER_START_LEDGER`] ?? 0),
     databasePath:
       databasePath === undefined ? databasePathFor(base.DATABASE_PATH, name) : String(databasePath),
+    databaseUrl: base.DATABASE_URL,
   };
 }
 

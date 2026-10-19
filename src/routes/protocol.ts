@@ -1,14 +1,14 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import { getProtocolFeeHistory } from "../lib/queries.ts";
 import type { ProtocolResponse } from "./types.ts";
 
 /** `GET /protocol`: latest indexed fee and its change history. */
-export function protocolRouter(db: DatabaseSync): Router {
+export function protocolRouter(db: Storage): Router {
   const r = Router();
 
-  r.get("/protocol", (_req, res) => {
-    const body: ProtocolResponse = getProtocolFeeHistory(db);
+  r.get("/protocol", async (_req, res) => {
+    const body: ProtocolResponse = await getProtocolFeeHistory(db);
     res.json(body);
   });
 

@@ -1,0 +1,191 @@
+import { Pool } from "pg";
+import type { FieldDef, PoolClient, PoolConfig } from "pg";
+import type { SqlParameters, Storage } from "./types.ts";
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS cursor (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_ledger BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plans (
+  id BIGINT PRIMARY KEY,
+  merchant TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  token TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  period BIGINT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  ledger BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS plans_merchant ON plans(merchant);
+CREATE TABLE IF NOT EXISTS mandates (
+  id BIGINT PRIMARY KEY,
+  subscriber TEXT NOT NULL,
+  merchant TEXT NOT NULL,
+  plan_id BIGINT NOT NULL,
+  amount TEXT NOT NULL,
+  period BIGINT NOT NULL,
+  next_charge BIGINT NOT NULL,
+  last_charge BIGINT NOT NULL DEFAULT 0,
+  charges_made BIGINT NOT NULL DEFAULT 0,
+  max_charges BIGINT NOT NULL DEFAULT 0,
+  fee_bps INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'Active',
+  ended_by TEXT,
+  ledger BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mandates_subscriber ON mandates(subscriber);
+CREATE INDEX IF NOT EXISTS mandates_merchant ON mandates(merchant);
+CREATE INDEX IF NOT EXISTS mandates_due ON mandates(status, next_charge);
+CREATE INDEX IF NOT EXISTS mandates_merchant_status_period_amount
+  ON mandates(merchant, status, period, amount);
+CREATE TABLE IF NOT EXISTS charges (
+  tx_hash TEXT NOT NULL,
+  mandate_id BIGINT NOT NULL,
+  subscriber TEXT NOT NULL,
+  merchant TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  fee TEXT NOT NULL,
+  charges_made BIGINT NOT NULL,
+  next_charge BIGINT NOT NULL,
+  ledger BIGINT NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY (tx_hash, mandate_id)
+);
+CREATE INDEX IF NOT EXISTS charges_merchant ON charges(merchant);
+CREATE INDEX IF NOT EXISTS charges_subscriber ON charges(subscriber);
+CREATE INDEX IF NOT EXISTS charges_mandate ON charges(mandate_id);
+CREATE INDEX IF NOT EXISTS charges_merchant_amount ON charges(merchant, amount);
+CREATE INDEX IF NOT EXISTS charges_subscriber_amount_fee ON charges(subscriber, amount, fee);
+CREATE TABLE IF NOT EXISTS vault_events (
+  tx_hash TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  "user" TEXT NOT NULL,
+  token TEXT NOT NULL,
+  counterparty TEXT,
+  amount TEXT NOT NULL,
+  balance TEXT NOT NULL,
+  ledger BIGINT NOT NULL,
+  PRIMARY KEY (tx_hash, kind, "user", amount)
+);
+CREATE INDEX IF NOT EXISTS vault_events_user ON vault_events("user");
+CREATE INDEX IF NOT EXISTS vault_events_user_token_ledger ON vault_events("user", token, ledger DESC);
+CREATE INDEX IF NOT EXISTS vault_events_user_ledger ON vault_events("user", ledger DESC);
+CREATE TABLE IF NOT EXISTS fee_history (
+  tx_hash TEXT PRIMARY KEY,
+  old_fee_bps INTEGER NOT NULL,
+  new_fee_bps INTEGER NOT NULL,
+  ledger BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fee_history_ledger ON fee_history(ledger DESC);
+`;
+
+const schemaName = /^[a-z_][a-z0-9_]*$/;
+
+function normalizeRows<Row extends Record<string, unknown>>(
+  rows: Row[],
+  fields: readonly FieldDef[],
+): Row[] {
+  const integerColumns = fields.filter((field) => field.dataTypeID === 20).map((field) => field.name);
+  return rows.map((row) => {
+    const normalized: Record<string, unknown> = { ...row };
+    for (const column of integerColumns) {
+      const value = normalized[column];
+      if (typeof value === "string") normalized[column] = Number(value);
+    }
+    return normalized as Row;
+  });
+}
+
+function postgresSql(sql: string): string {
+  const ignored = /^([\s\S]*?)\bINSERT\s+OR\s+IGNORE\s+INTO\b/i.exec(sql);
+  let result = ignored ? `${ignored[1]}INSERT INTO${sql.slice(ignored[0].length)}` : sql;
+  let parameterIndex = 0;
+  result = result.replace(/\?/g, () => `$${++parameterIndex}`);
+  result = result.replace(/\bCAST\(([^()]*)\s+AS\s+INTEGER\)/gi, "CAST($1 AS BIGINT)");
+  result = result.replace(/\bMAX\(0,\s*([^()]*)\)/gi, "GREATEST(0, $1)");
+  if (ignored && !/\bON\s+CONFLICT\b/i.test(result)) result = `${result.trimEnd()} ON CONFLICT DO NOTHING`;
+  return result;
+}
+
+function sqlFor(sql: string): string {
+  return postgresSql(sql);
+}
+
+class PgExecutor implements Storage {
+  private readonly client: Pool | PoolClient;
+
+  constructor(client: Pool | PoolClient) {
+    this.client = client;
+  }
+
+  async all<Row>(sql: string, parameters: SqlParameters = []): Promise<Row[]> {
+    const result = await this.client.query(sqlFor(sql), [...parameters]);
+    return normalizeRows(result.rows, result.fields) as Row[];
+  }
+
+  async get<Row>(sql: string, parameters: SqlParameters = []): Promise<Row | undefined> {
+    const result = await this.client.query(sqlFor(sql), [...parameters]);
+    return normalizeRows(result.rows, result.fields)[0] as Row | undefined;
+  }
+
+  async run(sql: string, parameters: SqlParameters = []): Promise<void> {
+    await this.client.query(sqlFor(sql), [...parameters]);
+  }
+
+  async transaction<Result>(work: (storage: Storage) => Promise<Result>): Promise<Result> {
+    return work(this);
+  }
+
+  async close(): Promise<void> {}
+}
+
+/** PostgreSQL implementation of the shared async storage boundary. */
+export class PostgresStorage extends PgExecutor implements Storage {
+  private readonly pool: Pool;
+
+  private constructor(pool: Pool, client: Pool | PoolClient = pool) {
+    super(client);
+    this.pool = pool;
+  }
+
+  static async open(connectionString: string, networkName: string): Promise<PostgresStorage> {
+    const schema = `payflow_${networkName.replace(/[^a-z0-9_]/gi, "_").toLowerCase()}`;
+    if (!schemaName.test(schema)) throw new Error("Invalid PostgreSQL schema name");
+
+    const bootstrap = new Pool({ connectionString });
+    try {
+      await bootstrap.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
+    } finally {
+      await bootstrap.end();
+    }
+
+    const poolConfig: PoolConfig = {
+      connectionString,
+      options: `-c search_path=${schema}`,
+    };
+    const pool = new Pool(poolConfig);
+    const storage = new PostgresStorage(pool);
+    await storage.run(SCHEMA);
+    return storage;
+  }
+
+  override async transaction<Result>(work: (storage: Storage) => Promise<Result>): Promise<Result> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await work(new PgExecutor(client));
+      await client.query("COMMIT");
+      return result;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  override async close(): Promise<void> {
+    await this.pool.end();
+  }
+}
