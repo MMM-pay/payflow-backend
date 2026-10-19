@@ -101,6 +101,7 @@ const app = createApp(
   runtimes.map((rt) => ({
     config: rt.network,
     db: rt.db,
+    events: rt.indexer.events,
     indexer: rt.indexer.status,
     summaryCache: rt.indexer.merchantCache,
     rpc: rt.server,

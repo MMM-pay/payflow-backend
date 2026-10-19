@@ -22,6 +22,8 @@ export type ApiErrorCode =
   | "indexer_unavailable"
   | "reindex_failed"
   | "keeper_pass_failed"
+  | "rate_limited"
+  | "stream_limit"
   | "internal_error";
 
 /**
@@ -66,6 +68,8 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   indexer_unavailable: "Runtime indexer control is not available on this instance.",
   reindex_failed: "The reindex action failed.",
   keeper_pass_failed: "The keeper pass failed.",
+  rate_limited: "Too many requests. Try again later.",
+  stream_limit: "The maximum number of live streams is already connected.",
   internal_error: "An internal error occurred.",
 };
 

@@ -53,6 +53,31 @@ function rawEvent(ledger: number, planId: number): rpc.Api.EventResponse {
   } as unknown as rpc.Api.EventResponse;
 }
 
+function rawChargedEvent(ledger: number): rpc.Api.EventResponse {
+  return {
+    ledger,
+    txHash: "tx-stream-pass",
+    contractId: CONTRACT,
+    topic: [
+      nativeToScVal("charged", { type: "symbol" }),
+      nativeToScVal(1n, { type: "u64" }),
+      nativeToScVal(SUBSCRIBER, { type: "address" }),
+      nativeToScVal(MERCHANT, { type: "address" }),
+    ],
+    value: nativeToScVal(
+      { amount: 90n, fee: 10n, charges_made: 1n, next_charge: 1_700_000_060n },
+      {
+        type: {
+          amount: ["symbol", "i128"],
+          fee: ["symbol", "i128"],
+          charges_made: ["symbol", "u32"],
+          next_charge: ["symbol", "u64"],
+        },
+      },
+    ),
+  } as unknown as rpc.Api.EventResponse;
+}
+
 interface FakeChain {
   latest: number;
   oldest: number;
@@ -116,6 +141,39 @@ function plans(db: ReturnType<typeof openDatabase>): number[] {
 }
 
 describe("indexer sync", () => {
+  test("emits a projected event during the same RPC pass", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = {
+      latest: 101,
+      oldest: 100,
+      events: [rawChargedEvent(100)],
+      calls: [],
+    };
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 100 }));
+    ix.apply({
+      name: "subscribed",
+      contractId: CONTRACT,
+      ledger: 99,
+      txHash: "tx-subscribe-pass",
+      topics: [1n, SUBSCRIBER, MERCHANT],
+      data: {
+        plan_id: 1n,
+        amount: 100n,
+        period: 60n,
+        next_charge: 1_700_000_000n,
+      },
+    });
+    const received: string[] = [];
+    ix.events.on("applied", (event: { name: string }) => received.push(event.name));
+
+    const result = await ix.tick();
+
+    assert.equal(result.applied, 1);
+    assert.deepEqual(received, ["charged"]);
+    assert.equal(result.cursor, 101);
+    db.close();
+  });
+
   test("starts at the configured ledger and stops before the latest one", async () => {
     const db = openDatabase(":memory:");
     const chain: FakeChain = {

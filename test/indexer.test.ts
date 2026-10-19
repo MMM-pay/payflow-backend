@@ -126,6 +126,22 @@ describe("indexer projections", () => {
     assert.equal(row.charges_made, 0);
   });
 
+  test("emits a live event only after its projection has been applied", () => {
+    const received: DecodedEvent[] = [];
+    ix.events.on("applied", (e: DecodedEvent) => received.push(e));
+
+    ix.apply(subscribed);
+    ix.apply(charged(1, 1_700_060_000, "tx-live"));
+    ix.apply(event("some_future_event", [], { x: 1n }));
+
+    assert.deepEqual(received.map((e) => e.name), ["subscribed", "charged"]);
+    assert.equal(
+      (d.prepare("SELECT charges_made FROM mandates WHERE id = 1").get() as { charges_made: number })
+        .charges_made,
+      1,
+    );
+  });
+
   test("a charge appends history and advances the mandate", () => {
     ix.apply(subscribed);
     ix.apply(charged(1, 1_700_060_000, "tx-a"));

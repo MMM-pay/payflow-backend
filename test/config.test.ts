@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { loadConfig, networkConfigs } from "../src/config.ts";
 
 /** The minimum viable environment: contract ids pass the 56-char check. */
+const VALID_CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32));
 const BASE = {
-  PLAN_REGISTRY_ID: "C".repeat(56),
-  VAULT_ID: "C".repeat(56),
-  SUBSCRIPTION_ID: "C".repeat(56),
+  PLAN_REGISTRY_ID: VALID_CONTRACT_ID,
+  VAULT_ID: VALID_CONTRACT_ID,
+  SUBSCRIPTION_ID: VALID_CONTRACT_ID,
 };
 
 describe("soroban rpc endpoints", () => {
@@ -75,7 +77,20 @@ describe("keeper order", () => {
   });
 });
 
-const ID = "C".repeat(56);
+describe("keeper inclusion fee configuration", () => {
+  test("uses the default percentile and cap", () => {
+    const config = loadConfig(env());
+    assert.equal(config.KEEPER_FEE_PERCENTILE, "90");
+    assert.equal(config.KEEPER_MAX_FEE, 100_000n);
+  });
+
+  test("rejects unsupported percentiles and fees below BASE_FEE", () => {
+    assert.throws(() => loadConfig(env({ KEEPER_FEE_PERCENTILE: "85" })), /KEEPER_FEE_PERCENTILE/);
+    assert.throws(() => loadConfig(env({ KEEPER_MAX_FEE: "1" })), /KEEPER_MAX_FEE/);
+  });
+});
+
+const ID = VALID_CONTRACT_ID;
 
 /** Environment holding only what the default network needs. */
 function env(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -140,6 +155,50 @@ describe("network configs", () => {
     assert.throws(
       () => networkConfigs(config, env(overrides)),
       /Invalid network name "main net"/,
+    );
+  });
+});
+
+describe("Stellar identifier validation", () => {
+  test("accepts a valid contract id and secret seed", () => {
+    const secret = Keypair.random().secret();
+    const config = loadConfig({ ...BASE, KEEPER_SECRET: secret });
+    assert.equal(config.PLAN_REGISTRY_ID, VALID_CONTRACT_ID);
+    assert.equal(config.KEEPER_SECRET, secret);
+  });
+
+  test("rejects a public key where a contract id is required", () => {
+    const publicKey = Keypair.random().publicKey();
+    assert.throws(
+      () => loadConfig({ ...BASE, PLAN_REGISTRY_ID: publicKey }),
+      /PLAN_REGISTRY_ID: must be a valid Stellar contract ID/,
+    );
+  });
+
+  test("rejects a malformed contract id and names the variable", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, VAULT_ID: "C".repeat(56) }),
+      /VAULT_ID: must be a valid Stellar contract ID/,
+    );
+  });
+
+  test("rejects malformed keeper secrets without echoing them", () => {
+    const secret = "S".repeat(56);
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_SECRET: secret }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /KEEPER_SECRET: must be a valid Stellar secret seed/);
+        assert.equal(error.message.includes(secret), false);
+        return true;
+      },
+    );
+  });
+
+  test("rejects non-string identifiers without including their values", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, SUBSCRIPTION_ID: 123 as unknown as string }),
+      /SUBSCRIPTION_ID: Invalid input/,
     );
   });
 });

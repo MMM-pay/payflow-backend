@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import type { EventEmitter } from "node:events";
 import cors from "cors";
+import { rateLimit } from "express-rate-limit";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
+import helmet from "helmet";
 import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Config, NetworkConfig } from "./config.ts";
@@ -87,6 +90,7 @@ function lagOf(indexer: IndexerStatus | undefined): number | null {
 export interface NetworkRuntime {
   config: NetworkConfig;
   db: DatabaseSync;
+  events?: EventEmitter | undefined;
   indexer?: IndexerStatus | undefined;
   summaryCache?: MerchantSummaryCache | undefined;
   rpc?: RpcStatus | undefined;
@@ -210,6 +214,9 @@ export function createApp(
 
   const app = express();
 
+  app.set("trust proxy", 1);
+  app.use(helmet());
+
   app.use(
     pinoHttp({
       logger,
@@ -238,6 +245,26 @@ export function createApp(
     }),
   );
   app.use(express.json({ limit: "64kb" }));
+
+  app.get(["/health", "/ready"], (_req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    next();
+  });
+
+  app.use(
+    "/api",
+    (_req, res, next) => {
+      res.setHeader("Cache-Control", "no-store");
+      next();
+    },
+    rateLimit({
+      windowMs: config.API_RATE_LIMIT_WINDOW_MS ?? 60_000,
+      limit: config.API_RATE_LIMIT_MAX ?? 120,
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      handler: (req, res) => sendApiError(res, req, 429, "rate_limited"),
+    }),
+  );
 
   // Always 200 so a slow backfill does not get the service restarted; the
   // body says whether the projection is current.
@@ -292,6 +319,7 @@ export function createApp(
       runtimes.map((rt) => ({
         name: rt.config.name,
         db: rt.db,
+        events: rt.events,
         summaryCache: rt.summaryCache,
         defaultToken: rt.config.defaultToken ?? config.TOKEN_ID,
         tokens: tokenServiceOf(rt),

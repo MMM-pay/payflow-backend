@@ -1,4 +1,5 @@
 import { extname } from "node:path";
+import { BASE_FEE, StrKey } from "@stellar/stellar-sdk";
 import { z } from "zod";
 
 /** Split a comma-separated URL list, dropping blanks and duplicates. */
@@ -20,6 +21,18 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+const contractId = z
+  .string()
+  .refine((value) => StrKey.isValidContract(value), "must be a valid Stellar contract ID");
+const optionalSecret = z
+  .string()
+  .optional()
+  .transform((value) => (value === "" ? undefined : value))
+  .refine(
+    (value) => value === undefined || StrKey.isValidEd25519SecretSeed(value),
+    "must be a valid Stellar secret seed",
+  );
+
 const schema = z.object({
   STELLAR_NETWORK: z.string().default("testnet"),
   /** One or more RPC endpoints; the client fails over between them. */
@@ -34,21 +47,21 @@ const schema = z.object({
     ),
   NETWORK_PASSPHRASE: z.string().default("Test SDF Network ; September 2015"),
 
-  PLAN_REGISTRY_ID: z.string().min(56),
-  VAULT_ID: z.string().min(56),
-  SUBSCRIPTION_ID: z.string().min(56),
-  TOKEN_ID: z.string().min(56).optional(),
+  PLAN_REGISTRY_ID: contractId,
+  VAULT_ID: contractId,
+  SUBSCRIPTION_ID: contractId,
+  TOKEN_ID: contractId.optional(),
 
   /** Extra networks to serve beside the default, comma-separated. */
   NETWORKS: z.string().default(""),
 
-  KEEPER_SECRET: z.string().optional(),
+  KEEPER_SECRET: optionalSecret,
   /**
    * Standby key for zero-downtime rotation. When set, the keeper falls back
    * to it if `KEEPER_SECRET` becomes unusable mid-pass, and accepts it as the
    * new primary on SIGHUP without a restart.
    */
-  KEEPER_SECRET_NEXT: z.string().optional(),
+  KEEPER_SECRET_NEXT: optionalSecret,
   KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   /**
    * Which due mandate to settle first: `oldest` (due date ascending, the
@@ -56,6 +69,11 @@ const schema = z.object({
    * high-value mandates under a fee budget).
    */
   KEEPER_ORDER: z.enum(["oldest", "largest"]).default("oldest"),
+  KEEPER_FEE_PERCENTILE: z.enum(["50", "60", "70", "80", "90", "95", "99"]).default("90"),
+  KEEPER_MAX_FEE: z.coerce
+    .bigint()
+    .min(BigInt(BASE_FEE), `must be at least BASE_FEE (${BASE_FEE})`)
+    .default(100_000n),
   KEEPER_ENABLED: z
     .string()
     .default("false")
@@ -71,6 +89,8 @@ const schema = z.object({
   INDEXER_FETCH_CONCURRENCY: z.coerce.number().int().positive().max(16).default(4),
 
   PORT: z.coerce.number().int().positive().default(8080),
+  API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+  API_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),
@@ -156,9 +176,9 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
   const schema = z.object({
     [`${prefix}_SOROBAN_RPC_URL`]: z.string().url(),
     [`${prefix}_NETWORK_PASSPHRASE`]: z.string().min(1),
-    [`${prefix}_PLAN_REGISTRY_ID`]: z.string().min(56),
-    [`${prefix}_VAULT_ID`]: z.string().min(56),
-    [`${prefix}_SUBSCRIPTION_ID`]: z.string().min(56),
+    [`${prefix}_PLAN_REGISTRY_ID`]: contractId,
+    [`${prefix}_VAULT_ID`]: contractId,
+    [`${prefix}_SUBSCRIPTION_ID`]: contractId,
     [`${prefix}_INDEXER_START_LEDGER`]: z.coerce.number().int().nonnegative().default(0),
     [`${prefix}_DATABASE_PATH`]: z.string().min(1).optional(),
   });

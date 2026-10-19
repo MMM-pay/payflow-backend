@@ -10,6 +10,7 @@ import type { Config, NetworkConfig } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 import { MerchantSummaryCache } from "../src/routes/index.ts";
 import type { MerchantSummary } from "../src/routes/types.ts";
+import { asReader, TokenMetadataService } from "../src/lib/tokens.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
@@ -123,6 +124,14 @@ describe("http api", () => {
     const { status, body } = await get("/health");
     assert.equal(status, 200);
     assert.equal(body.status, "ok");
+  });
+
+  test("health is not cached and API list responses have a short cache lifetime", async () => {
+    const health = await fetch(`${base}/health`);
+    const plans = await fetch(`${base}/api/plans`);
+    assert.equal(health.headers.get("cache-control"), "no-store");
+    assert.equal(plans.headers.get("cache-control"), "public, max-age=5");
+    assert.equal(health.headers.get("x-content-type-options"), "nosniff");
   });
 
   test("health reports indexer lag", async () => {
@@ -428,6 +437,90 @@ describe("merchant summary caching", () => {
     assert.equal(cache.get("m1")?.merchant, "m1");
     assert.equal(cache.get("m2"), undefined);
     assert.equal(cache.get("m3")?.merchant, "m3");
+  });
+});
+
+describe("server-sent event stream", () => {
+  test("streams a charge and removes its listener when the client disconnects", async () => {
+    const streamDb = openDatabase(":memory:");
+    const streamIndexer = new Indexer(streamDb, {} as never, {} as never);
+    streamIndexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+      plan_id: 1n,
+      amount: 10_000_000n,
+      period: 2_592_000n,
+      next_charge: 1_700_000_000n,
+    }, "subscribe-stream"));
+    const streamApp = createApp(
+      [{
+        config: testnet,
+        db: streamDb,
+        indexer: status,
+        events: streamIndexer.events,
+        tokens: new TokenMetadataService(asReader(undefined), {
+          networkPassphrase: testnet.networkPassphrase,
+        }),
+      }],
+      config,
+    );
+    const streamServer = await new Promise<Server>((resolve) => {
+      const listening = streamApp.listen(0, () => resolve(listening));
+    });
+    const address = streamServer.address();
+    const streamBase = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`;
+    const listenerCount = streamIndexer.events.listenerCount("applied");
+
+    try {
+      const response = await fetch(`${streamBase}/api/stream?merchant=${MERCHANT}`);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(streamIndexer.events.listenerCount("applied"), listenerCount + 1);
+      const reader = response.body!.getReader();
+      await reader.read();
+
+      streamIndexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+        amount: 9_900_000n,
+        fee: 100_000n,
+        charges_made: 1n,
+        next_charge: 1_702_592_000n,
+      }, "charge-stream"));
+      let text = "";
+      while (!text.includes("event: charged")) {
+        const streamed = await reader.read();
+        assert.equal(streamed.done, false);
+        text += new TextDecoder().decode(streamed.value);
+      }
+      assert.match(text, /event: charged/);
+      assert.match(text, /"amount":"9900000"/);
+
+      await reader.cancel();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(streamIndexer.events.listenerCount("applied"), listenerCount);
+    } finally {
+      streamServer.close();
+      streamDb.close();
+    }
+  });
+});
+
+describe("API rate limiting", () => {
+  test("returns 429 with Retry-After after the configured limit", async () => {
+    const limitedApp = createApp(db, { ...config, API_RATE_LIMIT_MAX: 1 } as Config, status);
+    const limitedServer = await new Promise<Server>((resolve) => {
+      const listening = limitedApp.listen(0, () => resolve(listening));
+    });
+    const address = limitedServer.address();
+    const limitedBase = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`;
+    try {
+      assert.equal((await fetch(`${limitedBase}/api/plans`)).status, 200);
+      const limited = await fetch(`${limitedBase}/api/plans`);
+      assert.equal(limited.status, 429);
+      assert.ok(limited.headers.get("retry-after"));
+      const body = (await limited.json()) as { error: { code: string } };
+      assert.equal(body.error.code, "rate_limited");
+    } finally {
+      limitedServer.close();
+    }
   });
 });
 

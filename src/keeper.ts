@@ -6,6 +6,7 @@ import {
   TransactionBuilder,
   nativeToScVal,
   rpc,
+  xdr,
 } from "@stellar/stellar-sdk";
 import type { Config } from "./config.ts";
 import { logger } from "./lib/logger.ts";
@@ -22,7 +23,7 @@ export interface DueMandate {
 /** The RPC calls the keeper makes. Narrow so tests can supply a fake. */
 export type KeeperRpc = Pick<
   rpc.Server,
-  "getAccount" | "prepareTransaction" | "sendTransaction" | "getTransaction"
+  "getAccount" | "getFeeStats" | "prepareTransaction" | "sendTransaction" | "getTransaction"
 >;
 
 /** First retry delay after a failed charge; doubles per failure. */
@@ -41,6 +42,17 @@ const BATCH = 25;
 function isKeyFailure(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /not found|no such account|missing source|not funded/i.test(message);
+}
+
+function isCongestionFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  if (/txINSUFFICIENT_FEE|txInsufficientFee|TRY_AGAIN_LATER/i.test(message)) return true;
+  try {
+    const result = xdr.TransactionResult.fromXDR(message, "base64");
+    return (result.result as unknown as { type: string }).type === "txInsufficientFee";
+  } catch {
+    return false;
+  }
 }
 
 export interface SettleResult {
@@ -206,14 +218,32 @@ export class Keeper {
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
     const due = this.findDue(now);
+    if (due.length === 0) return [];
+    const fee = await this.inclusionFee();
     const results: SettleResult[] = [];
     for (const mandate of due) {
-      const result = await this.settle(mandate.id);
+      const result = await this.settle(mandate.id, fee);
       this.record(result, now);
       results.push(result);
     }
     this.announceRetirement(results);
     return results;
+  }
+
+  private async inclusionFee(): Promise<bigint> {
+    const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
+    try {
+      const stats = await this.server.getFeeStats();
+      const percentile = `p${this.config.KEEPER_FEE_PERCENTILE ?? "90"}` as keyof typeof stats.sorobanInclusionFee;
+      const requestedFee = BigInt(stats.sorobanInclusionFee[percentile]);
+      const baseFee = BigInt(BASE_FEE);
+      const fee = requestedFee > baseFee ? requestedFee : baseFee;
+      return fee < maxFee ? fee : maxFee;
+    } catch {
+      logger.warn("keeper fee stats unavailable; using BASE_FEE for this pass");
+      const baseFee = BigInt(BASE_FEE);
+      return baseFee < maxFee ? baseFee : maxFee;
+    }
   }
 
   /**
@@ -270,11 +300,34 @@ export class Keeper {
    * loop. A failure of the signing key itself rotates to the standby key and
    * retries the same mandate, so a leaked or drained key causes no downtime.
    */
-  async settle(mandateId: number): Promise<SettleResult> {
+  async settle(mandateId: number, inclusionFee: bigint = BigInt(BASE_FEE)): Promise<SettleResult> {
+    const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
+    let fee = inclusionFee < maxFee ? inclusionFee : maxFee;
+    let congestionRetries = 0;
     for (;;) {
       try {
-        return await this.submit(mandateId);
+        const result = await this.submit(mandateId, fee);
+        if (result.status === "failed" && isCongestionFailure(result.error)) {
+          const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
+          if (congestionRetries === 0 && retryFee > fee) {
+            congestionRetries += 1;
+            fee = retryFee;
+            logger.warn({ mandateId, fee: fee.toString() }, "retrying charge with a higher fee");
+            continue;
+          }
+        }
+        logger.info({ mandateId, fee: fee.toString() }, "keeper inclusion fee selected");
+        return result;
       } catch (err) {
+        if (isCongestionFailure(err)) {
+          const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
+          if (congestionRetries === 0 && retryFee > fee) {
+            congestionRetries += 1;
+            fee = retryFee;
+            logger.warn({ mandateId, fee: fee.toString() }, "retrying charge with a higher fee");
+            continue;
+          }
+        }
         const error = err instanceof Error ? err.message : String(err);
         if (isKeyFailure(err) && this.active + 1 < this.keys.length) {
           const failed = this.keys[this.active]!.publicKey();
@@ -286,19 +339,19 @@ export class Keeper {
           );
           continue;
         }
-        logger.warn({ mandateId, error }, "charge skipped");
+        logger.warn({ mandateId, fee: fee.toString(), error }, "charge skipped");
         return { mandateId, status: "failed", error };
       }
     }
   }
 
   /** Builds, simulates, signs and submits one `charge` with the active key. */
-  private async submit(mandateId: number): Promise<SettleResult> {
+  private async submit(mandateId: number, fee: bigint): Promise<SettleResult> {
     const account = await this.server.getAccount(this.publicKey);
     const contract = new Contract(this.config.SUBSCRIPTION_ID);
 
     const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
+      fee: fee.toString(),
       networkPassphrase: this.config.NETWORK_PASSPHRASE,
     })
       .addOperation(
@@ -311,11 +364,17 @@ export class Keeper {
     prepared.sign(this.keys[this.active]!);
 
     const sent = await this.server.sendTransaction(prepared);
+    if (sent.status === "TRY_AGAIN_LATER") {
+      return { mandateId, status: "failed", error: sent.status };
+    }
     if (sent.status === "ERROR") {
       return {
         mandateId,
         status: "failed",
-        error: JSON.stringify(sent.errorResult ?? sent.status),
+        error:
+          typeof sent.errorResult === "string"
+            ? sent.errorResult
+            : JSON.stringify(sent.errorResult ?? sent.status),
       };
     }
 

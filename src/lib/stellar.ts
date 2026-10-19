@@ -12,6 +12,7 @@ export type RpcLike = Pick<
   | "getHealth"
   | "getEvents"
   | "getAccount"
+  | "getFeeStats"
   | "prepareTransaction"
   | "sendTransaction"
   | "getTransaction"
@@ -148,6 +149,10 @@ export class FailoverRpc implements RpcStatus {
 
   async getAccount(address: string): Promise<Account> {
     return this.run("getAccount", (server) => server.getAccount(address));
+  }
+
+  async getFeeStats(): Promise<rpc.Api.GetFeeStatsResponse> {
+    return this.run("getFeeStats", (server) => server.getFeeStats());
   }
 
   async prepareTransaction(

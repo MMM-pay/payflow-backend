@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { EventEmitter } from "node:events";
 import { rpc } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
 
@@ -86,6 +87,7 @@ export class Indexer {
   private readonly db: DatabaseSync;
   private readonly server: IndexerRpc;
   private readonly config: IndexerConfig;
+  readonly events = new EventEmitter();
   readonly merchantCache: MerchantSummaryCache;
   readonly status: IndexerStatus = {
     cursor: 0,
@@ -363,15 +365,19 @@ export class Indexer {
         return "applied";
       case "subscribed":
         this.onSubscribed(e);
+        this.events.emit("applied", e);
         return "applied";
       case "charged":
         this.onCharged(e);
+        this.events.emit("applied", e);
         return "applied";
       case "cancelled":
         this.onStatus(e, "Cancelled", "subscriber");
+        this.events.emit("applied", e);
         return "applied";
       case "mandate_ended":
         this.onStatus(e, "Cancelled", "merchant");
+        this.events.emit("applied", e);
         return "applied";
       case "mandate_completed":
         this.onStatus(e, "Completed");
