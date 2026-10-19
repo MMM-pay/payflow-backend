@@ -20,6 +20,13 @@ All notable changes to payflow-backend. The format follows
   consumes the *fee source's* sequence number, which would serialize every
   transaction against the main key again. Tested with three channels: no
   sequence-number collisions, all channels sign, results keep due order.
+- **Merchant churn metrics (#30).** `GET /api/merchants/:address/churn` reports
+  how a merchant's mandate base moved over time: mandates started, cancelled
+  by the subscriber, ended by the merchant, and completed, plus the net, in
+  `day`, `week` or `month` buckets. The indexer records each lifecycle event
+  in a new `mandate_events` log stamped with the ledger's close time, so the
+  buckets are the chain's calendar and not the indexer's wall clock, and
+  replaying a ledger range leaves the report unchanged.
 - **Per-plan statistics (#29).** `GET /api/plans/:id/stats` reports a plan's
   active and total mandates, cancellations, gross amount collected and the
   average number of settled charges per mandate, so merchants can compare

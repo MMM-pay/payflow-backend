@@ -1355,3 +1355,170 @@ describe("multiple networks", () => {
   });
 });
 
+
+// Churn: the per-merchant report of starts and departures over time.
+//
+// The events are stamped with a ledger close time that straddles a month
+// boundary, so the buckets are the chain's calendar months and not the
+// indexer's wall clock. No network is touched.
+describe("merchant churn", () => {
+  const CHURN_MERCHANT = "GA5WDTXMB5SW2DIVYCXKQ36M3LWPSGVPYQWRTMLERMZSPGYQXVQ2N55B";
+  const CHURN_SUBSCRIBER = "GD2P7AV53TONBPXKX5NWQKGUTAF32VZWKMFHQ2QZ5XNTTQFTV7Q4USP";
+  const churnDb = openDatabase(":memory:");
+  const churnIx = new Indexer(churnDb, {} as never, {} as never);
+  let churnServer: Server;
+  let churnBase: string;
+
+  /** 2025-01-31T23:59:59Z: the last second of January. */
+  const JAN_END = Math.floor(Date.UTC(2025, 0, 31, 23, 59, 59) / 1000);
+  /** 2025-02-01T00:00:00Z: the first second of February. */
+  const FEB_START = Math.floor(Date.UTC(2025, 1, 1, 0, 0, 0) / 1000);
+  /** 2025-02-15T12:00:00Z: mid-February. */
+  const FEB_MID = Math.floor(Date.UTC(2025, 1, 15, 12, 0, 0) / 1000);
+
+  const ev = (
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+    tx: string,
+    closeTime: number,
+  ): DecodedEvent => ({
+    name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime,
+  });
+
+  const churnGet = async (path: string) => {
+    const res = await fetch(churnBase + path);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  before(async () => {
+    churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
+      token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
+    }, "tx-plan", JAN_END));
+
+    // Mandate 1 starts in January and is cancelled in February.
+    churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }, "tx-sub-1", JAN_END));
+    churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
+
+    // Mandate 2 starts in February and is ended by the merchant, also in
+    // February.
+    churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }, "tx-sub-2", FEB_MID));
+    churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
+      subscriber: CHURN_SUBSCRIBER, charges_made: 1,
+    }, "tx-end-2", FEB_MID));
+
+    const app = createApp(churnDb, config);
+    await new Promise<void>((resolve) => {
+      churnServer = app.listen(0, () => {
+        const addr = churnServer.address();
+        churnBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    churnServer.close();
+    churnDb.close();
+  });
+
+  test("buckets are calendar months that split a month boundary", async () => {
+    const { status, body } = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    assert.equal(status, 200);
+    assert.equal(body.merchant, CHURN_MERCHANT);
+    assert.equal(body.bucket, "month");
+
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      buckets.map((b) => b.bucket),
+      ["2025-01", "2025-02"],
+      "the January start and the February cancel land in different buckets",
+    );
+
+    // January: one mandate started and none departed.
+    assert.equal(buckets[0]!.started, 1);
+    assert.equal(buckets[0]!.cancelled, 0);
+    assert.equal(buckets[0]!.ended, 0);
+    assert.equal(buckets[0]!.net, 1);
+
+    // February: one start, one cancellation and one merchant ending.
+    assert.equal(buckets[1]!.started, 1);
+    assert.equal(buckets[1]!.cancelled, 1);
+    assert.equal(buckets[1]!.ended, 1);
+    assert.equal(buckets[1]!.net, -1);
+  });
+
+  test("the totals sum every bucket", async () => {
+    const { body } = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    const totals = body.totals as unknown as Record<string, unknown>;
+    assert.equal(totals.started, 2);
+    assert.equal(totals.cancelled, 1);
+    assert.equal(totals.ended, 1);
+    assert.equal(totals.net, 0);
+  });
+
+  test("a day bucket splits the same events by day", async () => {
+    // The default window is the last 12 buckets, which is shorter than the
+    // span between the first and last event here, so ask for more.
+    const { body } = await churnGet(
+      `/api/merchants/${CHURN_MERCHANT}/churn?bucket=day&limit=30`,
+    );
+    assert.equal(body.bucket, "day");
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    // Every day in the range is present, so a chart has no gaps in it.
+    assert.equal(buckets.length, 16);
+    assert.equal(buckets[0]!.bucket, "2025-01-31");
+    assert.equal(buckets.at(-1)!.bucket, "2025-02-15");
+    // The start is on 31 January and the cancellation on 1 February.
+    assert.equal(buckets[0]!.started, 1);
+    assert.equal(buckets[0]!.cancelled, 0);
+    assert.equal(buckets[1]!.bucket, "2025-02-01");
+    assert.equal(buckets[1]!.cancelled, 1);
+    // The second mandate both starts and is ended by the merchant on the
+    // 15th.
+    assert.equal(buckets.at(-1)!.started, 1);
+    assert.equal(buckets.at(-1)!.ended, 1);
+  });
+
+  test("the report keeps the most recent buckets", async () => {
+    const { body } = await churnGet(
+      `/api/merchants/${CHURN_MERCHANT}/churn?bucket=day&limit=1`,
+    );
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      buckets.map((b) => b.bucket),
+      ["2025-02-15"],
+      "the last bucket is the most recent one",
+    );
+  });
+
+  test("a merchant with no events reports no buckets", async () => {
+    const { status, body } = await churnGet("/api/merchants/GAUNKNOWN/churn");
+    assert.equal(status, 200);
+    assert.deepEqual(body.buckets, []);
+    assert.equal((body.totals as unknown as Record<string, unknown>).started, 0);
+  });
+
+  test("an unknown bucket size falls back to month", async () => {
+    const { status, body } = await churnGet(
+      `/api/merchants/${CHURN_MERCHANT}/churn?bucket=fortnight`,
+    );
+    assert.equal(status, 200);
+    assert.equal(body.bucket, "month");
+  });
+
+  test("replaying the same events leaves the report unchanged", async () => {
+    const before = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    // Apply the same events again, as a crashed pass would.
+    churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }, "tx-sub-1", JAN_END));
+    churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
+    const after = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    assert.deepEqual(after.body, before.body, "a replayed event does not move a count");
+  });
+});

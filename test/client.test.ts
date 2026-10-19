@@ -39,14 +39,15 @@ before(async () => {
     topics: unknown[],
     data: Record<string, unknown>,
     tx = "t",
-  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+    closeTime: number | null = null,
+  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime });
 
   ix.apply(ev("plan_created", [MERCHANT, 1n], {
     token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Pro Monthly",
   }));
   ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n, fee_bps: 100,
-  }));
+  }, "t", 1_700_000_000));
   ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
@@ -108,6 +109,16 @@ describe("typed api client", () => {
     assert.equal(stats.totalCollected, "9900000");
     assert.equal(stats.totalCharges, 1);
     assert.equal(stats.averageChargesPerMandate, 1);
+  });
+
+  test("fetches the merchant churn report", async () => {
+    const churn = await client.merchantChurn(MERCHANT, { bucket: "month" });
+    assert.equal(churn.merchant, MERCHANT);
+    assert.equal(churn.bucket, "month");
+    assert.equal(churn.buckets.length, 1);
+    assert.equal(churn.buckets[0]?.started, 1);
+    assert.equal(churn.totals.started, 1);
+    assert.equal(churn.totals.net, 1);
   });
 
   test("mandate list, charges and due pages", async () => {

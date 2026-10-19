@@ -14,12 +14,14 @@
  */
 import type {
   ChargePage,
+  ChurnBucketSize,
   DuePage,
   ForecastResponse,
   HealthResponse,
   KeeperHistoryResponse,
   MandatePage,
   MandateRow,
+  MerchantChurnResponse,
   MerchantSubscribersResponse,
   MerchantSummary,
   PlanPage,
@@ -38,6 +40,8 @@ export type {
   ApiErrorResponse,
   ChargePage,
   ChargeRow,
+  ChurnBucket,
+  ChurnBucketSize,
   DueMandateRow,
   DuePage,
   ForecastResponse,
@@ -47,6 +51,7 @@ export type {
   KeeperPassSummary,
   MandatePage,
   MandateRow,
+  MerchantChurnResponse,
   MerchantSubscriber,
   MerchantSubscribersResponse,
   MerchantSummary,
@@ -185,6 +190,17 @@ export class PayflowClient {
   merchantSubscribers(address: string, query: PageQuery = {}): Promise<MerchantSubscribersResponse> {
     return this.get<MerchantSubscribersResponse>(
       `/api/merchants/${encodeURIComponent(address)}/subscribers`,
+      query,
+    );
+  }
+
+  /** The merchant's churn report: starts and departures per time bucket. */
+  merchantChurn(
+    address: string,
+    query: { bucket?: ChurnBucketSize; limit?: number } = {},
+  ): Promise<MerchantChurnResponse> {
+    return this.get<MerchantChurnResponse>(
+      `/api/merchants/${encodeURIComponent(address)}/churn`,
       query,
     );
   }

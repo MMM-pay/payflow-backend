@@ -9,6 +9,7 @@ import {
   big,
   decodeEvent,
   num,
+  parseCloseTime,
   specProblems,
   str,
   type DecodedEvent,
@@ -16,22 +17,7 @@ import {
 import { logger } from "./lib/logger.ts";
 import { defaultMerchantSummaryCache, type MerchantSummaryCache } from "./routes/index.ts";
 
-/** Helper to parse a ledger close time into unix epoch seconds. */
-export function parseCloseTime(raw: unknown): number | null {
-  if (raw === undefined || raw === null) return null;
-  if (typeof raw === "number") {
-    return raw > 1e11 ? Math.floor(raw / 1000) : raw;
-  }
-  if (typeof raw === "string") {
-    const asNum = Number(raw);
-    if (!Number.isNaN(asNum) && asNum > 0) {
-      return asNum > 1e11 ? Math.floor(asNum / 1000) : asNum;
-    }
-    const parsed = Date.parse(raw);
-    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
-  }
-  return null;
-}
+export { parseCloseTime };
 
 /** RPC caps a single getEvents window; stay well inside it. */
 const LEDGER_WINDOW = 8_000;
@@ -375,25 +361,38 @@ export class Indexer {
       case "plan_status_changed":
         this.onPlanStatus(e);
         return "applied";
-      case "subscribed":
+      case "subscribed": {
+        const [, , merchant] = e.topics;
         this.onSubscribed(e);
+        this.recordChurn(e, "started", str(merchant));
         this.events.emit("applied", e);
         return "applied";
+      }
       case "charged":
         this.onCharged(e);
         this.events.emit("applied", e);
         return "applied";
-      case "cancelled":
-        this.onStatus(e, "Cancelled", "subscriber");
+      case "cancelled": {
+        // The cancel event names the subscriber, not the merchant, so the
+        // merchant comes from the mandate row the projection holds.
+        const merchant = this.onStatus(e, "Cancelled", "subscriber");
+        this.recordChurn(e, "cancelled", merchant);
         this.events.emit("applied", e);
         return "applied";
-      case "mandate_ended":
-        this.onStatus(e, "Cancelled", "merchant");
+      }
+      case "mandate_ended": {
+        // The end event names the merchant in its second topic; the mandate
+        // row is the fallback when the projection has not seen it yet.
+        const merchant = this.onStatus(e, "Cancelled", "merchant") ?? str(e.topics[1]);
+        this.recordChurn(e, "ended", merchant);
         this.events.emit("applied", e);
         return "applied";
-      case "mandate_completed":
-        this.onStatus(e, "Completed");
+      }
+      case "mandate_completed": {
+        const merchant = this.onStatus(e, "Completed");
+        this.recordChurn(e, "completed", merchant);
         return "applied";
+      }
       case "pause_changed":
         this.onPauseChanged(e);
         return "applied";
@@ -516,8 +515,17 @@ export class Indexer {
       );
   }
 
-  /** `endedBy` records which side cancelled; completion leaves it null. */
-  private onStatus(e: DecodedEvent, status: string, endedBy: string | null = null): void {
+  /**
+   * `endedBy` records which side cancelled; completion leaves it null.
+   *
+   * Returns the mandate's merchant, which the churn log needs and which only
+   * the projection knows for the events that do not name it themselves.
+   */
+  private onStatus(
+    e: DecodedEvent,
+    status: string,
+    endedBy: string | null = null,
+  ): string | undefined {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
     const row = this.db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(mid) as
@@ -527,6 +535,47 @@ export class Indexer {
     this.db
       .prepare("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?")
       .run(status, endedBy, mid);
+    return row?.merchant;
+  }
+
+  /**
+   * Record a mandate lifecycle event in the churn log.
+   *
+   * The row is keyed on (mandate_id, slot) and written with INSERT OR IGNORE,
+   * so replaying a ledger range leaves the log unchanged. `at` is the
+   * ledger's close time, so an event lands in the same bucket however many
+   * times it is applied.
+   *
+   * `slot` is 'start' or 'departure': a mandate has one start and at most one
+   * departure, so a mandate that is both started and cancelled contributes to
+   * both counts but can never be counted as leaving twice.
+   */
+  private recordChurn(
+    e: DecodedEvent,
+    kind: "started" | "cancelled" | "ended" | "completed",
+    merchant: string | undefined,
+  ): void {
+    // Without a merchant there is nobody to attribute the event to, and
+    // without a close time there is no bucket to file it under. Either way
+    // the projection itself is already written, so the event is skipped
+    // rather than guessed at.
+    if (!merchant) return;
+    const at = e.closeTime;
+    if (at === undefined || at === null) return;
+    const [mandateId] = e.topics;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO mandate_events (mandate_id, slot, merchant, kind, at, ledger)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        num(mandateId),
+        kind === "started" ? "start" : "departure",
+        merchant,
+        kind,
+        at,
+        e.ledger,
+      );
   }
 
   private onPauseChanged(e: DecodedEvent): void {

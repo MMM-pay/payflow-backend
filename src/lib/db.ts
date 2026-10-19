@@ -9,6 +9,12 @@ import { DatabaseSync } from "node:sqlite";
  *
  * `charges` is an append-only log keyed on (tx_hash, mandate_id) so a replayed
  * ledger cannot double-count revenue.
+ *
+ * `mandate_events` is the churn log: one row per mandate per lifecycle event
+ * (started, cancelled, ended, completed), stamped with the ledger close time
+ * of the event. It is keyed on (mandate_id, slot) and written with
+ * INSERT OR IGNORE, so replaying a ledger range cannot record the same
+ * event — or the same departure — twice.
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cursor (
@@ -90,6 +96,27 @@ CREATE TABLE IF NOT EXISTS fee_history (
   ledger       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS fee_history_ledger ON fee_history(ledger DESC);
+
+-- One row per mandate per lifecycle event, used by the merchant churn
+-- endpoint. The "at" column is the ledger close time of the event in unix
+-- seconds, so buckets follow the chain's clock rather than the indexer's
+-- wall clock.
+--
+-- The "slot" column is 'start' or 'departure' and is part of the primary key,
+-- so a mandate has exactly one start and at most one departure however many
+-- times the event is applied. That is what makes the churn report's net
+-- figure correct by construction: a mandate can never be counted as leaving
+-- twice.
+CREATE TABLE IF NOT EXISTS mandate_events (
+  mandate_id INTEGER NOT NULL,
+  slot       TEXT    NOT NULL,
+  merchant   TEXT    NOT NULL,
+  kind       TEXT    NOT NULL,
+  at         INTEGER NOT NULL,
+  ledger     INTEGER NOT NULL,
+  PRIMARY KEY (mandate_id, slot)
+);
+CREATE INDEX IF NOT EXISTS mandate_events_merchant ON mandate_events(merchant, kind, at);
 `;
 
 /**

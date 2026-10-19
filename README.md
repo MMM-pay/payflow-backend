@@ -192,6 +192,7 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/due` | Mandates chargeable right now |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/merchants/:address/subscribers?limit=` | The merchant's distinct subscribers, grouped by lifetime value |
+| `GET` | `/api/merchants/:address/churn?bucket=month&limit=` | Per-bucket churn: mandates started, cancelled, ended and completed, and the net |
 | `GET` | `/api/merchants/:address/forecast?days=30` | Projected charges over the next N days, net of fees |
 | `GET` | `/api/subscribers/:address/summary` | Mandates and total paid |
 | `GET` | `/api/subscribers/:address/upcoming?days=30` | Charges due over the next N days, with projected times |
@@ -201,6 +202,44 @@ When extra networks are configured (see below), every route also answers under
 mandate ids (`?ids=1,2,3`). Ids that do not exist are omitted; more than 100
 ids returns `400` with `error.code = "too_many_ids"` and a non-numeric id
 returns `400` with `error.code = "invalid_ids"`.
+
+### Merchant churn
+
+`GET /api/merchants/:address/churn` reports how a merchant's mandate base
+moved over time: how many mandates started, how many departed (cancelled by
+the subscriber, ended by the merchant, or completed their full charge count),
+and the net of the two.
+
+```json
+{
+  "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+  "bucket": "month",
+  "buckets": [
+    {
+      "bucket": "2025-01",
+      "started": 3,
+      "cancelled": 1,
+      "ended": 0,
+      "completed": 2,
+      "net": 0
+    }
+  ],
+  "totals": { "started": 3, "cancelled": 1, "ended": 0, "completed": 2, "net": 0 }
+}
+```
+
+- `bucket` picks the period: `day`, `week` or `month` (the default). Buckets
+  are calendar periods in UTC — a month bucket is labelled `2025-01`, a day
+  bucket `2025-01-15`, and a week bucket carries the Monday's date.
+- `limit` caps how many of the most recent buckets are reported (12 by
+  default, 120 at most). Every bucket in the range is present, so a chart has
+  no gaps in it.
+- `net` is `started` minus the departures, i.e. the growth of the mandate
+  base in that bucket.
+
+The counts are bucketed by the **ledger close time** of each event, so they
+describe the chain's own history rather than when the indexer happened to
+index it. Replaying a ledger range therefore leaves the report unchanged.
 
 ### Error responses
 

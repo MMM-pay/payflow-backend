@@ -1,11 +1,20 @@
 import type { DatabaseSync } from "node:sqlite";
 import { readCursor } from "./db.ts";
+import {
+  BUCKET_SQL,
+  bucketLabel,
+  bucketStart,
+  nextBucketStart,
+} from "./churn.ts";
 import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "../routes/helpers.ts";
 import type {
   ChargeRow,
+  ChurnBucket,
+  ChurnBucketSize,
   DueMandateRow,
   ProtocolResponse,
   MandateRow,
+  MerchantChurnResponse,
   MerchantSummary,
   PlanRow,
   StatsResponse,
@@ -406,6 +415,119 @@ export function getSubscriberSummary(
     mandates,
     totalPaid: String(paid.total),
   };
+}
+
+/** The lifecycle events a churn report counts, in report order. */
+export const CHURN_KINDS = ["started", "cancelled", "ended", "completed"] as const;
+
+export type ChurnKind = (typeof CHURN_KINDS)[number];
+
+/**
+ * A merchant's churn report: how many mandates started and departed in each
+ * time bucket.
+ *
+ * The counts come from `mandate_events`, the append-only log the indexer
+ * writes one row per mandate per lifecycle event into. Each row is stamped
+ * with the ledger close time of its event, so a bucket is a property of the
+ * chain, not of when the indexer happened to run: replaying a ledger range
+ * leaves the report unchanged.
+ *
+ * One indexed scan groups the events by bucket and kind, so the report costs
+ * the same whether the merchant has ten mandates or ten thousand.
+ */
+export function getMerchantChurn(
+  db: DatabaseSync,
+  merchant: string,
+  bucket: ChurnBucketSize,
+  limit: number,
+): MerchantChurnResponse {
+  const rows = db
+    .prepare(
+      // The bucket expression is a vetted static fragment chosen by the
+      // bucket size, never request data; the address is a bound parameter,
+      // so no request data reaches the SQL text.
+      // eslint-disable-next-line no-restricted-syntax
+      `SELECT kind, ${BUCKET_SQL[bucket]} AS bucket, COUNT(*) AS n
+         FROM mandate_events
+        WHERE merchant = ?
+        GROUP BY kind, bucket`,
+    )
+    .all(merchant) as unknown as Array<{
+    kind: ChurnKind;
+    bucket: number;
+    n: number;
+  }>;
+
+  const counts = new Map<number, Record<ChurnKind, number>>();
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    let entry = counts.get(row.bucket);
+    if (!entry) {
+      // Every kind starts at zero, so a bucket reports a kind it has no
+      // events for as an explicit zero rather than as a missing field.
+      entry = Object.fromEntries(CHURN_KINDS.map((k) => [k, 0])) as Record<ChurnKind, number>;
+      counts.set(row.bucket, entry);
+    }
+    entry[row.kind] = row.n;
+    if (row.bucket < min) min = row.bucket;
+    if (row.bucket > max) max = row.bucket;
+  }
+
+  // Report the most recent buckets, oldest first within the window. The
+  // limit bounds the work the caller can ask for; the query itself is a
+  // single indexed scan either way.
+  const buckets: ChurnBucket[] = [];
+  if (counts.size > 0) {
+    const starts = bucketStarts(bucket, min, max);
+    const window = starts.slice(Math.max(0, starts.length - limit));
+    for (const start of window) {
+      const entry = counts.get(Math.floor(start.getTime() / 1000));
+      const started = entry?.started ?? 0;
+      const cancelled = entry?.cancelled ?? 0;
+      const ended = entry?.ended ?? 0;
+      const completed = entry?.completed ?? 0;
+      buckets.push({
+        bucket: bucketLabel(bucket, start),
+        started,
+        cancelled,
+        ended,
+        completed,
+        net: started - cancelled - ended - completed,
+      });
+    }
+  }
+
+  const totals = buckets.reduce(
+    (acc, b) => ({
+      started: acc.started + b.started,
+      cancelled: acc.cancelled + b.cancelled,
+      ended: acc.ended + b.ended,
+      completed: acc.completed + b.completed,
+      net: acc.net + b.net,
+    }),
+    { started: 0, cancelled: 0, ended: 0, completed: 0, net: 0 },
+  );
+
+  return { merchant, bucket, buckets, totals };
+}
+
+/** Every bucket start between two instants, oldest first. */
+function bucketStarts(
+  bucket: ChurnBucketSize,
+  from: number,
+  to: number,
+): Date[] {
+  const starts: Date[] = [];
+  let cursor = bucketStart(bucket, from);
+  const end = bucketStart(bucket, to);
+  // The guard bounds a pathological range; the caller already limits the
+  // number of buckets it keeps.
+  for (let i = 0; i < 10_000 && cursor.getTime() <= end.getTime(); i += 1) {
+    starts.push(cursor);
+    cursor = nextBucketStart(bucket, cursor);
+  }
+  return starts;
 }
 
 /** A merchant's distinct subscriber, grouped across that subscriber's mandates with the merchant. */

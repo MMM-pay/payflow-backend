@@ -246,6 +246,74 @@ describe("indexer projections", () => {
     assert.equal(row.ended_by, "subscriber");
   });
 
+  test("a lifecycle event is logged with the ledger close time", () => {
+    const at = Math.floor(Date.UTC(2025, 0, 15, 12) / 1000);
+    ix.apply({ ...subscribed, closeTime: at });
+    ix.apply({ ...event("cancelled", [1n, SUBSCRIBER], { charges_made: 0 }), closeTime: at + 60 });
+
+    const rows = d
+      .prepare("SELECT mandate_id, slot, merchant, kind, at FROM mandate_events ORDER BY at")
+      .all() as Array<Record<string, unknown>>;
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0]!.mandate_id, 1);
+    assert.equal(rows[0]!.slot, "start");
+    assert.equal(rows[0]!.merchant, MERCHANT);
+    assert.equal(rows[0]!.kind, "started");
+    assert.equal(rows[0]!.at, at);
+    assert.equal(rows[1]!.mandate_id, 1);
+    assert.equal(rows[1]!.slot, "departure");
+    assert.equal(rows[1]!.merchant, MERCHANT);
+    assert.equal(rows[1]!.kind, "cancelled");
+    assert.equal(rows[1]!.at, at + 60);
+  });
+
+  test("replaying an event does not log it twice", () => {
+    const at = Math.floor(Date.UTC(2025, 0, 15, 12) / 1000);
+    const sub = { ...subscribed, closeTime: at };
+    const cancel = { ...event("cancelled", [1n, SUBSCRIBER], { charges_made: 0 }), closeTime: at + 60 };
+    ix.apply(sub);
+    ix.apply(cancel);
+    ix.apply(sub);
+    ix.apply(cancel);
+    ix.apply(cancel);
+
+    const count = (
+      d.prepare("SELECT COUNT(*) AS n FROM mandate_events").get() as { n: number }
+    ).n;
+    assert.equal(count, 2, "one start and one departure, however often they arrive");
+  });
+
+  test("a mandate is counted as leaving at most once", () => {
+    const at = Math.floor(Date.UTC(2025, 0, 15, 12) / 1000);
+    ix.apply({ ...subscribed, closeTime: at });
+    ix.apply({ ...event("cancelled", [1n, SUBSCRIBER], { charges_made: 0 }), closeTime: at + 60 });
+    // A second, different departure for the same mandate: the log keeps the
+    // first, so a mandate can never be counted as leaving twice.
+    ix.apply({
+      ...event("mandate_ended", [1n, MERCHANT], { subscriber: SUBSCRIBER, charges_made: 1 }),
+      closeTime: at + 120,
+    });
+
+    const rows = d
+      .prepare("SELECT kind FROM mandate_events WHERE slot = 'departure'")
+      .all() as Array<{ kind: string }>;
+    assert.deepEqual(rows.map((r) => r.kind), ["cancelled"]);
+  });
+
+  test("an event with no ledger close time is not logged", () => {
+    // No close time means no bucket to file the event under, so it is
+    // skipped rather than filed under a guessed time.
+    ix.apply(subscribed);
+    ix.apply(event("cancelled", [1n, SUBSCRIBER], { charges_made: 0 }));
+    const count = (
+      d.prepare("SELECT COUNT(*) AS n FROM mandate_events").get() as { n: number }
+    ).n;
+    assert.equal(count, 0);
+    // The projection itself is still written.
+    const row = d.prepare("SELECT status FROM mandates WHERE id = 1").get() as { status: string };
+    assert.equal(row.status, "Cancelled");
+  });
+
   test("pause toggles only from active states", () => {
     ix.apply(subscribed);
     ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: true }));

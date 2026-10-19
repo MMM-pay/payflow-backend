@@ -67,7 +67,8 @@ const ev = (
   topics: unknown[],
   data: Record<string, unknown>,
   tx = "tx",
-): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+  closeTime: number | null = null,
+): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime });
 
 const FIXTURES = new URL("./fixtures/", import.meta.url);
 const UPDATE = process.env.UPDATE_GOLDEN === "1";
@@ -97,6 +98,7 @@ const ROUTES: RouteSpec[] = [
   { file: "merchant_summary", method: "GET", path: `/api/merchants/${MERCHANT}/summary`, status: 200 },
   { file: "merchant_forecast", method: "GET", path: `/api/merchants/${MERCHANT}/forecast`, status: 200 },
   { file: "merchant_subscribers", method: "GET", path: `/api/merchants/${MERCHANT}/subscribers`, status: 200 },
+  { file: "merchant_churn", method: "GET", path: `/api/merchants/${MERCHANT}/churn?bucket=month`, status: 200 },
   { file: "subscriber_summary", method: "GET", path: `/api/subscribers/${SUBSCRIBER}/summary`, status: 200 },
   { file: "subscriber_upcoming", method: "GET", path: `/api/subscribers/${SUBSCRIBER}/upcoming`, status: 200 },
   { file: "stats", method: "GET", path: "/api/stats", status: 200 },
@@ -121,10 +123,12 @@ before(async () => {
   ix.apply(ev("plan_created", [MERCHANT, 1n], {
     token: "C", amount: 10_000_000n, period: 2_592_000n,
   }));
+  // The subscription carries a ledger close time, so the churn report has a
+  // bucket to file it under. The instant is fixed, so the snapshot is stable.
   ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n,
     next_charge: BigInt(FIXED_NOW_S - 100),
-  }));
+  }, "tx", FIXED_NOW_S));
   ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n,
     next_charge: BigInt(FIXED_NOW_S + 2_592_000),

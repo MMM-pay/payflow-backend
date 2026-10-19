@@ -234,6 +234,38 @@ export interface MerchantSubscribersResponse {
   subscribers: MerchantSubscriber[];
 }
 
+/** The time buckets a churn report can be grouped by. */
+export type ChurnBucketSize = "day" | "week" | "month";
+
+/** One bucket of a merchant's churn report. */
+export interface ChurnBucket {
+  /**
+   * The bucket's label: `2025-01` for a month, `2025-01-15` for a day, and
+   * the Monday's date (`2025-01-13`) for a week. All in UTC.
+   */
+  bucket: string;
+  /** Mandates that started in the bucket. */
+  started: number;
+  /** Mandates the subscriber cancelled in the bucket. */
+  cancelled: number;
+  /** Mandates the merchant ended in the bucket. */
+  ended: number;
+  /** Mandates that completed their full charge count in the bucket. */
+  completed: number;
+  /** `started` minus the departures: the net growth of the mandate base. */
+  net: number;
+}
+
+export interface MerchantChurnResponse {
+  merchant: string;
+  /** The bucket size the report is grouped by. */
+  bucket: ChurnBucketSize;
+  /** The buckets, oldest first. */
+  buckets: ChurnBucket[];
+  /** The same counts summed over every bucket in the report. */
+  totals: Omit<ChurnBucket, "bucket">;
+}
+
 export interface UpcomingCharge {
   mandateId: number;
   merchant: string;

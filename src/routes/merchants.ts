@@ -4,13 +4,16 @@ import {
   getMerchantSummary,
   listMerchantForecastMandates,
   listMerchantSubscribers,
+  getMerchantChurn,
 } from "../lib/queries.ts";
+import { churnBucketSize } from "../lib/churn.ts";
 import type {
   ForecastResponse,
+  MerchantChurnResponse,
   MerchantSubscribersResponse,
   MerchantSummary,
 } from "./types.ts";
-import { limitOf } from "./helpers.ts";
+import { limitOf, MAX_CHURN_BUCKETS } from "./helpers.ts";
 
 /**
  * Bounded LRU in-memory cache for merchant summaries.
@@ -68,6 +71,8 @@ export const defaultMerchantSummaryCache = new MerchantSummaryCache();
 const DAY_S = 86_400;
 /** Longest forecast horizon, to keep the arithmetic bounded. */
 const MAX_FORECAST_DAYS = 365;
+/** Buckets reported by the churn endpoint when the caller does not say. */
+const DEFAULT_CHURN_BUCKETS = 12;
 
 function daysOf(raw: unknown, fallback = 30): number {
   const n = Number(raw);
@@ -126,6 +131,27 @@ export function merchantsRouter(
         (sub) => ({ ...sub, totalCollected: sub.totalCollected.toString() }),
       ),
     };
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/churn?bucket=month`: how many mandates started
+   * and departed in each time bucket.
+   *
+   * `bucket` picks the period (`day`, `week` or `month`; `month` by default)
+   * and `limit` how many of the most recent buckets to report. The counts are
+   * bucketed by the ledger close time of each event, so they are the chain's
+   * own history rather than the indexer's view of it.
+   */
+  r.get("/merchants/:address/churn", (req, res) => {
+    const address = String(req.params.address);
+    const bucket = churnBucketSize(req.query.bucket);
+    const body: MerchantChurnResponse = getMerchantChurn(
+      db,
+      address,
+      bucket,
+      Math.min(limitOf(req.query.limit, DEFAULT_CHURN_BUCKETS), MAX_CHURN_BUCKETS),
+    );
     res.json(body);
   });
 
