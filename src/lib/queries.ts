@@ -341,6 +341,60 @@ export function getSubscriberSummary(
   };
 }
 
+/** A merchant's distinct subscriber, grouped across that subscriber's mandates with the merchant. */
+export interface MerchantSubscriberAggregate {
+  subscriber: string;
+  mandateCount: number;
+  chargeCount: number;
+  totalCollected: bigint;
+}
+
+/**
+ * A merchant's distinct subscribers, ordered by lifetime value descending.
+ *
+ * Starts from mandates so a subscriber with mandates but no settled charges
+ * still appears with a lifetime value of `0`. Every value is a bound
+ * parameter and the sum reads as bigint, so no amount round-trips through a
+ * JavaScript number.
+ */
+export function listMerchantSubscribers(
+  db: DatabaseSync,
+  merchant: string,
+  limit: number,
+): MerchantSubscriberAggregate[] {
+  const stmt = db
+    // The address is a bound parameter, so no request data reaches the SQL text.
+    .prepare(
+      `SELECT m.subscriber AS subscriber,
+              COUNT(DISTINCT m.id) AS mandate_count,
+              COUNT(c.tx_hash) AS charge_count,
+              COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total_collected
+         FROM mandates m
+         LEFT JOIN charges c ON c.mandate_id = m.id AND c.merchant = m.merchant
+        WHERE m.merchant = ?
+        GROUP BY m.subscriber
+        ORDER BY total_collected DESC, m.subscriber
+        LIMIT ?`,
+    );
+  // Read the sum as bigint so lifetime value never round-trips through a
+  // JavaScript number at stroop scale.
+  stmt.setReadBigInts(true);
+  const rows = stmt.all(merchant, limit) as unknown as {
+    subscriber: string;
+    mandate_count: number;
+    charge_count: number;
+    total_collected: bigint;
+  }[];
+  return rows.map((row) => ({
+    // Counts came through as bigint because the statement reads integers as
+    // bigint; coerce back to numbers — they are small counts, never amounts.
+    subscriber: row.subscriber,
+    mandateCount: Number(row.mandate_count),
+    chargeCount: Number(row.charge_count),
+    totalCollected: row.total_collected,
+  }));
+}
+
 /** Active positive-period mandates for a subscriber's upcoming schedule. */
 export function listSubscriberUpcomingMandates(
   db: DatabaseSync,

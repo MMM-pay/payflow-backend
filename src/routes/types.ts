@@ -199,6 +199,24 @@ export interface SubscriberSummary {
   totalPaid: string;
 }
 
+/** One subscriber of a merchant, grouped across all of that subscriber's mandates with the merchant. */
+export interface MerchantSubscriber {
+  /** Subscriber address. */
+  subscriber: string;
+  /** Distinct mandates this subscriber holds with this merchant. */
+  mandateCount: number;
+  /** Charges settled from this subscriber to this merchant. */
+  chargeCount: number;
+  /** Lifetime value: gross amount collected from this subscriber, token's smallest unit. */
+  totalCollected: string;
+}
+
+export interface MerchantSubscribersResponse {
+  merchant: string;
+  /** Subscribers with at least one mandate, ordered by lifetime value descending. */
+  subscribers: MerchantSubscriber[];
+}
+
 export interface UpcomingCharge {
   mandateId: number;
   merchant: string;

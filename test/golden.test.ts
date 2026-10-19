@@ -95,6 +95,7 @@ const ROUTES: RouteSpec[] = [
   { file: "due", method: "GET", path: "/api/due", status: 200 },
   { file: "merchant_summary", method: "GET", path: `/api/merchants/${MERCHANT}/summary`, status: 200 },
   { file: "merchant_forecast", method: "GET", path: `/api/merchants/${MERCHANT}/forecast`, status: 200 },
+  { file: "merchant_subscribers", method: "GET", path: `/api/merchants/${MERCHANT}/subscribers`, status: 200 },
   { file: "subscriber_summary", method: "GET", path: `/api/subscribers/${SUBSCRIBER}/summary`, status: 200 },
   { file: "subscriber_upcoming", method: "GET", path: `/api/subscribers/${SUBSCRIBER}/upcoming`, status: 200 },
   { file: "stats", method: "GET", path: "/api/stats", status: 200 },

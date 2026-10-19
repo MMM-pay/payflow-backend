@@ -3,8 +3,14 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   getMerchantSummary,
   listMerchantForecastMandates,
+  listMerchantSubscribers,
 } from "../lib/queries.ts";
-import type { ForecastResponse, MerchantSummary } from "./types.ts";
+import type {
+  ForecastResponse,
+  MerchantSubscribersResponse,
+  MerchantSummary,
+} from "./types.ts";
+import { limitOf } from "./helpers.ts";
 
 /**
  * Bounded LRU in-memory cache for merchant summaries.
@@ -108,6 +114,18 @@ export function merchantsRouter(
 
     const body = getMerchantSummary(db, address, defaultToken);
     cache.set(cacheKey, body);
+    res.json(body);
+  });
+
+  /** The merchant's distinct subscribers, grouped by lifetime value. */
+  r.get("/merchants/:address/subscribers", (req, res) => {
+    const address = String(req.params.address);
+    const body: MerchantSubscribersResponse = {
+      merchant: address,
+      subscribers: listMerchantSubscribers(db, address, limitOf(req.query.limit)).map(
+        (sub) => ({ ...sub, totalCollected: sub.totalCollected.toString() }),
+      ),
+    };
     res.json(body);
   });
 

@@ -126,6 +126,20 @@ describe("typed api client", () => {
     const subscriber = await client.subscriberSummary(SUBSCRIBER);
     assert.equal(subscriber.totalPaid, "10000000");
 
+    const merchantsSubs = await client.merchantSubscribers(MERCHANT);
+    assert.equal(merchantsSubs.merchant, MERCHANT);
+    assert.deepEqual(merchantsSubs.subscribers, [
+      {
+        subscriber: SUBSCRIBER,
+        mandateCount: 1,
+        chargeCount: 1,
+        totalCollected: "9900000",
+      },
+    ]);
+
+    const none = await client.merchantSubscribers("GNOBODY");
+    assert.deepEqual(none.subscribers, []);
+
     const stats = await client.stats();
     assert.equal(stats.plans, 1);
     assert.equal(stats.mandates, 1);

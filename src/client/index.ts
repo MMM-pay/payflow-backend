@@ -20,6 +20,7 @@ import type {
   KeeperHistoryResponse,
   MandatePage,
   MandateRow,
+  MerchantSubscribersResponse,
   MerchantSummary,
   PlanPage,
   PlanRow,
@@ -45,6 +46,8 @@ export type {
   KeeperPassSummary,
   MandatePage,
   MandateRow,
+  MerchantSubscriber,
+  MerchantSubscribersResponse,
   MerchantSummary,
   PlanPage,
   PlanRow,
@@ -170,6 +173,13 @@ export class PayflowClient {
     return this.get<ForecastResponse>(
       `/api/merchants/${encodeURIComponent(address)}/forecast`,
       days !== undefined ? { days } : undefined,
+    );
+  }
+
+  merchantSubscribers(address: string, query: PageQuery = {}): Promise<MerchantSubscribersResponse> {
+    return this.get<MerchantSubscribersResponse>(
+      `/api/merchants/${encodeURIComponent(address)}/subscribers`,
+      query,
     );
   }
 

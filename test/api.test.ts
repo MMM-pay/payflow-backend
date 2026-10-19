@@ -413,6 +413,37 @@ describe("http api", () => {
     assert.equal(none.body.forecast, "0");
   });
 
+  test("merchant subscribers groups distinct subscribers with lifetime value", async () => {
+    const { body } = await get(`/api/merchants/${MERCHANT}/subscribers`);
+    assert.equal(body.merchant, MERCHANT);
+    assert.deepEqual(body.subscribers, [
+      {
+        subscriber: SUBSCRIBER,
+        mandateCount: 1,
+        chargeCount: 1,
+        totalCollected: "9900000",
+      },
+    ]);
+  });
+
+  test("subscriber with mandates but no settled charges still appears at zero", async () => {
+    const { body } = await get(`/api/merchants/${YEARLY_MERCHANT}/subscribers`);
+    assert.deepEqual(body.subscribers, [
+      { subscriber: SUBSCRIBER, mandateCount: 1, chargeCount: 0, totalCollected: "0" },
+    ]);
+  });
+
+  test("unknown merchant returns an empty subscriber list", async () => {
+    const { body } = await get("/api/merchants/GNOBODY/subscribers");
+    assert.deepEqual(body.subscribers, []);
+  });
+
+  test("limit caps the subscriber page", async () => {
+    const { body } = await get(`/api/merchants/${MERCHANT}/subscribers?limit=1`);
+    assert.equal(body.subscribers.length, 1);
+    assert.equal(body.subscribers[0]?.subscriber, SUBSCRIBER);
+  });
+
   test("subscriber summary includes fee in total paid", async () => {
     const { body } = await get(`/api/subscribers/${SUBSCRIBER}/summary`);
     assert.equal(body.totalPaid, "10000000");
