@@ -14,6 +14,13 @@ All notable changes to payflow-backend. The format follows
   generated client knows not to read them as numbers. A test compares the
   document with the routes Express registers, so a route that is added without
   being documented fails the build.
+- **The keeper skips mandates the vault cannot cover (#8).** Before it settles
+  anything, the keeper reads `vault.balance(subscriber, token)` from the
+  contract — a read-only simulation, no transaction and no fee — and skips a
+  mandate whose amount the vault does not hold, logging the shortfall once per
+  pass. A balance that cannot be read is not treated as a shortfall, so an RPC
+  hiccup never stops a settlement. `GET /api/due` gained a `funded` flag per
+  mandate, computed from the last vault balance the indexer saw.
 - **Merchant revenue over time (#12).** `GET /api/merchants/:address/revenue`
   reports what a merchant took in, what the protocol took and what was left,
   in `day`, `week` or `month` buckets: `gross`, `fee` and `net` per bucket,

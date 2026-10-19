@@ -6,10 +6,13 @@ import {
   TransactionBuilder,
   nativeToScVal,
   rpc,
+  scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
 import type { Config } from "./config.ts";
 import { logger } from "./lib/logger.ts";
+import { simulationSource } from "./lib/simulate.ts";
+import { planTokensByIds } from "./lib/queries.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
 
 export interface DueMandate {
@@ -19,13 +22,30 @@ export interface DueMandate {
   next_charge: number;
   /** Decimal string in the token's smallest unit; never a JS number. */
   amount: string;
+  /** The plan the mandate was opened against; its token names the vault balance. */
+  plan_id: number;
 }
 
 /** The RPC calls the keeper makes. Narrow so tests can supply a fake. */
 export type KeeperRpc = Pick<
   rpc.Server,
-  "getAccount" | "getFeeStats" | "prepareTransaction" | "sendTransaction" | "getTransaction"
+  | "getAccount"
+  | "getFeeStats"
+  | "prepareTransaction"
+  | "sendTransaction"
+  | "getTransaction"
+  /** Read-only contract calls; the vault balance check uses them. */
+  | "simulateTransaction"
 >;
+
+/**
+ * The part of the RPC the vault-balance read needs.
+ *
+ * A fake RPC in a test may not implement it, and the read is an optimisation
+ * rather than a requirement: without it the keeper settles exactly as it did
+ * before.
+ */
+type VaultBalanceRpc = Partial<Pick<KeeperRpc, "simulateTransaction">>;
 
 /** First retry delay after a failed charge; doubles per failure. */
 const BACKOFF_BASE_S = 60;
@@ -61,6 +81,21 @@ export interface SettleResult {
   status: "settled" | "failed";
   txHash?: string;
   error?: string;
+}
+
+/**
+ * A mandate the keeper did not even try to settle: the subscriber's vault
+ * does not hold enough to cover the charge. Every amount is a decimal string
+ * in the token's smallest unit.
+ */
+export interface SkippedMandate {
+  mandateId: number;
+  /** The amount the charge needs. */
+  required: string;
+  /** The balance the vault holds. */
+  balance: string;
+  /** What is missing. */
+  shortfall: string;
 }
 
 /**
@@ -254,7 +289,7 @@ export class Keeper {
     if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
     return this.db
       .prepare(
-        `SELECT id, subscriber, merchant, next_charge, amount
+        `SELECT id, subscriber, merchant, next_charge, amount, plan_id
            FROM mandates
           WHERE status = 'Active'
             AND next_charge <= ?
@@ -277,7 +312,7 @@ export class Keeper {
   private queryDueLargest(now: number, limit: number): DueMandate[] {
     const rows = this.db
       .prepare(
-        `SELECT id, subscriber, merchant, next_charge, amount
+        `SELECT id, subscriber, merchant, next_charge, amount, plan_id
            FROM mandates
           WHERE status = 'Active'
             AND next_charge <= ?
@@ -296,8 +331,12 @@ export class Keeper {
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
     const due = this.findDue(now);
-    const fee = due.length > 0 ? await this.inclusionFee() : undefined;
-    const channels = due.length > 0 ? await this.distributableChannels() : [];
+    // Mandates the vault cannot cover are dropped before any transaction is
+    // built: the charge would fail in simulation anyway, and skipping it
+    // saves the RPC call and the fee.
+    const { chargeable, skipped } = await this.withoutShortfalls(due);
+    const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
+    const channels = chargeable.length > 0 ? await this.distributableChannels() : [];
     // One worker per channel pulls from the shared queue: within a channel
     // mandates settle strictly one after the other (one account, one sequence
     // stream), across channels they run in parallel. The cursor and the
@@ -311,7 +350,7 @@ export class Keeper {
         for (;;) {
           const slot = cursor;
           cursor += 1;
-          const mandate = due[slot];
+          const mandate = chargeable[slot];
           if (!mandate) return;
           const result = await this.settle(mandate.id, fee, channel);
           this.record(result, now);
@@ -322,8 +361,135 @@ export class Keeper {
     ordered.sort((a, b) => a.slot - b.slot);
     const results = ordered.map((entry) => entry.result);
     this.announceRetirement(results);
-    this.recordPass(now, results);
+    this.recordPass(now, results, skipped);
     return results;
+  }
+
+  /**
+   * Drop the mandates whose vault cannot cover the charge.
+   *
+   * `charge` pulls the whole amount out of the subscriber's vault, so a vault
+   * holding less than the amount cannot pay: the simulation fails and the
+   * transaction is wasted. Reading `vault.balance` first skips those
+   * mandates, and tells `/api/due` which of the due mandates are actually
+   * chargeable.
+   *
+   * A balance that cannot be read — the RPC is down, or the deployment has no
+   * simulation support — is not a shortfall. The mandate is kept and the
+   * charge decides, exactly as before, so a transient failure never stops a
+   * settlement.
+   *
+   * Each skipped mandate is logged once per pass, with the shortfall, so an
+   * operator can see what is waiting for a top-up.
+   */
+  private async withoutShortfalls(due: DueMandate[]): Promise<{
+    chargeable: DueMandate[];
+    skipped: SkippedMandate[];
+  }> {
+    const chargeable: DueMandate[] = [];
+    const skipped: SkippedMandate[] = [];
+    if (due.length === 0) return { chargeable, skipped };
+
+    // A mandate carries no token of its own; it inherits its plan's, and the
+    // vault balance is per (subscriber, token).
+    const tokens = planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
+    // One read per subscriber and token per pass: a subscriber with several
+    // mandates on the same plan is one balance, not one read each.
+    const balances = new Map<string, bigint | null>();
+
+    for (const mandate of due) {
+      const token = tokens.get(mandate.plan_id);
+      if (!token) {
+        chargeable.push(mandate);
+        continue;
+      }
+      const key = `${mandate.subscriber}|${token}`;
+      let balance = balances.get(key);
+      if (balance === undefined) {
+        balance = await this.vaultBalance(mandate.subscriber, token);
+        balances.set(key, balance);
+      }
+      if (balance === null) {
+        chargeable.push(mandate);
+        continue;
+      }
+      const required = BigInt(mandate.amount);
+      if (balance >= required) {
+        chargeable.push(mandate);
+        continue;
+      }
+      skipped.push({
+        mandateId: mandate.id,
+        required: required.toString(),
+        balance: balance.toString(),
+        shortfall: (required - balance).toString(),
+      });
+    }
+
+    for (const skip of skipped) {
+      logger.warn(
+        {
+          mandateId: skip.mandateId,
+          required: skip.required,
+          balance: skip.balance,
+          shortfall: skip.shortfall,
+        },
+        "keeper skipped a mandate the vault cannot cover",
+      );
+    }
+    return { chargeable, skipped };
+  }
+
+  /**
+   * The subscriber's vault balance for one token, or null when it cannot be
+   * read.
+   *
+   * The balance is read with a read-only simulation of the vault contract's
+   * `balance(user, token)` view function — no transaction, no fee, no state
+   * changed. A failure is logged and reported as "unknown", never thrown: the
+   * caller's loop must not crash over it.
+   */
+  private async vaultBalance(subscriber: string, token: string): Promise<bigint | null> {
+    const simulator = this.server as VaultBalanceRpc;
+    if (typeof simulator.simulateTransaction !== "function") return null;
+    const vaultId = this.config.VAULT_ID;
+    if (!vaultId) return null;
+    try {
+      const tx = new TransactionBuilder(
+        simulationSource(`vault-balance:${subscriber}:${token}`),
+        { fee: "100", networkPassphrase: this.config.NETWORK_PASSPHRASE },
+      )
+        .addOperation(
+          new Contract(vaultId).call(
+            "balance",
+            nativeToScVal(subscriber, { type: "address" }),
+            nativeToScVal(token, { type: "address" }),
+          ),
+        )
+        .setTimeout(0)
+        .build();
+      const res = await simulator.simulateTransaction(tx);
+      if ("error" in res && res.error) {
+        logger.warn(
+          { subscriber, token, reason: res.error.slice(0, 200).replace(/\s+/g, " ") },
+          "vault balance unavailable; settling as before",
+        );
+        return null;
+      }
+      // SDK <= 16 reported `results[]`; SDK 17 reports a single `result`.
+      const retval = "result" in res ? res.result?.retval : undefined;
+      if (!retval) return null;
+      const value = scValToNative(retval);
+      if (typeof value === "bigint") return value;
+      if (typeof value === "string" && /^-?\d+$/.test(value)) return BigInt(value);
+      return null;
+    } catch (err) {
+      logger.warn(
+        { subscriber, token, err: err instanceof Error ? err.message : String(err) },
+        "vault balance unavailable; settling as before",
+      );
+      return null;
+    }
   }
 
   /**
@@ -425,7 +591,7 @@ export class Keeper {
     }));
   }
 
-  private recordPass(now: number, results: SettleResult[]): void {
+  private recordPass(now: number, results: SettleResult[], skipped: SkippedMandate[] = []): void {
     this.passes.push({
       time: now,
       attempted: results.length,
@@ -436,6 +602,7 @@ export class Keeper {
           mandateId: result.mandateId,
           error: this.scrubError(result.error ?? "Settlement failed"),
         })),
+      skipped: skipped.map((skip) => ({ ...skip })),
       backoff: this.backoffList(now),
     });
     if (this.passes.length > 20) this.passes.shift();

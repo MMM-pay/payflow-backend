@@ -114,6 +114,15 @@ in the builder, production dependencies only in the final image.
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
   queue would block every other mandate.
+- **A mandate the vault cannot cover is skipped, not charged.** Before it
+  settles anything, the keeper reads `vault.balance(subscriber, token)` from
+  the contract — a read-only simulation, no transaction and no fee. One read
+  per subscriber and token per pass, so a subscriber with several mandates
+  costs one read, not one each. A mandate whose amount the vault cannot cover
+  is skipped, and the skip is logged once per pass with the shortfall. The
+  other mandates of the pass settle as usual, and a balance that cannot be
+  read (RPC down) is not treated as a shortfall: the charge decides, exactly
+  as before.
 - **Events are validated against the contract spec.** Every decoded event is
   checked against `src/lib/event_spec.json` before it is projected. A renamed
   or retyped contract field makes the event fail validation: it is logged with
@@ -254,6 +263,36 @@ curl -s localhost:8080/api/openapi.json | jq '.paths | keys'
 
 A test compares the document with the routes Express registers, so a route
 that is added without being documented fails the build.
+
+### The due list and the vault balance
+
+`GET /api/due` lists the mandates that can be charged right now. Each one
+carries a `funded` flag: whether the last vault balance the indexer saw covers
+the charge.
+
+```json
+{
+  "now": 1750000000,
+  "due": [
+    {
+      "id": 7,
+      "subscriber": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+      "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+      "next_charge": 1749999940,
+      "amount": "10000000",
+      "funded": true
+    }
+  ]
+}
+```
+
+The balance is the one the indexer last saw, so it can be behind the chain: a
+subscriber who has just funded their vault is reported as not funded until the
+deposit is indexed. The keeper does not rely on it — it reads
+`vault.balance(subscriber, token)` from the contract before it settles
+anything, and skips a mandate the vault cannot cover. A skipped mandate is
+logged once per pass with the shortfall, and it does not take the pass's place:
+the other mandates settle as usual.
 
 ### Merchant churn
 

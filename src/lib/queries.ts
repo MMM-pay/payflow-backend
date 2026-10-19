@@ -11,7 +11,7 @@ import type {
   ChargeRow,
   ChurnBucket,
   ChurnBucketSize,
-  DueMandateRow,
+  DueMandateRecord,
   ProtocolResponse,
   MandateRow,
   MerchantChurnResponse,
@@ -279,21 +279,75 @@ export function getProtocolFeeHistory(db: DatabaseSync): ProtocolResponse {
   return { fee_bps: history[0]?.new_fee_bps ?? null, history };
 }
 
-/** List active mandates currently eligible for settlement at `now`. */
+/**
+ * List active mandates currently eligible for settlement at `now`.
+ *
+ * `plan_id` comes along so the caller can find the mandate's token — the
+ * vault balance is per (subscriber, token).
+ */
 export function listDueMandates(
   db: DatabaseSync,
   now: number,
   limit: number,
-): DueMandateRow[] {
+): DueMandateRecord[] {
   return db
     .prepare(
-      `SELECT id, subscriber, merchant, next_charge, amount
+      `SELECT id, subscriber, merchant, next_charge, amount, plan_id
          FROM mandates
         WHERE status = 'Active' AND next_charge <= ?
           AND (max_charges = 0 OR charges_made < max_charges)
         ORDER BY next_charge ASC LIMIT ?`,
     )
-    .all(now, limit) as unknown as DueMandateRow[];
+    .all(now, limit) as unknown as DueMandateRecord[];
+}
+
+/**
+ * The last known vault balance of every listed address, per token.
+ *
+ * `vault_events` records the balance after each deposit, withdrawal and
+ * debit, so the newest event per (address, token) carries the balance the
+ * vault held at that point. An address with no events holds nothing: the
+ * vault starts empty, so its balance is zero.
+ *
+ * The balances stay the strings they are stored as — an amount is never read
+ * as a number, so no precision is lost on the way out.
+ */
+export function listLatestVaultBalances(
+  db: DatabaseSync,
+  addresses: string[],
+): Map<string, Map<string, string>> {
+  const unique = [...new Set(addresses)];
+  const balances = new Map<string, Map<string, string>>();
+  if (unique.length === 0) return balances;
+  const placeholders = unique.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      // The placeholders are one "?" per de-duped address; the addresses
+      // themselves are bound parameters, so no request data reaches the SQL
+      // text.
+      // eslint-disable-next-line no-restricted-syntax
+      `SELECT e.user AS user, e.token AS token, e.balance AS balance
+         FROM vault_events e
+        WHERE e.user IN (${placeholders})
+          AND NOT EXISTS (
+            SELECT 1 FROM vault_events newer
+             WHERE newer.user = e.user
+               AND newer.token = e.token
+               AND (newer.ledger > e.ledger OR
+                    (newer.ledger = e.ledger AND newer.rowid > e.rowid))
+          )`,
+    )
+    .all(...(unique as never[])) as unknown as {
+    user: string;
+    token: string;
+    balance: string;
+  }[];
+  for (const row of rows) {
+    const perToken = balances.get(row.user) ?? new Map<string, string>();
+    perToken.set(row.token, row.balance);
+    balances.set(row.user, perToken);
+  }
+  return balances;
 }
 
 /** Revenue per token: sums from charges and active mandates, joined via plans. */

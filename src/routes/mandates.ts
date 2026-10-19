@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   getMandateById,
   listDueMandates,
+  listLatestVaultBalances,
   listMandateCharges,
   listMandates,
   planTokensByIds,
@@ -20,6 +21,7 @@ import {
 } from "./validate.ts";
 import type {
   ChargePage,
+  DueMandateRow,
   DuePage,
   MandatePage,
 } from "./types.ts";
@@ -135,13 +137,44 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     res.json(body);
   });
 
-  /** Mandates chargeable right now, per the indexed projection. */
+  /**
+   * Mandates chargeable right now, per the indexed projection.
+   *
+   * Each one carries `funded`: whether the last known vault balance covers
+   * the charge. The balance is the one the indexer last saw, so it can be
+   * behind the chain — the keeper reads it from the contract before it
+   * settles — but it is enough to tell a mandate that is merely due from one
+   * that is waiting for a top-up.
+   */
   r.get("/due", (req, res) => {
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
     const now = Math.floor(Date.now() / 1000);
-    const due = listDueMandates(db, now, limitOf(limit.value));
+    const rows = listDueMandates(db, now, limitOf(limit.value));
+    // A mandate carries no token of its own; it inherits its plan's, and the
+    // vault balance is per (subscriber, token).
+    const tokens = planTokensByIds(db, rows.map((row) => row.plan_id));
+    const balances = listLatestVaultBalances(
+      db,
+      rows.map((row) => row.subscriber),
+    );
+
+    const due: DueMandateRow[] = rows.map((row) => {
+      const token = tokens.get(row.plan_id);
+      const balance = token ? balances.get(row.subscriber)?.get(token) : undefined;
+      return {
+        id: row.id,
+        subscriber: row.subscriber,
+        merchant: row.merchant,
+        next_charge: row.next_charge,
+        amount: row.amount,
+        // Amounts are compared as bigints: a balance is a decimal string in
+        // the token's smallest unit and must never round-trip through a
+        // JavaScript number.
+        funded: balance !== undefined && BigInt(balance) >= BigInt(row.amount),
+      };
+    });
     const body: DuePage = { now, due };
     res.json(body);
   });
