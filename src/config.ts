@@ -121,6 +121,15 @@ const schema = z.object({
   PORT: z.coerce.number().int().positive().default(8080),
   API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   API_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
+  /**
+   * Serve the Prometheus endpoint at `/metrics`. Off by default: the metrics
+   * are operational data, and a deployment that does not scrape them should
+   * not expose them.
+   */
+  METRICS_ENABLED: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),

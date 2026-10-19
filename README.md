@@ -211,6 +211,7 @@ When extra networks are configured (see below), every route also answers under
 |---|---|---|
 | `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, `paused` state, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
 | `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
+| `GET` | `/metrics` | Prometheus metrics: the indexer's gauges and the keeper's counters (only when `METRICS_ENABLED=true`) |
 | `GET` | `/api/openapi.json` | The OpenAPI 3.1 description of this API |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
@@ -263,6 +264,26 @@ curl -s localhost:8080/api/openapi.json | jq '.paths | keys'
 
 A test compares the document with the routes Express registers, so a route
 that is added without being documented fails the build.
+
+### Metrics
+
+With `METRICS_ENABLED=true` the service serves `/metrics` in the Prometheus
+text format. It is off by default: the numbers are operational data, and a
+deployment that does not scrape them should not expose them.
+
+| Metric | Type | What it says |
+|---|---|---|
+| `payflow_indexer_cursor` | gauge | The ledger up to which events have been projected |
+| `payflow_indexer_latest_ledger` | gauge | The latest ledger the RPC node reported |
+| `payflow_indexer_lag` | gauge | How many ledgers the projection trails the network by |
+| `payflow_events_applied_total` | counter | Contract events applied to the projection |
+| `payflow_charges_settled_total` | counter | Charges the keeper settled |
+| `payflow_charges_failed_total` | counter | Charges the keeper could not settle |
+| `payflow_keeper_passes_total` | counter | Keeper passes run |
+
+The three indexer gauges carry a `network` label, so an instance that serves
+testnet and mainnet reports both. The counters are the process's own totals:
+they reset when the process restarts, which is what Prometheus expects.
 
 ### The due list and the vault balance
 
@@ -585,6 +606,7 @@ examined without API downtime.
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
 | `API_RATE_LIMIT_MAX` | `120` | Maximum requests per IP in each API rate-limit window |
+| `METRICS_ENABLED` | `false` | Serve the Prometheus metrics at `/metrics` |
 | `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |

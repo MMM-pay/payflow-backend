@@ -11,6 +11,7 @@ import {
 } from "@stellar/stellar-sdk";
 import type { Config } from "./config.ts";
 import { logger } from "./lib/logger.ts";
+import { metrics } from "./lib/metrics.ts";
 import { simulationSource } from "./lib/simulate.ts";
 import { planTokensByIds } from "./lib/queries.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
@@ -362,6 +363,11 @@ export class Keeper {
     const results = ordered.map((entry) => entry.result);
     this.announceRetirement(results);
     this.recordPass(now, results, skipped);
+    metrics.increment("keeper_passes");
+    for (const result of results) {
+      if (result.status === "settled") metrics.increment("charges_settled");
+      else metrics.increment("charges_failed");
+    }
     return results;
   }
 

@@ -15,6 +15,7 @@ import {
   type DecodedEvent,
 } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
+import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { defaultMerchantSummaryCache, type MerchantSummaryCache } from "./routes/index.ts";
 
 export { parseCloseTime };
@@ -127,6 +128,9 @@ export class Indexer {
     this.server = server;
     this.config = config;
     this.merchantCache = merchantCache;
+    // Publish the starting state, so a scrape sees the series from the first
+    // moment and not only once the first pass has run.
+    this.publishMetrics(0);
   }
 
   private contractIds(): string[] {
@@ -142,6 +146,33 @@ export class Indexer {
       this.config.VAULT_ID,
       this.config.SUBSCRIPTION_ID,
     ];
+  }
+
+  /**
+   * The network this indexer reads, as it appears on the metrics' `network`
+   * label. A configuration built from the environment names it too, so the
+   * label is the same either way.
+   */
+  private get networkLabel(): string {
+    if ("name" in this.config) return this.config.name;
+    return this.config.STELLAR_NETWORK ?? "default";
+  }
+
+  /**
+   * Publish the indexer's progress to the metrics registry.
+   *
+   * The gauges are the ones an operator alerts on: how far the projection has
+   * got, how far the network has got, and the difference between them. The
+   * counter counts the events the projection has absorbed.
+   *
+   * A pass that fails still publishes: the cursor it reached is the truth the
+   * operator needs, and the lag it leaves behind is exactly what the alert is
+   * for.
+   */
+  private publishMetrics(applied: number): void {
+    const network = this.networkLabel;
+    publishIndexerMetrics(this.status, network);
+    if (applied > 0) metrics.increment("events_applied", applied, { network });
   }
 
   /**
@@ -245,6 +276,7 @@ export class Indexer {
     // write nothing, so the saved cursor and projection are untouched and the
     // loop resumes exactly where it left off on resume.
     if (this.status.paused) {
+      this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: this.status.cursor, latest: this.status.latest };
     }
     const latestRes = await this.server.getLatestLedger();
@@ -256,6 +288,7 @@ export class Indexer {
     if (start > latest) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
+      this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -265,6 +298,7 @@ export class Indexer {
     if (end <= start) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
+      this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -312,6 +346,7 @@ export class Indexer {
 
     this.status.cursor = cursor;
     this.updateFreshness(latestCloseTime, lastSeenCloseTime, cursor, latest);
+    this.publishMetrics(applied);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
   }

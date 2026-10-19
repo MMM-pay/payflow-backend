@@ -16,6 +16,7 @@ import { sendApiError } from "./routes/errors.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
+import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
 
 /**
@@ -279,6 +280,21 @@ export function createApp(
     res.setHeader("Cache-Control", "public, max-age=60");
     res.json(openApiDocument);
   });
+
+  // Prometheus metrics. Opt-in: without METRICS_ENABLED the path does not
+  // exist and answers 404 like any other unknown route.
+  if (config.METRICS_ENABLED) {
+    app.get("/metrics", (_req, res) => {
+      // The gauges describe the projection as it stands, not as it stood
+      // after the last pass, so they are refreshed before the render.
+      for (const rt of runtimes) {
+        if (rt.indexer) publishIndexerMetrics(rt.indexer, rt.config.name);
+      }
+      res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      res.send(metrics.render());
+    });
+  }
 
   // Always 200 so a slow backfill does not get the service restarted; the
   // body says whether the projection is current.

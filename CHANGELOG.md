@@ -14,6 +14,12 @@ All notable changes to payflow-backend. The format follows
   generated client knows not to read them as numbers. A test compares the
   document with the routes Express registers, so a route that is added without
   being documented fails the build.
+- **Prometheus metrics (#9).** With `METRICS_ENABLED=true` the service serves
+  `/metrics` in the Prometheus text format: gauges for the indexer's cursor,
+  the latest ledger and the lag, and counters for the events applied, the
+  charges settled, the charges failed and the keeper passes. The endpoint is
+  off by default; the new variable is in `.env.example` and the README's
+  configuration table.
 - **The keeper skips mandates the vault cannot cover (#8).** Before it settles
   anything, the keeper reads `vault.balance(subscriber, token)` from the
   contract — a read-only simulation, no transaction and no fee — and skips a

@@ -23,6 +23,9 @@ Use these commands to quickly inspect service state:
 # Check service health, lag, and data freshness
 curl -s http://localhost:8080/health | jq .
 
+# Scrape the Prometheus metrics (only when METRICS_ENABLED=true)
+curl -s http://localhost:8080/metrics
+
 # Inspect indexer progress directly in SQLite
 sqlite3 payflow.db "SELECT * FROM meta WHERE key = 'cursor';"
 
@@ -34,6 +37,29 @@ journalctl -u payflow-backend -n 100 --no-pager
 # Or if running via Docker/Render CLI:
 # render logs -s srv-xxxx --tail 100
 ```
+
+### What the metrics say
+
+`/metrics` is the history behind `/health`: `/health` says whether the
+indexer is behind right now, the metrics say how long it has been.
+
+| Metric | Alert on |
+|---|---|
+| `payflow_indexer_lag` | A lag that keeps growing: the indexer is not keeping up |
+| `payflow_indexer_cursor` | A cursor that stops moving while the lag grows |
+| `payflow_events_applied_total` | A counter that stops growing while the lag grows |
+| `payflow_charges_settled_total` | No charges settled although mandates are due |
+| `payflow_charges_failed_total` | Failures climbing: the keeper cannot settle |
+| `payflow_keeper_passes_total` | A pass count that stops growing: the keeper is stuck |
+
+The keeper logs a mandate it skipped because the vault could not cover it:
+
+```bash
+journalctl -u payflow-backend -g "cannot cover" --no-pager
+```
+
+Each line names the mandate and the shortfall, so a subscriber that needs a
+top-up can be found without reading the chain.
 
 ---
 
