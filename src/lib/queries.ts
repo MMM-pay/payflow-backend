@@ -4,12 +4,15 @@ import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "../routes/helpers.ts";
 import type {
   ChargeRow,
   DueMandateRow,
+  ProtocolResponse,
   MandateRow,
   MerchantSummary,
   PlanRow,
   StatsResponse,
   SubscriberSummary,
   TokenRevenue,
+  VaultBalancePage,
+  VaultEventPage,
 } from "../routes/types.ts";
 
 export interface ListPlansFilter {
@@ -126,6 +129,15 @@ export function getMandateById(
     .get(id) as unknown as MandateRow | undefined;
 }
 
+/** Resolve the merchant for a mandate when an event only includes its id. */
+export function getMandateMerchant(db: DatabaseSync, id: number): string | undefined {
+  return (
+    db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(id) as
+      | { merchant: string }
+      | undefined
+  )?.merchant;
+}
+
 /** List charge events for a mandate ordered by ledger descending. */
 export function listMandateCharges(
   db: DatabaseSync,
@@ -135,6 +147,57 @@ export function listMandateCharges(
   return db
     .prepare("SELECT * FROM charges WHERE mandate_id = ? ORDER BY ledger DESC LIMIT ?")
     .all(mandateId, limit) as unknown as ChargeRow[];
+}
+
+/** Latest indexed vault balance for each token owned by an address. */
+export function getVaultBalances(
+  db: DatabaseSync,
+  address: string,
+): VaultBalancePage["balances"] {
+  return db
+    .prepare(
+      `SELECT e.token, e.balance, e.ledger
+         FROM vault_events e
+        WHERE e.user = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM vault_events newer
+             WHERE newer.user = e.user
+               AND newer.token = e.token
+               AND (newer.ledger > e.ledger OR
+                    (newer.ledger = e.ledger AND newer.rowid > e.rowid))
+          )
+        ORDER BY e.token`,
+    )
+    .all(address) as unknown as VaultBalancePage["balances"];
+}
+
+/** Vault events for an address, newest ledger and insertion order first. */
+export function listVaultEvents(
+  db: DatabaseSync,
+  address: string,
+  limit: number,
+): VaultEventPage["events"] {
+  return db
+    .prepare(
+      `SELECT tx_hash, kind, user, token, counterparty, amount, balance, ledger
+         FROM vault_events
+        WHERE user = ?
+        ORDER BY ledger DESC, rowid DESC
+        LIMIT ?`,
+    )
+    .all(address, limit) as unknown as VaultEventPage["events"];
+}
+
+/** Current fee is the newest indexed fee change; null means no change is known. */
+export function getProtocolFeeHistory(db: DatabaseSync): ProtocolResponse {
+  const history = db
+    .prepare(
+      `SELECT tx_hash, old_fee_bps, new_fee_bps, ledger
+         FROM fee_history
+        ORDER BY ledger DESC, rowid DESC`,
+    )
+    .all() as unknown as ProtocolResponse["history"];
+  return { fee_bps: history[0]?.new_fee_bps ?? null, history };
 }
 
 /** List active mandates currently eligible for settlement at `now`. */

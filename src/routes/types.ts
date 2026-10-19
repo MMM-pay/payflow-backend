@@ -103,6 +103,61 @@ export interface ChargePage {
   charges: ChargeRow[];
 }
 
+export interface VaultBalance {
+  token: string;
+  /** Latest on-chain balance in the token's smallest unit. */
+  balance: string;
+  ledger: number;
+}
+
+export interface VaultEventRow {
+  tx_hash: string;
+  kind: string;
+  user: string;
+  token: string;
+  counterparty: string | null;
+  /** Event amount in the token's smallest unit. */
+  amount: string;
+  /** Post-event balance in the token's smallest unit. */
+  balance: string;
+  ledger: number;
+}
+
+export interface VaultBalancePage {
+  address: string;
+  balances: VaultBalance[];
+}
+
+export interface VaultEventPage {
+  address: string;
+  events: VaultEventRow[];
+}
+
+export interface ProtocolFeeChange {
+  tx_hash: string;
+  old_fee_bps: number;
+  new_fee_bps: number;
+  ledger: number;
+}
+
+export interface ProtocolResponse {
+  /** Null until a fee_changed event has been indexed. */
+  fee_bps: number | null;
+  history: ProtocolFeeChange[];
+}
+
+export interface KeeperPassSummary {
+  time: number;
+  attempted: number;
+  settled: number;
+  failures: { mandateId: number; error: string }[];
+  backoff: { mandateId: number; failures: number; retryAt: number; retryIn: number }[];
+}
+
+export interface KeeperHistoryResponse {
+  passes: KeeperPassSummary[];
+}
+
 export interface DuePage {
   now: number;
   due: DueMandateRow[];

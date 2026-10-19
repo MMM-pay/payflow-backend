@@ -89,6 +89,9 @@ const ROUTES: RouteSpec[] = [
   { file: "mandates", method: "GET", path: "/api/mandates", status: 200 },
   { file: "mandate_by_id", method: "GET", path: "/api/mandates/1", status: 200 },
   { file: "mandate_charges", method: "GET", path: "/api/mandates/1/charges", status: 200 },
+  { file: "vault_balances", method: "GET", path: `/api/vault/${SUBSCRIBER}`, status: 200 },
+  { file: "vault_events", method: "GET", path: `/api/vault/${SUBSCRIBER}/events`, status: 200 },
+  { file: "protocol", method: "GET", path: "/api/protocol", status: 200 },
   { file: "due", method: "GET", path: "/api/due", status: 200 },
   { file: "merchant_summary", method: "GET", path: `/api/merchants/${MERCHANT}/summary`, status: 200 },
   { file: "merchant_forecast", method: "GET", path: `/api/merchants/${MERCHANT}/forecast`, status: 200 },
@@ -124,6 +127,8 @@ before(async () => {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n,
     next_charge: BigInt(FIXED_NOW_S + 2_592_000),
   }, "tx-charge-1"));
+  ix.apply(ev("deposit", [SUBSCRIBER, "C"], { amount: 1_000_000n, balance: 1_000_000n }, "tx-vault"));
+  ix.apply(ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "tx-fee"));
 
   const app = createApp(
     [{ config: testnet, db, indexer: status, summaryCache: ix.merchantCache }],

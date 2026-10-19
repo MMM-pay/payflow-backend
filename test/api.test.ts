@@ -64,6 +64,12 @@ before(async () => {
   ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
+  ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_A"], { amount: 9_007_199_254_740_993n, balance: 9_007_199_254_740_993n }, "vault-a"), ledger: 9 });
+  ix.apply({ ...ev("withdraw", [SUBSCRIBER, "TOKEN_A"], { amount: 3n, balance: 9_007_199_254_740_990n }, "vault-b"), ledger: 10 });
+  ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_B"], { amount: 20n, balance: 20n }, "vault-c"), ledger: 10 });
+  ix.apply({ ...ev("debit", [SUBSCRIBER, "TOKEN_A"], { amount: 5n, balance: 9_007_199_254_740_985n }, "vault-d"), ledger: 10 });
+  ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "fee-1"), ledger: 8 });
+  ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 125n, new_fee_bps: 150n }, "fee-2"), ledger: 12 });
 
   // A yearly plan: one charge of 120_000_000 per 365-day period, next charge
   // far in the future so it never lands in the due list.
@@ -226,6 +232,99 @@ describe("http api", () => {
   test("mandate charge history", async () => {
     const { body } = await get("/api/mandates/1/charges");
     assert.equal((body.charges as unknown[]).length, 1);
+  });
+
+  test("vault balances use the latest event per token without losing precision", async () => {
+    const { status: code, body } = await get(`/api/vault/${SUBSCRIBER}`);
+    assert.equal(code, 200);
+    const balances = body.balances as { token: string; balance: string; ledger: number }[];
+    assert.deepEqual(balances, [
+      { token: "TOKEN_A", balance: "9007199254740985", ledger: 10 },
+      { token: "TOKEN_B", balance: "20", ledger: 10 },
+    ]);
+    assert.equal(typeof balances[0]!.balance, "string");
+  });
+
+  test("vault events are newest first and honor the limit", async () => {
+    const { body } = await get(`/api/vault/${SUBSCRIBER}/events?limit=2`);
+    const events = body.events as { tx_hash: string; balance: string; ledger: number }[];
+    assert.deepEqual(events.map((event) => event.tx_hash), ["vault-d", "vault-c"]);
+    assert.equal(events[0]!.balance, "9007199254740985");
+    assert.equal(events[0]!.ledger, 10);
+  });
+
+  test("protocol reports the latest fee and newest-first fee history", async () => {
+    const { status: code, body } = await get("/api/protocol");
+    assert.equal(code, 200);
+    assert.equal(body.fee_bps, 150);
+    assert.deepEqual(body.history, [
+      { tx_hash: "fee-2", old_fee_bps: 125, new_fee_bps: 150, ledger: 12 },
+      { tx_hash: "fee-1", old_fee_bps: 100, new_fee_bps: 125, ledger: 8 },
+    ]);
+  });
+
+  test("keeper history is not exposed when the keeper is disabled", async () => {
+    const { status: code, body } = await get("/api/keeper");
+    assert.equal(code, 404);
+    assert.equal((body.error as unknown as { code: string }).code, "not_found");
+  });
+
+  test("keeper history is exposed when enabled", async () => {
+    const pass = {
+      time: 123,
+      attempted: 2,
+      settled: 1,
+      failures: [{ mandateId: 7, error: "insufficient vault balance" }],
+      backoff: [{ mandateId: 7, failures: 1, retryAt: 183, retryIn: 60 }],
+    };
+    const app = createApp(
+      db,
+      { ...config, KEEPER_ENABLED: true } as Config,
+      status,
+      { keeperHistory: () => [pass] },
+    );
+    const testServer = app.listen(0);
+    const addr = testServer.address();
+    const testBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+    try {
+      const res = await fetch(`${testBase}/api/keeper`);
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { passes: [pass] });
+    } finally {
+      testServer.close();
+    }
+  });
+
+  test("keeper history is not exposed when the keeper is disabled", async () => {
+    const { status: code, body } = await get("/api/keeper");
+    assert.equal(code, 404);
+    assert.equal((body.error as unknown as { code: string }).code, "not_found");
+  });
+
+  test("keeper history is exposed when enabled", async () => {
+    const pass = {
+      time: 123,
+      attempted: 2,
+      settled: 1,
+      failures: [{ mandateId: 7, error: "insufficient vault balance" }],
+      backoff: [{ mandateId: 7, failures: 1, retryAt: 183, retryIn: 60 }],
+    };
+    const app = createApp(
+      db,
+      { ...config, KEEPER_ENABLED: true } as Config,
+      status,
+      { keeperHistory: () => [pass] },
+    );
+    const testServer = app.listen(0);
+    const addr = testServer.address();
+    const testBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+    try {
+      const res = await fetch(`${testBase}/api/keeper`);
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { passes: [pass] });
+    } finally {
+      testServer.close();
+    }
   });
 
   test("batch mandate lookup omits unknown ids", async () => {
@@ -468,9 +567,12 @@ describe("server-sent event stream", () => {
     const address = streamServer.address();
     const streamBase = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`;
     const listenerCount = streamIndexer.events.listenerCount("applied");
+    const controller = new AbortController();
 
     try {
-      const response = await fetch(`${streamBase}/api/stream?merchant=${MERCHANT}`);
+      const response = await fetch(`${streamBase}/api/stream?merchant=${MERCHANT}`, {
+        signal: controller.signal,
+      });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
       assert.equal(response.headers.get("cache-control"), "no-store");
@@ -493,8 +595,10 @@ describe("server-sent event stream", () => {
       assert.match(text, /event: charged/);
       assert.match(text, /"amount":"9900000"/);
 
-      await reader.cancel();
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      controller.abort();
+      for (let attempt = 0; attempt < 20 && streamIndexer.events.listenerCount("applied") !== listenerCount; attempt += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
       assert.equal(streamIndexer.events.listenerCount("applied"), listenerCount);
     } finally {
       streamServer.close();

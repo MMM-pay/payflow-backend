@@ -130,6 +130,19 @@ describe("typed api client", () => {
     assert.equal(stats.plans, 1);
     assert.equal(stats.mandates, 1);
     assert.equal(stats.charges, 1);
+
+    const protocol = await client.protocol();
+    assert.equal(protocol.fee_bps, null);
+    assert.deepEqual(protocol.history, []);
+
+    assert.deepEqual(await client.vault(SUBSCRIBER), {
+      address: SUBSCRIBER,
+      balances: [],
+    });
+    assert.deepEqual(await client.vaultEvents(SUBSCRIBER, { limit: 5 }), {
+      address: SUBSCRIBER,
+      events: [],
+    });
   });
 
   test("a 404 raises PayflowApiError with the parsed error body", async () => {

@@ -161,7 +161,7 @@ export function createApp(
 
   if (isMulti) {
     runtimes = dbOrRuntimes;
-    if (typeof arg2 === "object" && arg2 !== null && ("reindex" in arg2 || "keeperPass" in arg2)) {
+    if (typeof arg2 === "object" && arg2 !== null && ("reindex" in arg2 || "keeperPass" in arg2 || "keeperHistory" in arg2)) {
       admin = arg2 as AdminHooks;
     }
   } else {
@@ -301,6 +301,12 @@ export function createApp(
   // /admin falls through to the 404 below like any unknown path.
   if (config.ADMIN_TOKEN && admin) {
     app.use("/admin", buildAdminRoutes(config.ADMIN_TOKEN, admin));
+  }
+
+  if (config.KEEPER_ENABLED && admin?.keeperHistory) {
+    app.get("/api/keeper", (_req, res) => {
+      res.json({ passes: admin.keeperHistory?.() ?? [] });
+    });
   }
 
   // A network without a wired token metadata source falls back to a reader

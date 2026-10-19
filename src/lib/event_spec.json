@@ -115,6 +115,15 @@
       "data": [{ "name": "paused", "type": "boolean" }]
     },
     {
+      "name": "fee_changed",
+      "contract": "subscription",
+      "topics": [{ "name": "admin", "type": "address" }],
+      "data": [
+        { "name": "old_fee_bps", "type": "u32" },
+        { "name": "new_fee_bps", "type": "u32" }
+      ]
+    },
+    {
       "name": "deposit",
       "contract": "vault",
       "topics": [

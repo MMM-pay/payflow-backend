@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS vault_events (
   PRIMARY KEY (tx_hash, kind, user, amount)
 );
 CREATE INDEX IF NOT EXISTS vault_events_user ON vault_events(user);
+CREATE INDEX IF NOT EXISTS vault_events_user_token_ledger
+  ON vault_events(user, token, ledger DESC);
+CREATE INDEX IF NOT EXISTS vault_events_user_ledger
+  ON vault_events(user, ledger DESC);
+
+CREATE TABLE IF NOT EXISTS fee_history (
+  tx_hash      TEXT    PRIMARY KEY,
+  old_fee_bps  INTEGER NOT NULL,
+  new_fee_bps  INTEGER NOT NULL,
+  ledger       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fee_history_ledger ON fee_history(ledger DESC);
 `;
 
 /**

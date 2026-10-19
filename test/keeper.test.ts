@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
-import { Account, Keypair, Transaction, scValToNative } from "@stellar/stellar-sdk";
+import { Account, Keypair, StrKey, Transaction, scValToNative } from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
@@ -51,10 +51,11 @@ function fakeRpc(funded: Set<string>, submitted: string[] = []): KeeperRpc {
     },
     prepareTransaction: async (tx) => tx,
     sendTransaction: async (tx) => {
-      submitted.push((tx as Transaction).hash().toString("hex"));
+      const hash = Buffer.from((tx as Transaction).hash()).toString("hex");
+      submitted.push(hash);
       return {
         status: "PENDING",
-        hash: (tx as Transaction).hash().toString("hex"),
+        hash,
       } as never;
     },
     getTransaction: async () =>
@@ -213,9 +214,9 @@ describe("keeper key rotation", () => {
 
   test("KEEPER_SECRET_NEXT validates through the config schema", () => {
     const env = {
-      PLAN_REGISTRY_ID: "C".repeat(56),
-      VAULT_ID: "C".repeat(56),
-      SUBSCRIPTION_ID: "C".repeat(56),
+      PLAN_REGISTRY_ID: StrKey.encodeContract(Buffer.alloc(32)),
+      VAULT_ID: StrKey.encodeContract(Buffer.alloc(32)),
+      SUBSCRIPTION_ID: StrKey.encodeContract(Buffer.alloc(32)),
       KEEPER_SECRET: keyA.secret(),
       KEEPER_SECRET_NEXT: keyB.secret(),
     };
@@ -414,6 +415,114 @@ describe("keeper congestion fee retry", () => {
     const results = await keeper.tick(10_000);
     assert.equal(results[0]!.status, "settled");
     assert.deepEqual(fees, ["1000", "1500"]);
+    db.close();
+  });
+});
+
+describe("keeper settle transaction paths", () => {
+  function settleKeeper(server: KeeperRpc): Keeper {
+    return new Keeper(
+      openDatabase(":memory:"),
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+  }
+
+  test("send ERROR returns a failed result", async () => {
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()])),
+      sendTransaction: async () => ({ status: "ERROR", errorResult: "contract rejected" }),
+    } as unknown as KeeperRpc;
+    const result = await settleKeeper(server).settle(7);
+    assert.deepEqual(result, {
+      mandateId: 7,
+      status: "failed",
+      error: "contract rejected",
+    });
+  });
+
+  test("a transaction that remains NOT_FOUND returns a failed result", async (t) => {
+    t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void) => {
+      queueMicrotask(callback);
+      return 0 as never;
+    });
+    let polls = 0;
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()])),
+      getTransaction: async () => {
+        polls += 1;
+        return { status: rpc.Api.GetTransactionStatus.NOT_FOUND };
+      },
+    } as unknown as KeeperRpc;
+    const result = await settleKeeper(server).settle(8);
+    assert.equal(result.mandateId, 8);
+    assert.equal(result.status, "failed");
+    assert.equal(result.error, "NOT_FOUND");
+    assert.ok(result.txHash);
+    assert.equal(polls, 11);
+  });
+
+  test("a FAILED transaction returns its status", async () => {
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()])),
+      getTransaction: async () => ({ status: rpc.Api.GetTransactionStatus.FAILED }),
+    } as unknown as KeeperRpc;
+    const result = await settleKeeper(server).settle(9);
+    assert.equal(result.mandateId, 9);
+    assert.equal(result.status, "failed");
+    assert.ok(result.txHash);
+    assert.equal(result.error, rpc.Api.GetTransactionStatus.FAILED);
+  });
+
+  test("simulation errors return failed results without rotating", async () => {
+    const server = {
+      getAccount: async () => new Account(keyA.publicKey(), "1"),
+      prepareTransaction: async () => {
+        throw new Error("simulation rejected");
+      },
+    } as unknown as KeeperRpc;
+    assert.deepEqual(await settleKeeper(server).settle(10), {
+      mandateId: 10,
+      status: "failed",
+      error: "simulation rejected",
+    });
+  });
+
+  test("a successful transaction returns its hash", async () => {
+    const server = fakeRpc(new Set([keyA.publicKey()]));
+    const result = await settleKeeper(server).settle(11);
+    assert.equal(result.mandateId, 11);
+    assert.equal(result.status, "settled");
+    assert.match(result.txHash ?? "", /^[0-9a-f]{64}$/);
+  });
+});
+
+describe("keeper pass history", () => {
+  test("records failures, backoff seconds and only the latest 20 passes", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const server = {
+      getAccount: async () => {
+        throw new Error(`account ${keyA.publicKey()} ${keyA.secret()} not found`);
+      },
+    } as unknown as KeeperRpc;
+    const keeper = new Keeper(db, server, keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+    const failed = await keeper.tick(10_000);
+    assert.equal(failed[0]!.status, "failed");
+    const firstPass = keeper.passHistory()[0]!;
+    assert.equal(firstPass.backoff[0]!.retryIn, 60);
+    assert.equal(firstPass.backoff[0]!.retryAt, 10_060);
+
+    for (let time = 10_001; time < 10_020; time += 1) await keeper.tick(time);
+    const history = keeper.passHistory();
+    assert.equal(history.length, 20);
+    assert.equal(history[0]!.time, 10_019);
+    assert.equal(history.at(-1)!.time, 10_000);
+
+    const failure = keeper.passHistory().find((pass) => pass.failures.length > 0)!.failures[0]!;
+    assert.doesNotMatch(failure.error, new RegExp(keyA.publicKey()));
+    assert.doesNotMatch(failure.error, new RegExp(keyA.secret()));
+    assert.equal(history.at(-1)!.backoff[0]!.retryIn, 60);
     db.close();
   });
 });

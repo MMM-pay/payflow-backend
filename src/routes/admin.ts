@@ -15,6 +15,7 @@ export interface AdminHooks {
   reindex?: () => Promise<unknown>;
   keeperPass?: () => Promise<unknown>;
   keeperBackoff?: () => unknown;
+  keeperHistory?: () => unknown;
   pauseIndexer?: () => unknown;
   resumeIndexer?: () => unknown;
 }

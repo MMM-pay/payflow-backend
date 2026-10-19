@@ -90,6 +90,29 @@ describe("indexer projections", () => {
     assert.equal(row.fee_bps, 100);
   });
 
+  test("fee changes are projected once and preserve the latest rate", () => {
+    const changed = event("fee_changed", [MERCHANT], {
+      old_fee_bps: 100n,
+      new_fee_bps: 125n,
+    });
+    ix.apply(changed);
+    ix.apply(changed);
+    ix.apply({
+      ...changed,
+      txHash: "tx-fee-2",
+      ledger: 101,
+      data: { old_fee_bps: 125n, new_fee_bps: 150n },
+    });
+
+    const history = d
+      .prepare("SELECT tx_hash, old_fee_bps, new_fee_bps FROM fee_history ORDER BY ledger DESC")
+      .all() as { tx_hash: string; old_fee_bps: number; new_fee_bps: number }[];
+    assert.deepEqual(history.map((row) => ({ ...row })), [
+      { tx_hash: "tx-fee-2", old_fee_bps: 125, new_fee_bps: 150 },
+      { tx_hash: "tx-fee_changed", old_fee_bps: 100, new_fee_bps: 125 },
+    ]);
+  });
+
   test("deactivating a plan flips the flag", () => {
     ix.apply(planCreated);
     ix.apply(event("plan_status_changed", [MERCHANT, 1n], { active: false }));
@@ -241,11 +264,14 @@ describe("indexer projections", () => {
   });
 
   test("vault events are recorded", () => {
-    ix.apply(
-      event("deposit", [SUBSCRIBER, TOKEN], { amount: 50_000_000n, balance: 50_000_000n }),
-    );
+    const deposit = event("deposit", [SUBSCRIBER, TOKEN], {
+      amount: 50_000_000n,
+      balance: 50_000_000n,
+    });
+    ix.apply(deposit);
+    ix.apply(deposit);
     const rows = d.prepare("SELECT * FROM vault_events").all() as Record<string, unknown>[];
-    assert.equal(rows.length, 1);
+    assert.equal(rows.length, 1, "replaying the event cannot duplicate history");
     assert.equal(rows[0]!.kind, "deposit");
     assert.equal(rows[0]!.balance, "50000000");
   });

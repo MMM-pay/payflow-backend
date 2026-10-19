@@ -1,0 +1,15 @@
+{
+  "address": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+  "events": [
+    {
+      "tx_hash": "tx-vault",
+      "kind": "deposit",
+      "user": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+      "token": "C",
+      "counterparty": null,
+      "amount": "1000000",
+      "balance": "1000000",
+      "ledger": 1
+    }
+  ]
+}

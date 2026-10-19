@@ -145,6 +145,10 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/mandates/:id` | One mandate |
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
+| `GET` | `/api/vault/:address` | Latest balance per token |
+| `GET` | `/api/vault/:address/events?limit=` | Vault deposit, withdrawal and debit history, newest first |
+| `GET` | `/api/protocol` | Current protocol fee (`fee_bps`) and fee-change history |
+| `GET` | `/api/keeper` | Last 20 keeper passes, failures and mandate backoff (only when enabled) |
 | `GET` | `/api/due` | Mandates chargeable right now |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/merchants/:address/forecast?days=30` | Projected charges over the next N days, net of fees |

@@ -1,7 +1,8 @@
 import type { EventEmitter } from "node:events";
 import type { DatabaseSync } from "node:sqlite";
 import { Router } from "express";
-import type { DecodedEvent } from "../lib/stellar.ts";
+import { getMandateMerchant } from "../lib/queries.ts";
+import { num, type DecodedEvent } from "../lib/stellar.ts";
 import { sendApiError } from "./errors.ts";
 
 const HEARTBEAT_MS = 25_000;
@@ -21,10 +22,10 @@ function addressesOf(event: DecodedEvent, db: DatabaseSync): {
       merchant: String(event.topics[1]),
     };
   }
-  const row = db
-    .prepare("SELECT merchant FROM mandates WHERE id = ?")
-    .get(event.topics[0] as string | number | bigint) as { merchant: string } | undefined;
-  return { subscriber: String(event.topics[1]), merchant: row?.merchant };
+  return {
+    subscriber: String(event.topics[1]),
+    merchant: getMandateMerchant(db, num(event.topics[0])),
+  };
 }
 
 /** Stream projected subscription events without polling the database. */

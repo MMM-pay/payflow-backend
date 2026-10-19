@@ -95,6 +95,7 @@ const adminHooks: AdminHooks = {
 if (keeper && runKeeperPass) {
   adminHooks.keeperPass = () => runKeeperPass();
   adminHooks.keeperBackoff = () => keeper.backoffList();
+  adminHooks.keeperHistory = () => keeper.passHistory();
 }
 
 const app = createApp(

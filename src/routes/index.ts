@@ -9,10 +9,12 @@ import {
   MerchantSummaryCache,
 } from "./merchants.ts";
 import { plansRouter } from "./plans.ts";
+import { protocolRouter } from "./protocol.ts";
 import { statsRouter } from "./stats.ts";
 import { subscribersRouter } from "./subscribers.ts";
 import { tokensRouter } from "./tokens.ts";
 import { streamRouter } from "./stream.ts";
+import { vaultRouter } from "./vault.ts";
 
 export { defaultMerchantSummaryCache, MerchantSummaryCache };
 
@@ -90,12 +92,14 @@ export function buildRoutes(
     next();
   });
   r.use(plansRouter(db, tokens));
+  r.use(protocolRouter(db));
   r.use(mandatesRouter(db, tokens));
   r.use(merchantsRouter(db, summaryCache, defaultToken));
   r.use(subscribersRouter(db));
   r.use(statsRouter(db));
   r.use(tokensRouter(tokens));
   if (events) r.use(streamRouter(events, db));
+  r.use(vaultRouter(db));
   return r;
 }
 

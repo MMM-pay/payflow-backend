@@ -17,13 +17,17 @@ import type {
   DuePage,
   ForecastResponse,
   HealthResponse,
+  KeeperHistoryResponse,
   MandatePage,
   MandateRow,
   MerchantSummary,
   PlanPage,
   PlanRow,
+  ProtocolResponse,
   StatsResponse,
   SubscriberSummary,
+  VaultBalancePage,
+  VaultEventPage,
 } from "../routes/types.ts";
 
 // Types shared with the backend, not copied: one declaration in
@@ -37,11 +41,15 @@ export type {
   ForecastResponse,
   HealthResponse,
   HealthStatus,
+  KeeperHistoryResponse,
+  KeeperPassSummary,
   MandatePage,
   MandateRow,
   MerchantSummary,
   PlanPage,
   PlanRow,
+  ProtocolFeeChange,
+  ProtocolResponse,
   StatsResponse,
   SubscriberSummary,
   TokenFields,
@@ -49,6 +57,10 @@ export type {
   TokenRevenue,
   UpcomingCharge,
   UpcomingChargesResponse,
+  VaultBalance,
+  VaultBalancePage,
+  VaultEventPage,
+  VaultEventRow,
 } from "../routes/types.ts";
 
 export interface PlansQuery {
@@ -167,5 +179,24 @@ export class PayflowClient {
 
   stats(): Promise<StatsResponse> {
     return this.get<StatsResponse>("/api/stats");
+  }
+
+  protocol(): Promise<ProtocolResponse> {
+    return this.get<ProtocolResponse>("/api/protocol");
+  }
+
+  vault(address: string): Promise<VaultBalancePage> {
+    return this.get<VaultBalancePage>(`/api/vault/${encodeURIComponent(address)}`);
+  }
+
+  vaultEvents(address: string, query: PageQuery = {}): Promise<VaultEventPage> {
+    return this.get<VaultEventPage>(
+      `/api/vault/${encodeURIComponent(address)}/events`,
+      query,
+    );
+  }
+
+  keeper(): Promise<KeeperHistoryResponse> {
+    return this.get<KeeperHistoryResponse>("/api/keeper");
   }
 }

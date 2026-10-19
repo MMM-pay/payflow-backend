@@ -385,6 +385,9 @@ export class Indexer {
       case "pause_changed":
         this.onPauseChanged(e);
         return "applied";
+      case "fee_changed":
+        this.onFeeChanged(e);
+        return "applied";
       case "deposit":
       case "withdraw":
       case "debit":
@@ -545,6 +548,20 @@ export class Indexer {
         counterparty === undefined ? null : str(counterparty),
         big(e.data.amount),
         big(e.data.balance),
+        e.ledger,
+      );
+  }
+
+  private onFeeChanged(e: DecodedEvent): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO fee_history (tx_hash, old_fee_bps, new_fee_bps, ledger)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(
+        e.txHash,
+        num(e.data.old_fee_bps),
+        num(e.data.new_fee_bps),
         e.ledger,
       );
   }
