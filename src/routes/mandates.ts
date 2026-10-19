@@ -132,6 +132,14 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
+    // A mandate that does not exist has no charges: the same 404 the
+    // mandate's own route answers, so a caller cannot mistake "no such
+    // mandate" for "no charges yet".
+    if (!getMandateById(db, id.value)) {
+      sendApiError(res, req, 404, "mandate_not_found");
+      return;
+    }
+
     const charges = listMandateCharges(db, id.value, limitOf(limit.value));
     const body: ChargePage = { charges };
     res.json(body);

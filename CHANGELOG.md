@@ -149,6 +149,10 @@ All notable changes to payflow-backend. The format follows
 
 ### Changed
 
+- **A mandate that does not exist has no charges (#10).**
+  `GET /api/mandates/:id/charges` used to answer `200` with an empty list for
+  an unknown id, so "no such mandate" and "no charges yet" looked the same. It
+  now answers `404 mandate_not_found`, like `GET /api/mandates/:id` does.
 - **A charge is stamped with the chain's clock (#13).** `charges.created_at`
   was the moment the indexer happened to see the charge, so every charge
   indexed in one backfill shared one timestamp and any time-based view of the

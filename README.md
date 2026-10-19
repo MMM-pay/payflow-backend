@@ -223,8 +223,8 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/vault/:address` | Latest balance per token |
 | `GET` | `/api/vault/:address/events?limit=` | Vault deposit, withdrawal and debit history, newest first |
 | `GET` | `/api/protocol` | Current protocol fee (`fee_bps`) and fee-change history |
-| `GET` | `/api/keeper` | Last 20 keeper passes, failures and mandate backoff (only when enabled) |
-| `GET` | `/api/due` | Mandates chargeable right now |
+| `GET` | `/api/keeper` | Last 20 keeper passes, failures, skipped mandates and mandate backoff (only when enabled) |
+| `GET` | `/api/due` | Mandates chargeable right now, each with a `funded` flag |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/merchants/:address/subscribers?limit=` | The merchant's distinct subscribers, grouped by lifetime value |
 | `GET` | `/api/merchants/:address/churn?bucket=month&limit=` | Per-bucket churn: mandates started, cancelled, ended and completed, and the net |
@@ -429,11 +429,16 @@ a stable `code` and show the human-readable `message` without parsing prose:
 > client bug looked like an empty page. Valid requests are unaffected; an
 > empty value (`?merchant=`) still means "no filter".
 
+> **Migration note (charges).** `GET /api/mandates/:id/charges` now answers
+> `404 mandate_not_found` for a mandate that does not exist, like
+> `GET /api/mandates/:id` does. Before, it answered `200` with an empty
+> list, so "no such mandate" and "no charges yet" looked the same.
+
 | `error.code` | HTTP | Where |
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
 | `plan_not_found` | 404 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` with no such plan |
-| `mandate_not_found` | 404 | `GET /api/mandates/:id` with no such mandate |
+| `mandate_not_found` | 404 | `GET /api/mandates/:id` or `GET /api/mandates/:id/charges` with no such mandate |
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
 | `too_many_ids` | 400 | `?ids=` lists more than 100 ids |
 | `invalid_request` | 400 | A query or path parameter is not valid; `error.details` says which |
