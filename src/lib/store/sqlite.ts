@@ -16,6 +16,7 @@ function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
 }
 
 class SqliteTransaction implements Storage {
+  readonly dialect = "sqlite" as const;
   private readonly database: DatabaseSync;
 
   constructor(database: DatabaseSync) {
@@ -49,6 +50,7 @@ class SqliteTransaction implements Storage {
 
 /** SQLite implementation of the shared async storage boundary. */
 export class SqliteStorage implements Storage {
+  readonly dialect = "sqlite" as const;
   readonly database: DatabaseSync;
   private transactionTail: Promise<void> = Promise.resolve();
 

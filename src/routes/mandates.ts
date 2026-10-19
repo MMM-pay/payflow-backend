@@ -10,6 +10,14 @@ import {
 import type { TokenMetadataService } from "../lib/tokens.ts";
 import { limitOf, tokenFields } from "./helpers.ts";
 import { sendApiError } from "./errors.ts";
+import {
+  addressSchema,
+  idSchema,
+  limitSchema,
+  mandateStatusSchema,
+  present,
+  validate,
+} from "./validate.ts";
 import type {
   ChargePage,
   DuePage,
@@ -42,7 +50,7 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
   const r = Router();
 
   r.get("/mandates", async (req, res) => {
-    const { ids, subscriber, merchant, status } = req.query;
+    const { ids } = req.query;
     let parsedIds: number[] | undefined;
     if (ids !== undefined) {
       const parsed = parseIds(ids);
@@ -56,12 +64,39 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
       }
       parsedIds = parsed.ids;
     }
+    const subscriber = validate(
+      req,
+      res,
+      "subscriber",
+      addressSchema.optional(),
+      present(req.query.subscriber),
+    );
+    if (!subscriber.ok) return;
+    const merchant = validate(
+      req,
+      res,
+      "merchant",
+      addressSchema.optional(),
+      present(req.query.merchant),
+    );
+    if (!merchant.ok) return;
+    const status = validate(
+      req,
+      res,
+      "status",
+      mandateStatusSchema.optional(),
+      present(req.query.status),
+    );
+    if (!status.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
     const rows = await listMandates(db, {
       ids: parsedIds,
-      subscriber: subscriber ? String(subscriber) : undefined,
-      merchant: merchant ? String(merchant) : undefined,
-      status: status ? String(status) : undefined,
-      limit: limitOf(req.query.limit),
+      subscriber: subscriber.value,
+      merchant: merchant.value,
+      status: status.value,
+      limit: limitOf(limit.value),
     });
     // A mandate carries no token of its own; it inherits its plan's, batched
     // into one read per page (see lib/queries.ts).
@@ -77,7 +112,10 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
   });
 
   r.get("/mandates/:id", async (req, res) => {
-    const row = await getMandateById(db, Number(req.params.id));
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+
+  const row = await getMandateById(db, id.value);
     if (!row) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
@@ -87,19 +125,23 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
   });
 
   r.get("/mandates/:id/charges", async (req, res) => {
-    const charges = await listMandateCharges(
-      db,
-      Number(req.params.id),
-      limitOf(req.query.limit),
-    );
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const charges = await listMandateCharges(db, id.value, limitOf(limit.value));
     const body: ChargePage = { charges };
     res.json(body);
   });
 
   /** Mandates chargeable right now, per the indexed projection. */
   r.get("/due", async (req, res) => {
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
     const now = Math.floor(Date.now() / 1000);
-    const due = await listDueMandates(db, now, limitOf(req.query.limit));
+    const due = await listDueMandates(db, now, limitOf(limit.value));
     const body: DuePage = { now, due };
     res.json(body);
   });

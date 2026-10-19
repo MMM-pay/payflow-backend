@@ -3,8 +3,33 @@ import type { Storage } from "../lib/store/types.ts";
 import {
   getMerchantSummary,
   listMerchantForecastMandates,
+  listMerchantSubscribers,
+  getMerchantChurn,
+  getMerchantRevenue,
 } from "../lib/queries.ts";
-import type { ForecastResponse, MerchantSummary } from "./types.ts";
+import { churnBucketSize } from "../lib/churn.ts";
+import type {
+  ForecastResponse,
+  MerchantChurnResponse,
+  MerchantRevenueResponse,
+  MerchantSubscribersResponse,
+  MerchantSummary,
+} from "./types.ts";
+import {
+  DEFAULT_REVENUE_BUCKETS,
+  limitOf,
+  MAX_CHURN_BUCKETS,
+  MAX_REVENUE_BUCKETS,
+} from "./helpers.ts";
+import {
+  addressSchema,
+  bucketSchema,
+  daysSchema,
+  limitSchema,
+  present,
+  unixSecondsSchema,
+  validate,
+} from "./validate.ts";
 
 /**
  * Bounded LRU in-memory cache for merchant summaries.
@@ -62,6 +87,8 @@ export const defaultMerchantSummaryCache = new MerchantSummaryCache();
 const DAY_S = 86_400;
 /** Longest forecast horizon, to keep the arithmetic bounded. */
 const MAX_FORECAST_DAYS = 365;
+/** Buckets reported by the churn endpoint when the caller does not say. */
+const DEFAULT_CHURN_BUCKETS = 12;
 
 function daysOf(raw: unknown, fallback = 30): number {
   const n = Number(raw);
@@ -98,27 +125,111 @@ export function merchantsRouter(
   const r = Router();
 
   r.get("/merchants/:address/summary", async (req, res) => {
-    const address = String(req.params.address);
-    const cacheKey = defaultToken ? `${address}:${defaultToken}` : address;
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const cacheKey = defaultToken ? `${address.value}:${defaultToken}` : address.value;
     const cached = cache.get(cacheKey);
     if (cached !== undefined) {
       res.json(cached);
       return;
     }
 
-    const body = await getMerchantSummary(db, address, defaultToken);
+  const body = await getMerchantSummary(db, address.value, defaultToken);
     cache.set(cacheKey, body);
+    res.json(body);
+  });
+
+  /** The merchant's distinct subscribers, grouped by lifetime value. */
+  r.get("/merchants/:address/subscribers", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const subscribers = await listMerchantSubscribers(db, address.value, limitOf(limit.value));
+    const body: MerchantSubscribersResponse = {
+      merchant: address.value,
+      subscribers: subscribers.map(
+        (sub) => ({ ...sub, totalCollected: sub.totalCollected.toString() }),
+      ),
+    };
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/churn?bucket=month`: how many mandates started
+   * and departed in each time bucket.
+   *
+   * `bucket` picks the period (`day`, `week` or `month`; `month` by default)
+   * and `limit` how many of the most recent buckets to report. The counts are
+   * bucketed by the ledger close time of each event, so they are the chain's
+   * own history rather than the indexer's view of it.
+   */
+  r.get("/merchants/:address/churn", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
+    if (!bucket.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const body: MerchantChurnResponse = await getMerchantChurn(
+      db,
+      address.value,
+      churnBucketSize(bucket.value),
+      Math.min(limitOf(limit.value, DEFAULT_CHURN_BUCKETS), MAX_CHURN_BUCKETS),
+    );
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/revenue?bucket=day|week&from=&to=`: what the
+   * merchant took in, what the protocol took and what was left, over time.
+   *
+   * The buckets are calendar periods in UTC, taken from the close time of
+   * the ledger each charge was emitted in, so the report is the chain's own
+   * history rather than the indexer's view of it. `from` and `to` bound the
+   * range in unix seconds; without them the report covers the merchant's
+   * whole history.
+   */
+  r.get("/merchants/:address/revenue", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
+    if (!bucket.ok) return;
+    const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
+    if (!from.ok) return;
+    const to = validate(req, res, "to", unixSecondsSchema.optional(), present(req.query.to));
+    if (!to.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const body: MerchantRevenueResponse = await getMerchantRevenue(
+      db,
+      address.value,
+      churnBucketSize(bucket.value),
+      from.value,
+      to.value,
+      limit.value === undefined
+        ? DEFAULT_REVENUE_BUCKETS
+        : Math.min(limit.value, MAX_REVENUE_BUCKETS),
+    );
     res.json(body);
   });
 
   /** Projected charges over the next `days`, net of the protocol fee. */
   r.get("/merchants/:address/forecast", async (req, res) => {
-    const address = String(req.params.address);
-    const days = daysOf(req.query.days);
-    const from = Math.floor(Date.now() / 1000);
-    const to = from + days * DAY_S;
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));
+    if (!days.ok) return;
 
-    const mandates = await listMerchantForecastMandates(db, address);
+    const window = daysOf(days.value);
+    const from = Math.floor(Date.now() / 1000);
+    const to = from + window * DAY_S;
+
+    const mandates = await listMerchantForecastMandates(db, address.value);
 
     let net = 0n;
     let counted = 0;
@@ -131,8 +242,8 @@ export function merchantsRouter(
     }
 
     const body: ForecastResponse = {
-      merchant: address,
-      days,
+      merchant: address.value,
+      days: window,
       from,
       to,
       forecast: net.toString(),

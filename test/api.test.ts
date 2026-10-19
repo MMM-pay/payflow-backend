@@ -11,14 +11,17 @@ import type { DecodedEvent } from "../src/lib/stellar.ts";
 import { MerchantSummaryCache } from "../src/routes/index.ts";
 import type { MerchantSummary } from "../src/routes/types.ts";
 import { asReader, TokenMetadataService } from "../src/lib/tokens.ts";
+import { testAddress } from "./addresses.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
-const YEARLY_MERCHANT = "GDLXOW3J5FEFW4UZ7XBHX6EFHL7POV7S2NG5RZ7ULYCGLJWGPUBFQO4U";
-const FORECAST_MERCHANT = "GA5WDTXMB5SW2DIVYCXKQ36M3LWPSGVPYQWRTMLERMZSPGYQXVQ2N55B";
-const CAPPED_MERCHANT = "GCP3XZ2Z4XLRTNBRD7KWWLE7K4LRBNTBVF37LWZRY2MEEK3GZ3RWZG7Y";
-const OTHER_MERCHANT = "GCMOCQFSVPXI45VOPXW2WWPBZBVJE6L45UQ47S46CUVK4ISNFRM34KXM";
-const OTHER_SUBSCRIBER = "GD2P7AV53TONBPXKX5NWQKGUTAF32VZWKMFHQ2QZ5XNTTQFTV7Q4USP";
+const YEARLY_MERCHANT = testAddress(2);
+const FORECAST_MERCHANT = testAddress(3);
+const CAPPED_MERCHANT = testAddress(4);
+const OTHER_MERCHANT = testAddress(5);
+const OTHER_SUBSCRIBER = testAddress(6);
+/** A well-formed address the projection knows nothing about. */
+const UNKNOWN_MERCHANT = testAddress(7);
 /** Frozen at load; forecast fixtures hang off it so the window maths is stable. */
 const NOW = Math.floor(Date.now() / 1000);
 
@@ -236,13 +239,34 @@ describe("http api", () => {
     const mine = await get(`/api/plans?merchant=${MERCHANT}`);
     assert.equal((mine.body.plans as unknown[]).length, 1);
 
-    const none = await get("/api/plans?merchant=GNOBODY");
+    const none = await get(`/api/plans?merchant=${UNKNOWN_MERCHANT}`);
     assert.equal((none.body.plans as unknown[]).length, 0);
   });
 
   test("unknown plan is 404", async () => {
     const { status } = await get("/api/plans/999");
     assert.equal(status, 404);
+  });
+
+  test("plan stats returns per-plan numbers", async () => {
+    const { body } = await get("/api/plans/1/stats");
+    assert.equal(body.planId, 1);
+    // All four seeded mandates reference plan 1 (the yearly, forecast and
+    // capped fixtures all point at it), and all four are Active.
+    assert.equal(body.activeMandates, 4);
+    assert.equal(body.totalMandates, 4);
+    assert.equal(body.cancellations, 0);
+    // Only mandate 1 has settled a charge, of 9_900_000.
+    assert.equal(body.totalCollected, "9900000");
+    assert.equal(body.totalCharges, 1);
+    assert.equal(body.averageChargesPerMandate, 0.25);
+  });
+
+  test("unknown plan stats is 404", async () => {
+    const { status } = await get("/api/plans/999/stats");
+    assert.equal(status, 404);
+    const { body } = await get("/api/plans/999/stats");
+    assert.equal((body as { error: { code: string } }).error.code, "plan_not_found");
   });
 
   test("mandate charge history", async () => {
@@ -398,8 +422,11 @@ describe("http api", () => {
     assert.equal(one.body.days, 1);
     assert.equal(one.body.forecast, "4950000");
 
+    // A malformed value is refused rather than quietly read as the default:
+    // a client bug should look like an error, not like empty data.
     const malformed = await get(`/api/merchants/${FORECAST_MERCHANT}/forecast?days=nope`);
-    assert.equal(malformed.body.days, 30);
+    assert.equal(malformed.status, 400);
+    assert.equal((malformed.body.error as unknown as { code: string }).code, "invalid_request");
   });
 
   test("forecast stops at max_charges and ignores unknown merchants", async () => {
@@ -408,9 +435,40 @@ describe("http api", () => {
     assert.equal(capped.body.mandateCount, 1);
     assert.equal(capped.body.forecast, "4000000");
 
-    const none = await get("/api/merchants/GNOBODY/forecast");
+    const none = await get(`/api/merchants/${UNKNOWN_MERCHANT}/forecast`);
     assert.equal(none.body.mandateCount, 0);
     assert.equal(none.body.forecast, "0");
+  });
+
+  test("merchant subscribers groups distinct subscribers with lifetime value", async () => {
+    const { body } = await get(`/api/merchants/${MERCHANT}/subscribers`);
+    assert.equal(body.merchant, MERCHANT);
+    assert.deepEqual(body.subscribers, [
+      {
+        subscriber: SUBSCRIBER,
+        mandateCount: 1,
+        chargeCount: 1,
+        totalCollected: "9900000",
+      },
+    ]);
+  });
+
+  test("subscriber with mandates but no settled charges still appears at zero", async () => {
+    const { body } = await get(`/api/merchants/${YEARLY_MERCHANT}/subscribers`);
+    assert.deepEqual(body.subscribers, [
+      { subscriber: SUBSCRIBER, mandateCount: 1, chargeCount: 0, totalCollected: "0" },
+    ]);
+  });
+
+  test("unknown merchant returns an empty subscriber list", async () => {
+    const { body } = await get(`/api/merchants/${UNKNOWN_MERCHANT}/subscribers`);
+    assert.deepEqual(body.subscribers, []);
+  });
+
+  test("limit caps the subscriber page", async () => {
+    const { body } = await get(`/api/merchants/${MERCHANT}/subscribers?limit=1`);
+    assert.equal(body.subscribers.length, 1);
+    assert.equal(body.subscribers[0]?.subscriber, SUBSCRIBER);
   });
 
   test("subscriber summary includes fee in total paid", async () => {
@@ -645,7 +703,7 @@ describe("API rate limiting", () => {
 });
 
 describe("stats volume", () => {
-  const MERCHANT2 = "GBIWM7VWG7UBSHPOXG7XQV6M4EXG2XC5JQER6IZU35VS2DGLTJX7UVOM";
+  const MERCHANT2 = testAddress(8);
   const statsDb = openDatabase(":memory:");
   const statsIx = new Indexer(statsDb, {} as never, {} as never);
   let statsServer: Server;
@@ -817,10 +875,102 @@ describe("merchant revenue per token", () => {
   });
 
   test("an unknown merchant has an empty breakdown and zero totals", async () => {
-    const { body } = await summaryGet(plainBase, "/api/merchants/GNOBODY/summary");
+    const { body } = await summaryGet(plainBase, `/api/merchants/${UNKNOWN_MERCHANT}/summary`);
     assert.deepEqual(body.tokens, []);
     assert.equal(body.totalCollected, "0");
     assert.equal(body.mrr, "0");
+  });
+});
+
+describe("per-plan statistics", () => {
+  const STATS_SUB_A = testAddress(9);
+  const STATS_SUB_B = testAddress(10);
+  const statsDb = openDatabase(":memory:");
+  const statsIx = new Indexer(statsDb, {} as never, {} as never);
+  let statsServer: Server;
+  let statsBase: string;
+
+  const ev = (
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+    tx = "t",
+  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+
+  before(async () => {
+    // Plan 1: one Active mandate with two settled charges, one Cancelled.
+    statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
+      token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Popular",
+    }));
+    statsIx.apply(ev("subscribed", [1n, STATS_SUB_A, MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }));
+    statsIx.apply(ev("subscribed", [2n, STATS_SUB_B, MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }));
+    statsIx.apply(ev("cancelled", [2n, STATS_SUB_B], { charges_made: 0 }, "tx-cancel"));
+    statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "tx-c1"));
+    statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 2n, next_charge: 4_000_000_000n,
+    }, "tx-c2"));
+    // Plan 2: published but never subscribed to.
+    statsIx.apply(ev("plan_created", [MERCHANT, 2n], {
+      token: "C", amount: 5_000_000n, period: 2_592_000n, name: "Unused",
+    }));
+
+    const app = createApp(statsDb, config);
+    await new Promise<void>((resolve) => {
+      statsServer = app.listen(0, () => {
+        const addr = statsServer.address();
+        statsBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    statsServer.close();
+    statsDb.close();
+  });
+
+  const statsGet = async (path: string) => {
+    const res = await fetch(statsBase + path);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  test("stats count mandates, cancellations and settled charges per plan", async () => {
+    const { body } = await statsGet("/api/plans/1/stats");
+    assert.equal(body.planId, 1);
+    assert.equal(body.activeMandates, 1);
+    assert.equal(body.totalMandates, 2);
+    assert.equal(body.cancellations, 1);
+    assert.equal(body.totalCollected, "19800000");
+    assert.equal(body.totalCharges, 2);
+    // Two settled charges spread over two mandates.
+    assert.equal(body.averageChargesPerMandate, 1);
+  });
+
+  test("a plan with no mandates reports zero, not NaN", async () => {
+    const { body } = await statsGet("/api/plans/2/stats");
+    assert.equal(body.activeMandates, 0);
+    assert.equal(body.totalMandates, 0);
+    assert.equal(body.cancellations, 0);
+    assert.equal(body.totalCollected, "0");
+    assert.equal(body.totalCharges, 0);
+    assert.equal(body.averageChargesPerMandate, 0);
+  });
+
+  test("an unknown plan id is 404 and a malformed one is 400", async () => {
+    assert.equal((await statsGet("/api/plans/999/stats")).status, 404);
+    // A path segment that is not an id at all is a bad request, not a
+    // missing plan: the two mean different things to the caller.
+    const malformed = await statsGet("/api/plans/abc/stats");
+    assert.equal(malformed.status, 400);
+    assert.equal((malformed.body as { error: { code: string } }).error.code, "invalid_request");
+    const { body } = await statsGet("/api/plans/999/stats");
+    assert.equal((body as { error: { code: string } }).error.code, "plan_not_found");
   });
 });
 
@@ -828,20 +978,20 @@ describe("merchant revenue per token", () => {
 // stable: requests happen milliseconds later, far inside the tolerances used.
 const UP_NOW = Math.floor(Date.now() / 1000);
 
-const DUE_SUB = `GDUE${"A".repeat(52)}`;
-const FUTURE_SUB = `GFUT${"B".repeat(52)}`;
-const CAPPED_SUB = `GCAP${"C".repeat(52)}`;
-const SPENT_SUB = `GSPENT${"D".repeat(50)}`;
-const FAST_SUB = `GFAST${"E".repeat(51)}`;
-const MIXED_SUB = `GMIX${"F".repeat(52)}`;
+const DUE_SUB = testAddress(11);
+const FUTURE_SUB = testAddress(12);
+const CAPPED_SUB = testAddress(13);
+const SPENT_SUB = testAddress(14);
+const FAST_SUB = testAddress(15);
+const MIXED_SUB = testAddress(16);
 
-const M_DUE = `GMDUE${"M".repeat(51)}`;
-const M_FUTURE = `GMFUT${"M".repeat(51)}`;
-const M_CAPPED = `GMCAP${"M".repeat(51)}`;
-const M_SPENT = `GMSPENT${"M".repeat(49)}`;
-const M_FAST = `GMFAST${"M".repeat(50)}`;
-const M_WEEKLY = `GMWEEK${"M".repeat(50)}`;
-const M_DAILY = `GMDAIL${"M".repeat(50)}`;
+const M_DUE = testAddress(17);
+const M_FUTURE = testAddress(18);
+const M_CAPPED = testAddress(19);
+const M_SPENT = testAddress(20);
+const M_FAST = testAddress(21);
+const M_WEEKLY = testAddress(22);
+const M_DAILY = testAddress(23);
 
 interface UpcomingCharge {
   mandateId: number;
@@ -992,7 +1142,7 @@ describe("subscriber upcoming charges", () => {
     assert.equal(body.totalUpcoming, "45000000"); // 3_000_000 × 5 + 1_000_000 × 30
   });
 
-  test("days caps the window and malformed values fall back to 30", async () => {
+  test("days caps the window and a malformed value is refused", async () => {
     const one = await upGet(`/api/subscribers/${DUE_SUB}/upcoming?days=1`);
     assert.equal(one.body.days, 1);
     assert.equal(one.body.until, one.body.now + 86_400);
@@ -1003,12 +1153,14 @@ describe("subscriber upcoming charges", () => {
     assert.equal(long.body.days, 365);
     assert.equal(long.body.truncated, false);
 
+    // A malformed value is refused rather than quietly read as the default.
     const malformed = await upGet(`/api/subscribers/${DUE_SUB}/upcoming?days=nope`);
-    assert.equal(malformed.body.days, 30);
+    assert.equal(malformed.status, 400);
+    assert.equal((malformed.body as unknown as { error: { code: string } }).error.code, "invalid_request");
   });
 
   test("an unknown subscriber has nothing upcoming", async () => {
-    const { status, body } = await upGet("/api/subscribers/GNOBODY/upcoming");
+    const { status, body } = await upGet(`/api/subscribers/${UNKNOWN_MERCHANT}/upcoming`);
     assert.equal(status, 200);
     assert.deepEqual(body.upcoming, []);
     assert.equal(body.totalUpcoming, "0");
@@ -1215,3 +1367,432 @@ describe("multiple networks", () => {
   });
 });
 
+
+// Churn: the per-merchant report of starts and departures over time.
+//
+// The events are stamped with a ledger close time that straddles a month
+// boundary, so the buckets are the chain's calendar months and not the
+// indexer's wall clock. No network is touched.
+describe("merchant churn", () => {
+  const CHURN_MERCHANT = testAddress(24);
+  const CHURN_SUBSCRIBER = testAddress(25);
+  const churnDb = openDatabase(":memory:");
+  const churnIx = new Indexer(churnDb, {} as never, {} as never);
+  let churnServer: Server;
+  let churnBase: string;
+
+  /** 2025-01-31T23:59:59Z: the last second of January. */
+  const JAN_END = Math.floor(Date.UTC(2025, 0, 31, 23, 59, 59) / 1000);
+  /** 2025-02-01T00:00:00Z: the first second of February. */
+  const FEB_START = Math.floor(Date.UTC(2025, 1, 1, 0, 0, 0) / 1000);
+  /** 2025-02-15T12:00:00Z: mid-February. */
+  const FEB_MID = Math.floor(Date.UTC(2025, 1, 15, 12, 0, 0) / 1000);
+
+  const ev = (
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+    tx: string,
+    closeTime: number,
+  ): DecodedEvent => ({
+    name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime,
+  });
+
+  const churnGet = async (path: string) => {
+    const res = await fetch(churnBase + path);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  before(async () => {
+    churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
+      token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
+    }, "tx-plan", JAN_END));
+
+    // Mandate 1 starts in January and is cancelled in February.
+    churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }, "tx-sub-1", JAN_END));
+    churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
+
+    // Mandate 2 starts in February and is ended by the merchant, also in
+    // February.
+    churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }, "tx-sub-2", FEB_MID));
+    churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
+      subscriber: CHURN_SUBSCRIBER, charges_made: 1,
+    }, "tx-end-2", FEB_MID));
+
+    const app = createApp(churnDb, config);
+    await new Promise<void>((resolve) => {
+      churnServer = app.listen(0, () => {
+        const addr = churnServer.address();
+        churnBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    churnServer.close();
+    churnDb.close();
+  });
+
+  test("buckets are calendar months that split a month boundary", async () => {
+    const { status, body } = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    assert.equal(status, 200);
+    assert.equal(body.merchant, CHURN_MERCHANT);
+    assert.equal(body.bucket, "month");
+
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      buckets.map((b) => b.bucket),
+      ["2025-01", "2025-02"],
+      "the January start and the February cancel land in different buckets",
+    );
+
+    // January: one mandate started and none departed.
+    assert.equal(buckets[0]!.started, 1);
+    assert.equal(buckets[0]!.cancelled, 0);
+    assert.equal(buckets[0]!.ended, 0);
+    assert.equal(buckets[0]!.net, 1);
+
+    // February: one start, one cancellation and one merchant ending.
+    assert.equal(buckets[1]!.started, 1);
+    assert.equal(buckets[1]!.cancelled, 1);
+    assert.equal(buckets[1]!.ended, 1);
+    assert.equal(buckets[1]!.net, -1);
+  });
+
+  test("the totals sum every bucket", async () => {
+    const { body } = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    const totals = body.totals as unknown as Record<string, unknown>;
+    assert.equal(totals.started, 2);
+    assert.equal(totals.cancelled, 1);
+    assert.equal(totals.ended, 1);
+    assert.equal(totals.net, 0);
+  });
+
+  test("a day bucket splits the same events by day", async () => {
+    // The default window is the last 12 buckets, which is shorter than the
+    // span between the first and last event here, so ask for more.
+    const { body } = await churnGet(
+      `/api/merchants/${CHURN_MERCHANT}/churn?bucket=day&limit=30`,
+    );
+    assert.equal(body.bucket, "day");
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    // Every day in the range is present, so a chart has no gaps in it.
+    assert.equal(buckets.length, 16);
+    assert.equal(buckets[0]!.bucket, "2025-01-31");
+    assert.equal(buckets.at(-1)!.bucket, "2025-02-15");
+    // The start is on 31 January and the cancellation on 1 February.
+    assert.equal(buckets[0]!.started, 1);
+    assert.equal(buckets[0]!.cancelled, 0);
+    assert.equal(buckets[1]!.bucket, "2025-02-01");
+    assert.equal(buckets[1]!.cancelled, 1);
+    // The second mandate both starts and is ended by the merchant on the
+    // 15th.
+    assert.equal(buckets.at(-1)!.started, 1);
+    assert.equal(buckets.at(-1)!.ended, 1);
+  });
+
+  test("the report keeps the most recent buckets", async () => {
+    const { body } = await churnGet(
+      `/api/merchants/${CHURN_MERCHANT}/churn?bucket=day&limit=1`,
+    );
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      buckets.map((b) => b.bucket),
+      ["2025-02-15"],
+      "the last bucket is the most recent one",
+    );
+  });
+
+  test("a merchant with no events reports no buckets", async () => {
+    const { status, body } = await churnGet(`/api/merchants/${UNKNOWN_MERCHANT}/churn`);
+    assert.equal(status, 200);
+    assert.deepEqual(body.buckets, []);
+    assert.equal((body.totals as unknown as Record<string, unknown>).started, 0);
+  });
+
+  test("an unknown bucket size is refused", async () => {
+    // The bucket size decides the shape of the report, so a value the API
+    // does not know is a bad request rather than a silent month.
+    const { status, body } = await churnGet(
+      `/api/merchants/${CHURN_MERCHANT}/churn?bucket=fortnight`,
+    );
+    assert.equal(status, 400);
+    assert.equal((body.error as unknown as { code: string }).code, "invalid_request");
+  });
+
+  test("replaying the same events leaves the report unchanged", async () => {
+    const before = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    // Apply the same events again, as a crashed pass would.
+    churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }, "tx-sub-1", JAN_END));
+    churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
+    const after = await churnGet(`/api/merchants/${CHURN_MERCHANT}/churn?bucket=month`);
+    assert.deepEqual(after.body, before.body, "a replayed event does not move a count");
+  });
+});
+
+// Revenue over time: what a merchant took in, what the protocol took and
+// what was left, in calendar buckets.
+//
+// The charges are stamped with ledger close times that straddle a day
+// boundary, so the buckets are the chain's calendar and not the indexer's
+// wall clock. No network is touched.
+describe("merchant revenue", () => {
+  const REV_MERCHANT = testAddress(40);
+  const REV_SUBSCRIBER = testAddress(41);
+  const revDb = openDatabase(":memory:");
+  const revIx = new Indexer(revDb, {} as never, {} as never);
+  let revServer: Server;
+  let revBase: string;
+
+  /** 2025-03-10T12:00:00Z. */
+  const MAR_MID = Math.floor(Date.UTC(2025, 2, 10, 12, 0, 0) / 1000);
+  /** 2025-03-11T12:00:00Z: the next day, so a day bucket splits them. */
+  const MAR_NEXT = Math.floor(Date.UTC(2025, 2, 11, 12, 0, 0) / 1000);
+
+  const ev = (
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+    tx: string,
+    closeTime: number,
+  ): DecodedEvent => ({
+    name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime,
+  });
+
+  const revGet = async (path: string) => {
+    const res = await fetch(revBase + path);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  before(async () => {
+    revIx.apply(ev("plan_created", [REV_MERCHANT, 1n], {
+      token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
+    }, "tx-plan", MAR_MID));
+    revIx.apply(ev("subscribed", [1n, REV_SUBSCRIBER, REV_MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+    }, "tx-sub", MAR_MID));
+    // 9_900_000 + 100_000: the subscriber pays 10_000_000, the protocol keeps
+    // 100_000 and the merchant 9_900_000.
+    revIx.apply(ev("charged", [1n, REV_SUBSCRIBER, REV_MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "tx-charge-1", MAR_MID));
+    revIx.apply(ev("charged", [1n, REV_SUBSCRIBER, REV_MERCHANT], {
+      amount: 4_950_000n, fee: 50_000n, charges_made: 2n, next_charge: 4_000_000_000n,
+    }, "tx-charge-2", MAR_NEXT));
+
+    const app = createApp(revDb, config);
+    await new Promise<void>((resolve) => {
+      revServer = app.listen(0, () => {
+        const addr = revServer.address();
+        revBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    revServer.close();
+    revDb.close();
+  });
+
+  test("buckets are calendar days that split a day boundary", async () => {
+    const { status, body } = await revGet(`/api/merchants/${REV_MERCHANT}/revenue?bucket=day`);
+    assert.equal(status, 200);
+    assert.equal(body.merchant, REV_MERCHANT);
+    assert.equal(body.bucket, "day");
+
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      buckets.map((b) => b.bucket),
+      ["2025-03-10", "2025-03-11"],
+      "the two charges fall on either side of a day boundary",
+    );
+
+    // The first day: the subscriber paid 10_000_000, the protocol took
+    // 100_000 and the merchant kept 9_900_000.
+    assert.equal(buckets[0]!.gross, "10000000");
+    assert.equal(buckets[0]!.fee, "100000");
+    assert.equal(buckets[0]!.net, "9900000");
+    assert.equal(buckets[0]!.charges, 1);
+
+    assert.equal(buckets[1]!.gross, "5000000");
+    assert.equal(buckets[1]!.fee, "50000");
+    assert.equal(buckets[1]!.net, "4950000");
+
+    // Every amount is a string: no amount round-trips through a JS number.
+    for (const bucket of buckets) {
+      for (const field of ["gross", "fee", "net"]) {
+        assert.equal(typeof bucket[field], "string", `${field} is a string`);
+      }
+    }
+  });
+
+  test("the totals sum every bucket", async () => {
+    const { body } = await revGet(`/api/merchants/${REV_MERCHANT}/revenue?bucket=day`);
+    const totals = body.totals as unknown as Record<string, unknown>;
+    assert.equal(totals.gross, "15000000");
+    assert.equal(totals.fee, "150000");
+    assert.equal(totals.net, "14850000");
+    assert.equal(totals.charges, 2);
+  });
+
+  test("a week bucket puts both charges in one bucket", async () => {
+    const { body } = await revGet(`/api/merchants/${REV_MERCHANT}/revenue?bucket=week`);
+    assert.equal(body.bucket, "week");
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    assert.equal(buckets.length, 1);
+    // A week bucket is labelled with the Monday it starts on.
+    assert.equal(buckets[0]!.bucket, "2025-03-10");
+    assert.equal(buckets[0]!.gross, "15000000");
+  });
+
+  test("the range bounds are half-open", async () => {
+    // From the first charge up to (but not including) the second one: only
+    // the first is inside [from, to).
+    const { body } = await revGet(
+      `/api/merchants/${REV_MERCHANT}/revenue?bucket=day&from=${MAR_MID}&to=${MAR_NEXT}`,
+    );
+    const buckets = body.buckets as unknown as Array<Record<string, unknown>>;
+    assert.equal(buckets.length, 1);
+    assert.equal(buckets[0]!.gross, "10000000");
+  });
+
+  test("an empty range reports no buckets and no revenue", async () => {
+    const { status, body } = await revGet(
+      `/api/merchants/${REV_MERCHANT}/revenue?bucket=day&from=${MAR_NEXT + 1}&to=${MAR_NEXT + 86_400}`,
+    );
+    assert.equal(status, 200);
+    assert.deepEqual(body.buckets, []);
+    const totals = body.totals as unknown as Record<string, unknown>;
+    assert.equal(totals.gross, "0");
+    assert.equal(totals.fee, "0");
+    assert.equal(totals.net, "0");
+    assert.equal(totals.charges, 0);
+  });
+
+  test("a merchant with no charges reports no buckets", async () => {
+    const { status, body } = await revGet(`/api/merchants/${UNKNOWN_MERCHANT}/revenue`);
+    assert.equal(status, 200);
+    assert.deepEqual(body.buckets, []);
+  });
+
+  test("the report echoes the range it was asked for", async () => {
+    const { body } = await revGet(
+      `/api/merchants/${REV_MERCHANT}/revenue?bucket=day&from=${MAR_MID}&to=${MAR_NEXT + 86_400}`,
+    );
+    assert.equal(body.from, MAR_MID);
+    assert.equal(body.to, MAR_NEXT + 86_400);
+  });
+
+  test("the epoch is a valid bound and a negative one is not", async () => {
+    const fromEpoch = await revGet(
+      `/api/merchants/${REV_MERCHANT}/revenue?bucket=day&from=0&to=${MAR_NEXT + 86_400}`,
+    );
+    assert.equal(fromEpoch.status, 200);
+    assert.equal(fromEpoch.body.from, 0);
+
+    const negative = await revGet(
+      `/api/merchants/${REV_MERCHANT}/revenue?bucket=day&from=-1`,
+    );
+    assert.equal(negative.status, 400);
+    assert.equal(
+      (negative.body as unknown as { error: { code: string } }).error.code,
+      "invalid_request",
+    );
+  });
+
+  test("replaying the same charges leaves the report unchanged", async () => {
+    const before = await revGet(`/api/merchants/${REV_MERCHANT}/revenue?bucket=day`);
+    // The same ledger, applied again as a crashed pass would.
+    revIx.apply(ev("charged", [1n, REV_SUBSCRIBER, REV_MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
+    }, "tx-charge-1", MAR_MID));
+    const after = await revGet(`/api/merchants/${REV_MERCHANT}/revenue?bucket=day`);
+    assert.deepEqual(after.body, before.body, "a replayed charge does not move a figure");
+  });
+});
+
+// Request validation: a parameter the API does not accept is an error, not
+// an empty page.
+describe("request validation", () => {
+  const VALID_MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
+
+  test("a bad address is refused, with the details of what was wrong", async () => {
+    const { status, body } = await get("/api/merchants/not-an-address/summary");
+    assert.equal(status, 400);
+    const error = (body as unknown as {
+      error: { code: string; message: string; details: { path: string; message: string }[] };
+    }).error;
+    assert.equal(error.code, "invalid_request");
+    assert.equal(error.details[0]?.path, "address");
+    assert.match(error.details[0]?.message ?? "", /Stellar address/);
+  });
+
+  test("a mistyped address is refused even though it has the right shape", async () => {
+    // One character changed: the length and the prefix still look right, but
+    // the checksum does not, so this is a client bug and not a lookup that
+    // happens to find nothing.
+    const typo = `${VALID_MERCHANT.slice(0, -1)}X`;
+    const { status, body } = await get(`/api/merchants/${typo}/summary`);
+    assert.equal(status, 400);
+    assert.equal(
+      (body as unknown as { error: { code: string } }).error.code,
+      "invalid_request",
+    );
+  });
+
+  test("a bad status is refused", async () => {
+    const { status, body } = await get("/api/mandates?status=whatever");
+    assert.equal(status, 400);
+    const error = (body as unknown as {
+      error: { code: string; details: { path: string }[] };
+    }).error;
+    assert.equal(error.code, "invalid_request");
+    assert.equal(error.details[0]?.path, "status");
+  });
+
+  test("a non-numeric id is refused", async () => {
+    const { status, body } = await get("/api/mandates/abc");
+    assert.equal(status, 400);
+    const error = (body as unknown as {
+      error: { code: string; details: { path: string }[] };
+    }).error;
+    assert.equal(error.code, "invalid_request");
+    assert.equal(error.details[0]?.path, "id");
+  });
+
+  test("a malformed limit is refused", async () => {
+    const { status, body } = await get("/api/plans?limit=lots");
+    assert.equal(status, 400);
+    assert.equal(
+      (body as unknown as { error: { code: string } }).error.code,
+      "invalid_request",
+    );
+  });
+
+  test("valid requests behave exactly as before", async () => {
+    const plans = await get(`/api/plans?merchant=${VALID_MERCHANT}&limit=10`);
+    assert.equal(plans.status, 200);
+    assert.equal((plans.body.plans as unknown[]).length, 1);
+
+    const mandates = await get("/api/mandates?status=Active");
+    assert.equal(mandates.status, 200);
+    assert.equal((mandates.body.mandates as unknown[]).length, 4);
+
+    const mandate = await get("/api/mandates/1");
+    assert.equal(mandate.status, 200);
+    assert.equal(mandate.body.id, 1);
+
+    // An empty filter means "no filter", not "an empty filter".
+    const unfiltered = await get("/api/plans?merchant=&limit=10");
+    assert.equal(unfiltered.status, 200);
+    assert.equal((unfiltered.body.plans as unknown[]).length, 1);
+  });
+});

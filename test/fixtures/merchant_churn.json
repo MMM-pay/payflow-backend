@@ -1,0 +1,21 @@
+{
+  "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+  "bucket": "month",
+  "buckets": [
+    {
+      "bucket": "2025-06",
+      "started": 1,
+      "cancelled": 0,
+      "ended": 0,
+      "completed": 0,
+      "net": 1
+    }
+  ],
+  "totals": {
+    "started": 1,
+    "cancelled": 0,
+    "ended": 0,
+    "completed": 0,
+    "net": 1
+  }
+}

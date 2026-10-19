@@ -70,6 +70,24 @@ const schema = z.object({
    * new primary on SIGHUP without a restart.
    */
   KEEPER_SECRET_NEXT: optionalSecret,
+  /**
+   * Extra channel accounts, comma-separated. Each channel signs and sequences
+   * its own transactions (paying its own fees), so one pass can settle in
+   * parallel instead of one account at a time. `KEEPER_SECRET` stays the
+   * first channel, which keeps single-key setups unchanged. Duplicates of the
+   * primary/standby keys or of each other are dropped by the keeper.
+   */
+  KEEPER_CHANNEL_SECRETS: z
+    .string()
+    .default("")
+    .transform((raw) => raw.split(",").map((part) => part.trim()).filter(Boolean))
+    .pipe(
+      z.array(
+        z
+          .string()
+          .refine(StrKey.isValidEd25519SecretSeed, "must be a valid Stellar secret seed"),
+      ),
+    ),
   KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   /**
    * Which due mandate to settle first: `oldest` (due date ascending, the
@@ -115,7 +133,13 @@ const schema = z.object({
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),
-  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
+  // An empty value means "not set": the shipped .env.example leaves the
+  // variable blank, and a container that reads it must not refuse to start
+  // over a URL that is not there.
+  OTEL_EXPORTER_OTLP_ENDPOINT: z
+    .union([z.literal(""), z.string().url()])
+    .optional()
+    .transform((value) => (value === "" ? undefined : value)),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
 
   ADMIN_TOKEN: z.string().optional(),

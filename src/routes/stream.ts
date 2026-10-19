@@ -4,6 +4,7 @@ import type { Storage } from "../lib/store/types.ts";
 import { getMandateMerchant } from "../lib/queries.ts";
 import { num, type DecodedEvent } from "../lib/stellar.ts";
 import { sendApiError } from "./errors.ts";
+import { addressSchema, present, validate } from "./validate.ts";
 
 const HEARTBEAT_MS = 25_000;
 const MAX_STREAMS = 100;
@@ -40,15 +41,34 @@ export function streamRouter(
 
   router.get("/stream", (req, res) => {
     res.setHeader("Cache-Control", "no-store");
+    // The filters are checked before a stream slot is taken, so a malformed
+    // request is answered with an error rather than a stream that never
+    // carries anything.
+    const merchantFilter = validate(
+      req,
+      res,
+      "merchant",
+      addressSchema.optional(),
+      present(req.query.merchant),
+    );
+    if (!merchantFilter.ok) return;
+    const subscriberFilter = validate(
+      req,
+      res,
+      "subscriber",
+      addressSchema.optional(),
+      present(req.query.subscriber),
+    );
+    if (!subscriberFilter.ok) return;
+
     if (activeStreams >= maxStreams) {
       res.setHeader("Retry-After", "5");
       sendApiError(res, req, 503, "stream_limit");
       return;
     }
 
-    const merchantFilter = typeof req.query.merchant === "string" ? req.query.merchant : undefined;
-    const subscriberFilter =
-      typeof req.query.subscriber === "string" ? req.query.subscriber : undefined;
+    const merchant = merchantFilter.value;
+    const subscriber = subscriberFilter.value;
 
     activeStreams += 1;
     res.status(200);
@@ -62,8 +82,8 @@ export function streamRouter(
         if (!STREAM_EVENTS.has(event.name)) return;
         const addresses = await addressesOf(event, db);
         if (closed) return;
-        if (merchantFilter && merchantFilter !== addresses.merchant) return;
-        if (subscriberFilter && subscriberFilter !== addresses.subscriber) return;
+        if (merchant && merchant !== addresses.merchant) return;
+        if (subscriber && subscriber !== addresses.subscriber) return;
         const data = JSON.stringify(event, (_key, value: unknown) =>
           typeof value === "bigint" ? value.toString() : value,
         );

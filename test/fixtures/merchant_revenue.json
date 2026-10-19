@@ -1,0 +1,21 @@
+{
+  "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+  "bucket": "day",
+  "from": null,
+  "to": null,
+  "buckets": [
+    {
+      "bucket": "2025-06-15",
+      "gross": "10000000",
+      "fee": "100000",
+      "net": "9900000",
+      "charges": 1
+    }
+  ],
+  "totals": {
+    "gross": "10000000",
+    "fee": "100000",
+    "net": "9900000",
+    "charges": 1
+  }
+}

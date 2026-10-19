@@ -1,12 +1,24 @@
 import type { Storage } from "./store/types.ts";
+import {
+  BUCKET_SQL,
+  bucketLabel,
+  bucketStart,
+  nextBucketStart,
+} from "./churn.ts";
 import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "../routes/helpers.ts";
 import type {
   ChargeRow,
+  ChurnBucket,
+  ChurnBucketSize,
   DueMandateRow,
   ProtocolResponse,
   MandateRow,
+  MerchantChurnResponse,
+  MerchantRevenueResponse,
   MerchantSummary,
   PlanRow,
+  RevenueBucket,
+  RevenueBucketSize,
   StatsResponse,
   SubscriberSummary,
   TokenRevenue,
@@ -57,6 +69,64 @@ export async function listPlans(db: Storage, filter: ListPlansFilter): Promise<P
 /** Look up a single plan by on-chain id. */
 export async function getPlanById(db: Storage, id: number): Promise<PlanRow | undefined> {
   return db.get<PlanRow>("SELECT * FROM plans WHERE id = ?", [id]);
+}
+
+/** A plan's statistics, grouped from its mandates and their settled charges. */
+export interface PlanStatsAggregate {
+  planId: number;
+  activeMandates: number;
+  totalMandates: number;
+  cancellations: number;
+  totalCollected: bigint;
+  totalCharges: number;
+}
+
+/**
+ * Per-plan statistics: active and total mandates, cancellations, gross amount
+ * collected and the average number of settled charges per mandate.
+ *
+ * Starts from mandates so a plan with no settled charges still appears with a
+ * total collected of `0`. The collected sum reads as bigint, so no amount
+ * round-trips through a JavaScript number; replaying a ledger range is
+ * idempotent because charges are keyed on (tx_hash, mandate_id).
+ */
+export async function getPlanStats(
+  db: Storage,
+  planId: number,
+): Promise<PlanStatsAggregate> {
+  const [mandateCounts, revenue] = await Promise.all([
+    db.get<{
+      total_mandates: number;
+      active_mandates: number;
+      cancellations: number;
+    }>(
+      `SELECT COUNT(*) AS total_mandates,
+              SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) AS active_mandates,
+              SUM(CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END) AS cancellations
+         FROM mandates
+        WHERE plan_id = ?`,
+      [planId],
+    ),
+    db.get<{ total_collected: bigint; total_charges: bigint }>(
+      `SELECT COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total_collected,
+              COUNT(c.tx_hash) AS total_charges
+         FROM charges c
+         JOIN mandates m ON m.id = c.mandate_id
+        WHERE m.plan_id = ?`,
+      [planId],
+    ),
+  ]);
+
+  const total = Number(mandateCounts?.total_mandates ?? 0);
+  return {
+    planId,
+    activeMandates: Number(mandateCounts?.active_mandates ?? 0),
+    totalMandates: total,
+    cancellations: Number(mandateCounts?.cancellations ?? 0),
+    totalCollected: BigInt(revenue?.total_collected ?? 0),
+    // Charges settled is a count, never an amount; safe to coerce to a number.
+    totalCharges: Number(revenue?.total_charges ?? 0),
+  };
 }
 
 /**
@@ -313,6 +383,296 @@ export async function getSubscriberSummary(
     mandates,
     totalPaid: paid.reduce((total, charge) => total + BigInt(charge.amount) + BigInt(charge.fee), 0n).toString(),
   };
+}
+
+/** The lifecycle events a churn report counts, in report order. */
+export const CHURN_KINDS = ["started", "cancelled", "ended", "completed"] as const;
+
+export type ChurnKind = (typeof CHURN_KINDS)[number];
+
+function bucketSql(db: Storage, bucket: ChurnBucketSize): string {
+  if (db.dialect === "sqlite") return BUCKET_SQL[bucket];
+  if (bucket === "day") return "FLOOR(at / 86400.0)::BIGINT * 86400";
+  if (bucket === "week") return "345600 + FLOOR((at - 345600) / 604800.0)::BIGINT * 604800";
+  return "EXTRACT(EPOCH FROM DATE_TRUNC('month', TO_TIMESTAMP(at) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::BIGINT";
+}
+
+/**
+ * A merchant's churn report: how many mandates started and departed in each
+ * time bucket.
+ *
+ * The counts come from `mandate_events`, the append-only log the indexer
+ * writes one row per mandate per lifecycle event into. Each row is stamped
+ * with the ledger close time of its event, so a bucket is a property of the
+ * chain, not of when the indexer happened to run: replaying a ledger range
+ * leaves the report unchanged.
+ *
+ * One indexed scan groups the events by bucket and kind, so the report costs
+ * the same whether the merchant has ten mandates or ten thousand.
+ */
+export async function getMerchantChurn(
+  db: Storage,
+  merchant: string,
+  bucket: ChurnBucketSize,
+  limit: number,
+): Promise<MerchantChurnResponse> {
+  const rows = await db.all<{
+    kind: ChurnKind;
+    bucket: number;
+    n: number;
+  }>(
+      // The bucket expression is a vetted static fragment chosen by the
+      // bucket size, never request data; the address is a bound parameter,
+      // so no request data reaches the SQL text.
+      `SELECT kind, ${bucketSql(db, bucket)} AS bucket, COUNT(*) AS n
+         FROM mandate_events
+        WHERE merchant = ?
+        GROUP BY kind, bucket`,
+      [merchant],
+    );
+
+  const counts = new Map<number, Record<ChurnKind, number>>();
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    let entry = counts.get(row.bucket);
+    if (!entry) {
+      // Every kind starts at zero, so a bucket reports a kind it has no
+      // events for as an explicit zero rather than as a missing field.
+      entry = Object.fromEntries(CHURN_KINDS.map((k) => [k, 0])) as Record<ChurnKind, number>;
+      counts.set(row.bucket, entry);
+    }
+    entry[row.kind] = Number(row.n);
+    if (Number(row.bucket) < min) min = Number(row.bucket);
+    if (Number(row.bucket) > max) max = Number(row.bucket);
+  }
+
+  // Report the most recent buckets, oldest first within the window. The
+  // limit bounds the work the caller can ask for; the query itself is a
+  // single indexed scan either way.
+  const buckets: ChurnBucket[] = [];
+  if (counts.size > 0) {
+    const starts = bucketStarts(bucket, min, max);
+    const window = starts.slice(Math.max(0, starts.length - limit));
+    for (const start of window) {
+      const entry = counts.get(Math.floor(start.getTime() / 1000));
+      const started = entry?.started ?? 0;
+      const cancelled = entry?.cancelled ?? 0;
+      const ended = entry?.ended ?? 0;
+      const completed = entry?.completed ?? 0;
+      buckets.push({
+        bucket: bucketLabel(bucket, start),
+        started,
+        cancelled,
+        ended,
+        completed,
+        net: started - cancelled - ended - completed,
+      });
+    }
+  }
+
+  const totals = buckets.reduce(
+    (acc, b) => ({
+      started: acc.started + b.started,
+      cancelled: acc.cancelled + b.cancelled,
+      ended: acc.ended + b.ended,
+      completed: acc.completed + b.completed,
+      net: acc.net + b.net,
+    }),
+    { started: 0, cancelled: 0, ended: 0, completed: 0, net: 0 },
+  );
+
+  return { merchant, bucket, buckets, totals };
+}
+
+/** Every bucket start between two instants, oldest first. */
+function bucketStarts(
+  bucket: ChurnBucketSize,
+  from: number,
+  to: number,
+): Date[] {
+  const starts: Date[] = [];
+  let cursor = bucketStart(bucket, from);
+  const end = bucketStart(bucket, to);
+  // The guard bounds a pathological range; the caller already limits the
+  // number of buckets it keeps.
+  for (let i = 0; i < 10_000 && cursor.getTime() <= end.getTime(); i += 1) {
+    starts.push(cursor);
+    cursor = nextBucketStart(bucket, cursor);
+  }
+  return starts;
+}
+
+/**
+ * A merchant's revenue over time: what came in, what the protocol took and
+ * what the merchant kept, in calendar buckets.
+ *
+ * The buckets come from `charges.created_at`, which is the close time of the
+ * ledger each charge was emitted in — the chain's clock, not the indexer's —
+ * so the report describes the chain's own history and replaying a ledger
+ * range leaves it unchanged.
+ *
+ * `gross` is what the subscribers paid (the charge amount plus the fee),
+ * `fee` is the protocol's share of it and `net` is what the merchant kept,
+ * so gross − fee = net. Every sum is read as a bigint, so no amount
+ * round-trips through a JavaScript number.
+ *
+ * `from` and `to` bound the range in unix seconds; the range is half-open,
+ * so a charge exactly at `to` is excluded. Without them the report covers
+ * the merchant's whole history.
+ */
+export async function getMerchantRevenue(
+  db: Storage,
+  merchant: string,
+  bucket: RevenueBucketSize,
+  from: number | undefined,
+  to: number | undefined,
+  limit: number,
+): Promise<MerchantRevenueResponse> {
+  const where = ["merchant = ?"];
+  const args: unknown[] = [merchant];
+  if (from !== undefined) {
+    // `created_at` is unix milliseconds; the range is in seconds.
+    where.push("created_at >= ?");
+    args.push(from * 1000);
+  }
+  if (to !== undefined) {
+    where.push("created_at < ?");
+    args.push(to * 1000);
+  }
+
+  const rows = await db.all<{
+    bucket: number;
+    gross: bigint;
+    fee: bigint;
+    charges: number;
+  }>(
+    // The bucket expression is a vetted static fragment chosen by the
+    // bucket size and the predicates are fixed; the address and the range
+    // are bound parameters, so no request data reaches the SQL text.
+    `SELECT ${bucketSql(db, bucket)} AS bucket,
+            COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS gross,
+            COALESCE(SUM(CAST(fee AS INTEGER)), 0) AS fee,
+            COUNT(*) AS charges
+       FROM (
+         SELECT CAST(created_at / 1000 AS INTEGER) AS at, amount, fee
+           FROM charges
+          WHERE ${where.join(" AND ")}
+       )
+      GROUP BY bucket
+      ORDER BY bucket`,
+    args,
+  );
+
+  const perBucket = new Map<number, { gross: bigint; fee: bigint; charges: number }>();
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    // The statement reads integers as bigint, so the bucket start is one too:
+    // it is a timestamp, not an amount, and fits in a number.
+    const start = Number(row.bucket);
+    perBucket.set(start, {
+      gross: BigInt(row.gross),
+      fee: BigInt(row.fee),
+      // A count, never an amount; safe to coerce back to a number.
+      charges: Number(row.charges),
+    });
+    if (start < min) min = start;
+    if (start > max) max = start;
+  }
+
+  // Every bucket between the first and the last one with data is present, so
+  // a chart has no gaps in it. The limit keeps the most recent ones.
+  const buckets: RevenueBucket[] = [];
+  if (perBucket.size > 0) {
+    const starts = bucketStarts(bucket, min, max);
+    const window = starts.slice(Math.max(0, starts.length - limit));
+    for (const start of window) {
+      const entry = perBucket.get(Math.floor(start.getTime() / 1000));
+      const gross = entry?.gross ?? 0n;
+      const fee = entry?.fee ?? 0n;
+      buckets.push({
+        bucket: bucketLabel(bucket, start),
+        gross: String(gross),
+        fee: String(fee),
+        net: String(gross - fee),
+        charges: entry?.charges ?? 0,
+      });
+    }
+  }
+
+  const totals = buckets.reduce(
+    (acc, b) => ({
+      gross: acc.gross + BigInt(b.gross),
+      fee: acc.fee + BigInt(b.fee),
+      net: acc.net + BigInt(b.net),
+      charges: acc.charges + b.charges,
+    }),
+    { gross: 0n, fee: 0n, net: 0n, charges: 0 },
+  );
+
+  return {
+    merchant,
+    bucket,
+    from: from ?? null,
+    to: to ?? null,
+    buckets,
+    totals: {
+      gross: String(totals.gross),
+      fee: String(totals.fee),
+      net: String(totals.net),
+      charges: totals.charges,
+    },
+  };
+}
+
+/** A merchant's distinct subscriber, grouped across that subscriber's mandates with the merchant. */
+export interface MerchantSubscriberAggregate {
+  subscriber: string;
+  mandateCount: number;
+  chargeCount: number;
+  totalCollected: bigint;
+}
+
+/**
+ * A merchant's distinct subscribers, ordered by lifetime value descending.
+ *
+ * Starts from mandates so a subscriber with mandates but no settled charges
+ * still appears with a lifetime value of `0`. Every value is a bound
+ * parameter and the sum reads as bigint, so no amount round-trips through a
+ * JavaScript number.
+ */
+export async function listMerchantSubscribers(
+  db: Storage,
+  merchant: string,
+  limit: number,
+): Promise<MerchantSubscriberAggregate[]> {
+  const rows = await db.all<{
+    subscriber: string;
+    mandate_count: number;
+    charge_count: number;
+    total_collected: bigint;
+  }>(
+      // The address is a bound parameter, so no request data reaches the SQL text.
+      `SELECT m.subscriber AS subscriber,
+              COUNT(DISTINCT m.id) AS mandate_count,
+              COUNT(c.tx_hash) AS charge_count,
+              COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total_collected
+         FROM mandates m
+         LEFT JOIN charges c ON c.mandate_id = m.id AND c.merchant = m.merchant
+        WHERE m.merchant = ?
+        GROUP BY m.subscriber
+        ORDER BY total_collected DESC, m.subscriber
+        LIMIT ?`,
+      [merchant, limit],
+    );
+  return rows.map((row) => ({
+    // Counts are small; collected amounts remain bigint at base-unit scale.
+    subscriber: row.subscriber,
+    mandateCount: Number(row.mandate_count),
+    chargeCount: Number(row.charge_count),
+    totalCollected: BigInt(row.total_collected),
+  }));
 }
 
 /** Active positive-period mandates for a subscriber's upcoming schedule. */

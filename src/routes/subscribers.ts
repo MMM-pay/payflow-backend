@@ -4,6 +4,7 @@ import {
   getSubscriberSummary,
   listSubscriberUpcomingMandates,
 } from "../lib/queries.ts";
+import { addressSchema, daysSchema, present, validate } from "./validate.ts";
 import type { UpcomingCharge, UpcomingChargesResponse } from "./types.ts";
 
 const DAY_S = 86_400;
@@ -22,8 +23,10 @@ export function subscribersRouter(db: Storage): Router {
   const r = Router();
 
   r.get("/subscribers/:address/summary", async (req, res) => {
-    const address = String(req.params.address);
-    const body = await getSubscriberSummary(db, address);
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const body = await getSubscriberSummary(db, address.value);
     res.json(body);
   });
 
@@ -39,12 +42,17 @@ export function subscribersRouter(db: Storage): Router {
    * occurrences step by `period` while they stay inside `[now, until)`.
    */
   r.get("/subscribers/:address/upcoming", async (req, res) => {
-    const subscriber = String(req.params.address);
-    const days = daysOf(req.query.days);
-    const now = Math.floor(Date.now() / 1000);
-    const until = now + days * DAY_S;
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));
+    if (!days.ok) return;
 
+    const subscriber = address.value;
+    const window = daysOf(days.value);
+    const now = Math.floor(Date.now() / 1000);
+    const until = now + window * DAY_S;
     const mandates = await listSubscriberUpcomingMandates(db, subscriber);
+
 
     const upcoming: UpcomingCharge[] = [];
     let truncated = false;
@@ -73,7 +81,7 @@ export function subscribersRouter(db: Storage): Router {
 
     const body: UpcomingChargesResponse = {
       subscriber,
-      days,
+      days: window,
       now,
       until,
       upcoming,

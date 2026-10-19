@@ -7,9 +7,12 @@ import { Indexer } from "../src/indexer.ts";
 import { PayflowClient, PayflowApiError } from "../src/client/index.ts";
 import type { Config } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
+import { testAddress } from "./addresses.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
+/** A well-formed address the projection knows nothing about. */
+const UNKNOWN_MERCHANT = testAddress(30);
 
 const config = {
   STELLAR_NETWORK: "testnet",
@@ -39,14 +42,15 @@ before(async () => {
     topics: unknown[],
     data: Record<string, unknown>,
     tx = "t",
-  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+    closeTime: number | null = null,
+  ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime });
 
   await ix.apply(ev("plan_created", [MERCHANT, 1n], {
     token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Pro Monthly",
   }));
   await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n, fee_bps: 100,
-  }));
+  }, "t", 1_700_000_000));
   await ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
@@ -86,7 +90,7 @@ describe("typed api client", () => {
 
     const mine = await client.plans({ merchant: MERCHANT, limit: 10 });
     assert.equal(mine.plans.length, 1);
-    const none = await client.plans({ merchant: "GNOBODY" });
+    const none = await client.plans({ merchant: UNKNOWN_MERCHANT });
     assert.equal(none.plans.length, 0);
   });
 
@@ -96,6 +100,41 @@ describe("typed api client", () => {
     const mandate = await client.mandate(1);
     assert.equal(mandate.status, "Active");
     assert.equal(mandate.fee_bps, 100);
+  });
+
+  test("fetches per-plan statistics", async () => {
+    const stats = await client.planStats(1);
+    assert.equal(stats.planId, 1);
+    assert.equal(stats.activeMandates, 1);
+    assert.equal(stats.totalMandates, 1);
+    assert.equal(stats.cancellations, 0);
+    // Amounts stay strings end to end; the client never turns money into a float.
+    assert.equal(stats.totalCollected, "9900000");
+    assert.equal(stats.totalCharges, 1);
+    assert.equal(stats.averageChargesPerMandate, 1);
+  });
+
+  test("fetches the merchant churn report", async () => {
+    const churn = await client.merchantChurn(MERCHANT, { bucket: "month" });
+    assert.equal(churn.merchant, MERCHANT);
+    assert.equal(churn.bucket, "month");
+    assert.equal(churn.buckets.length, 1);
+    assert.equal(churn.buckets[0]?.started, 1);
+    assert.equal(churn.totals.started, 1);
+    assert.equal(churn.totals.net, 1);
+  });
+
+  test("fetches the merchant revenue report", async () => {
+    const revenue = await client.merchantRevenue(MERCHANT, { bucket: "day" });
+    assert.equal(revenue.merchant, MERCHANT);
+    assert.equal(revenue.bucket, "day");
+    assert.equal(revenue.buckets.length, 1);
+    // Amounts stay strings end to end; the client never turns money into a float.
+    assert.equal(revenue.buckets[0]?.gross, "10000000");
+    assert.equal(revenue.buckets[0]?.fee, "100000");
+    assert.equal(revenue.buckets[0]?.net, "9900000");
+    assert.equal(revenue.totals.gross, "10000000");
+    assert.equal(revenue.totals.charges, 1);
   });
 
   test("mandate list, charges and due pages", async () => {
@@ -125,6 +164,20 @@ describe("typed api client", () => {
 
     const subscriber = await client.subscriberSummary(SUBSCRIBER);
     assert.equal(subscriber.totalPaid, "10000000");
+
+    const merchantsSubs = await client.merchantSubscribers(MERCHANT);
+    assert.equal(merchantsSubs.merchant, MERCHANT);
+    assert.deepEqual(merchantsSubs.subscribers, [
+      {
+        subscriber: SUBSCRIBER,
+        mandateCount: 1,
+        chargeCount: 1,
+        totalCollected: "9900000",
+      },
+    ]);
+
+    const none = await client.merchantSubscribers(UNKNOWN_MERCHANT);
+    assert.deepEqual(none.subscribers, []);
 
     const stats = await client.stats();
     assert.equal(stats.plans, 1);

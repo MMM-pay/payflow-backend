@@ -67,7 +67,8 @@ const ev = (
   topics: unknown[],
   data: Record<string, unknown>,
   tx = "tx",
-): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data });
+  closeTime: number | null = null,
+): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime });
 
 const FIXTURES = new URL("./fixtures/", import.meta.url);
 const UPDATE = process.env.UPDATE_GOLDEN === "1";
@@ -86,6 +87,7 @@ const ROUTES: RouteSpec[] = [
   { file: "ready", method: "GET", path: "/ready", status: 200 },
   { file: "plans", method: "GET", path: "/api/plans", status: 200 },
   { file: "plan_by_id", method: "GET", path: `/api/plans/1`, status: 200 },
+  { file: "plan_stats", method: "GET", path: "/api/plans/1/stats", status: 200 },
   { file: "mandates", method: "GET", path: "/api/mandates", status: 200 },
   { file: "mandate_by_id", method: "GET", path: "/api/mandates/1", status: 200 },
   { file: "mandate_charges", method: "GET", path: "/api/mandates/1/charges", status: 200 },
@@ -95,6 +97,9 @@ const ROUTES: RouteSpec[] = [
   { file: "due", method: "GET", path: "/api/due", status: 200 },
   { file: "merchant_summary", method: "GET", path: `/api/merchants/${MERCHANT}/summary`, status: 200 },
   { file: "merchant_forecast", method: "GET", path: `/api/merchants/${MERCHANT}/forecast`, status: 200 },
+  { file: "merchant_subscribers", method: "GET", path: `/api/merchants/${MERCHANT}/subscribers`, status: 200 },
+  { file: "merchant_churn", method: "GET", path: `/api/merchants/${MERCHANT}/churn?bucket=month`, status: 200 },
+  { file: "merchant_revenue", method: "GET", path: `/api/merchants/${MERCHANT}/revenue?bucket=day`, status: 200 },
   { file: "subscriber_summary", method: "GET", path: `/api/subscribers/${SUBSCRIBER}/summary`, status: 200 },
   { file: "subscriber_upcoming", method: "GET", path: `/api/subscribers/${SUBSCRIBER}/upcoming`, status: 200 },
   { file: "stats", method: "GET", path: "/api/stats", status: 200 },
@@ -122,11 +127,11 @@ before(async () => {
   await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n,
     next_charge: BigInt(FIXED_NOW_S - 100),
-  }));
+  }, "tx", FIXED_NOW_S));
   await ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n,
     next_charge: BigInt(FIXED_NOW_S + 2_592_000),
-  }, "tx-charge-1"));
+  }, "tx-charge-1", FIXED_NOW_S));
   await ix.apply(ev("deposit", [SUBSCRIBER, "C"], { amount: 1_000_000n, balance: 1_000_000n }, "tx-vault"));
   await ix.apply(ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "tx-fee"));
 

@@ -69,7 +69,10 @@ if (keeper) {
       "keeper settles the default network only",
     );
   }
-  logger.info({ keeper: keeper.publicKey, network: defaultRuntime.network.name }, "keeper enabled");
+  logger.info(
+    { keeper: keeper.publicKey, channels: keeper.channelCount, network: defaultRuntime.network.name },
+    "keeper enabled",
+  );
 } else {
   logger.info("keeper disabled (KEEPER_ENABLED=false)");
 }

@@ -11,8 +11,8 @@ export function statsRouter(db: Storage): Router {
 
   r.get("/stats", async (_req, res) => {
     // Volume is gross: the merchant's net amount plus the protocol fee. The
-    // 24-hour window uses created_at, which is when the indexer saw the charge
-    // -- charges carry no event timestamp of their own.
+    // 24-hour window uses created_at, which is the close time of the ledger
+    // the charge was emitted in -- the chain's clock, not the indexer's.
     const since = Date.now() - DAY_MS;
     res.json(await getProtocolStats(db, since));
   });

@@ -95,6 +95,23 @@ export interface PlanPage {
   plans: PlanRow[];
 }
 
+/** Per-plan statistics for comparing plans at a glance. */
+export interface PlanStatsResponse {
+  planId: number;
+  /** Mandates with status `Active`. */
+  activeMandates: number;
+  /** All mandates for this plan, any status. */
+  totalMandates: number;
+  /** Mandates with status `Cancelled`. */
+  cancellations: number;
+  /** String sum of settled charge amounts, token's smallest unit. */
+  totalCollected: string;
+  /** Settled charges across all mandates of this plan. */
+  totalCharges: number;
+  /** Mean settled charges per mandate (plain division; 0 when no mandates). */
+  averageChargesPerMandate: number;
+}
+
 export interface MandatePage {
   mandates: MandateRow[];
 }
@@ -197,6 +214,93 @@ export interface SubscriberSummary {
   mandates: MandateRow[];
   /** String sum of amount + fee paid, token's smallest unit. */
   totalPaid: string;
+}
+
+/** One subscriber of a merchant, grouped across all of that subscriber's mandates with the merchant. */
+export interface MerchantSubscriber {
+  /** Subscriber address. */
+  subscriber: string;
+  /** Distinct mandates this subscriber holds with this merchant. */
+  mandateCount: number;
+  /** Charges settled from this subscriber to this merchant. */
+  chargeCount: number;
+  /** Lifetime value: gross amount collected from this subscriber, token's smallest unit. */
+  totalCollected: string;
+}
+
+export interface MerchantSubscribersResponse {
+  merchant: string;
+  /** Subscribers with at least one mandate, ordered by lifetime value descending. */
+  subscribers: MerchantSubscriber[];
+}
+
+/** The time buckets a churn report can be grouped by. */
+export type ChurnBucketSize = "day" | "week" | "month";
+
+/** One bucket of a merchant's churn report. */
+export interface ChurnBucket {
+  /**
+   * The bucket's label: `2025-01` for a month, `2025-01-15` for a day, and
+   * the Monday's date (`2025-01-13`) for a week. All in UTC.
+   */
+  bucket: string;
+  /** Mandates that started in the bucket. */
+  started: number;
+  /** Mandates the subscriber cancelled in the bucket. */
+  cancelled: number;
+  /** Mandates the merchant ended in the bucket. */
+  ended: number;
+  /** Mandates that completed their full charge count in the bucket. */
+  completed: number;
+  /** `started` minus the departures: the net growth of the mandate base. */
+  net: number;
+}
+
+export interface MerchantChurnResponse {
+  merchant: string;
+  /** The bucket size the report is grouped by. */
+  bucket: ChurnBucketSize;
+  /** The buckets, oldest first. */
+  buckets: ChurnBucket[];
+  /** The same counts summed over every bucket in the report. */
+  totals: Omit<ChurnBucket, "bucket">;
+}
+
+/**
+ * The time buckets a revenue report can be grouped by. The same calendar
+ * periods the churn report uses, so a chart can put both on one axis.
+ */
+export type RevenueBucketSize = ChurnBucketSize;
+
+/** One bucket of a merchant's revenue report. */
+export interface RevenueBucket {
+  /**
+   * The bucket's label: `2025-01-15` for a day, the Monday's date
+   * (`2025-01-13`) for a week, and `2025-01` for a month. All in UTC.
+   */
+  bucket: string;
+  /** Gross collected from subscribers: the charge amount plus the fee. */
+  gross: string;
+  /** The protocol's share of that gross. */
+  fee: string;
+  /** What the merchant kept: gross minus the fee. */
+  net: string;
+  /** Charges settled in the bucket. */
+  charges: number;
+}
+
+export interface MerchantRevenueResponse {
+  merchant: string;
+  /** The bucket size the report is grouped by. */
+  bucket: RevenueBucketSize;
+  /** Start of the requested range in unix seconds; null when unbounded. */
+  from: number | null;
+  /** End of the requested range in unix seconds (exclusive); null when unbounded. */
+  to: number | null;
+  /** The buckets, oldest first. */
+  buckets: RevenueBucket[];
+  /** The same figures summed over every bucket in the report. */
+  totals: Omit<RevenueBucket, "bucket">;
 }
 
 export interface UpcomingCharge {

@@ -1,10 +1,11 @@
 import { Router } from "express";
 import type { Storage } from "../lib/store/types.ts";
-import { getPlanById, listPlans } from "../lib/queries.ts";
+import { getPlanById, getPlanStats, listPlans } from "../lib/queries.ts";
 import type { TokenMetadataService } from "../lib/tokens.ts";
 import { limitOf, tokenFields } from "./helpers.ts";
 import { sendApiError } from "./errors.ts";
-import type { PlanPage } from "./types.ts";
+import { addressSchema, idSchema, limitSchema, present, validate } from "./validate.ts";
+import type { PlanPage, PlanStatsResponse } from "./types.ts";
 
 /**
  * `GET /plans` and `GET /plans/:id`.
@@ -18,24 +19,64 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
   const r = Router();
 
   r.get("/plans", async (req, res) => {
-    const { merchant } = req.query;
+    const merchant = validate(
+      req,
+      res,
+      "merchant",
+      addressSchema.optional(),
+      present(req.query.merchant),
+    );
+    if (!merchant.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
     const plans = await Promise.all(
-      (await listPlans(db, {
-        merchant: merchant ? String(merchant) : undefined,
-        limit: limitOf(req.query.limit),
-      })).map(async (row) => ({ ...row, ...(await tokenFields(tokens, row.token)) })),
+  (await listPlans(db, {
+        merchant: merchant.value,
+        limit: limitOf(limit.value),
+  })).map(async (row) => ({ ...row, ...(await tokenFields(tokens, row.token)) })),
     );
     const body: PlanPage = { plans };
     res.json(body);
   });
 
   r.get("/plans/:id", async (req, res) => {
-    const row = await getPlanById(db, Number(req.params.id));
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+
+  const row = await getPlanById(db, id.value);
     if (!row) {
       sendApiError(res, req, 404, "plan_not_found");
       return;
     }
-    res.json({ ...row, ...(await tokenFields(tokens, row.token)) });
+    const tokenId = row.token;
+    res.json({ ...row, ...(await tokenFields(tokens, tokenId)) });
+  });
+
+  /** `GET /plans/:id/stats`: active and total mandates, cancellations, gross
+   * collected, and average charges per mandate. */
+  r.get("/plans/:id/stats", async (req, res) => {
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+    const planId = id.value;
+
+    if (!(await getPlanById(db, planId))) {
+      sendApiError(res, req, 404, "plan_not_found");
+      return;
+    }
+    const stats = await getPlanStats(db, planId);
+    const body: PlanStatsResponse = {
+      planId,
+      activeMandates: stats.activeMandates,
+      totalMandates: stats.totalMandates,
+      cancellations: stats.cancellations,
+      totalCollected: String(stats.totalCollected),
+      totalCharges: stats.totalCharges,
+      // A plan with no mandates has no average; report 0 rather than NaN.
+      averageChargesPerMandate:
+        stats.totalMandates === 0 ? 0 : stats.totalCharges / stats.totalMandates,
+    };
+    res.json(body);
   });
 
   return r;

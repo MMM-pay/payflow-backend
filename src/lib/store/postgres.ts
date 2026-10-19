@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS charges (
   PRIMARY KEY (tx_hash, mandate_id)
 );
 CREATE INDEX IF NOT EXISTS charges_merchant ON charges(merchant);
+CREATE INDEX IF NOT EXISTS charges_merchant_created_at ON charges(merchant, created_at);
 CREATE INDEX IF NOT EXISTS charges_subscriber ON charges(subscriber);
 CREATE INDEX IF NOT EXISTS charges_mandate ON charges(mandate_id);
 CREATE INDEX IF NOT EXISTS charges_merchant_amount ON charges(merchant, amount);
@@ -78,6 +79,16 @@ CREATE TABLE IF NOT EXISTS fee_history (
   ledger BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS fee_history_ledger ON fee_history(ledger DESC);
+CREATE TABLE IF NOT EXISTS mandate_events (
+  mandate_id BIGINT NOT NULL,
+  slot TEXT NOT NULL,
+  merchant TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  at BIGINT NOT NULL,
+  ledger BIGINT NOT NULL,
+  PRIMARY KEY (mandate_id, slot)
+);
+CREATE INDEX IF NOT EXISTS mandate_events_merchant ON mandate_events(merchant, kind, at);
 `;
 
 const schemaName = /^[a-z_][a-z0-9_]*$/;
@@ -113,6 +124,7 @@ function sqlFor(sql: string): string {
 }
 
 class PgExecutor implements Storage {
+  readonly dialect = "postgres" as const;
   private readonly client: Pool | PoolClient;
 
   constructor(client: Pool | PoolClient) {

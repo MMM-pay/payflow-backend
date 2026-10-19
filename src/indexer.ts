@@ -1,5 +1,4 @@
 import { EventEmitter } from "node:events";
-import type { DatabaseSync } from "node:sqlite";
 import { rpc } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
 
@@ -10,6 +9,7 @@ import {
   big,
   decodeEvent,
   num,
+  parseCloseTime,
   specProblems,
   str,
   type DecodedEvent,
@@ -17,22 +17,7 @@ import {
 import { logger } from "./lib/logger.ts";
 import { defaultMerchantSummaryCache, type MerchantSummaryCache } from "./routes/index.ts";
 
-/** Helper to parse a ledger close time into unix epoch seconds. */
-export function parseCloseTime(raw: unknown): number | null {
-  if (raw === undefined || raw === null) return null;
-  if (typeof raw === "number") {
-    return raw > 1e11 ? Math.floor(raw / 1000) : raw;
-  }
-  if (typeof raw === "string") {
-    const asNum = Number(raw);
-    if (!Number.isNaN(asNum) && asNum > 0) {
-      return asNum > 1e11 ? Math.floor(asNum / 1000) : asNum;
-    }
-    const parsed = Date.parse(raw);
-    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
-  }
-  return null;
-}
+export { parseCloseTime };
 
 /** RPC caps a single getEvents window; stay well inside it. */
 const LEDGER_WINDOW = 8_000;
@@ -133,7 +118,7 @@ export class Indexer {
   }
 
   constructor(
-    db: Storage | DatabaseSync,
+    db: Storage | import("node:sqlite").DatabaseSync,
     server: IndexerRpc,
     config: IndexerConfig,
     merchantCache: MerchantSummaryCache = defaultMerchantSummaryCache,
@@ -399,6 +384,7 @@ export class Indexer {
         return "applied";
       case "subscribed":
         await this.onSubscribed(e, storage);
+        await this.recordChurn(e, "started", str(e.topics[2]), storage);
         this.notify(e, notifications);
         return "applied";
       case "charged":
@@ -406,16 +392,24 @@ export class Indexer {
         this.notify(e, notifications);
         return "applied";
       case "cancelled":
-        await this.onStatus(e, "Cancelled", "subscriber", storage);
-        this.notify(e, notifications);
-        return "applied";
-      case "mandate_ended":
-        await this.onStatus(e, "Cancelled", "merchant", storage);
+        {
+          const merchant = await this.onStatus(e, "Cancelled", "subscriber", storage);
+          await this.recordChurn(e, "cancelled", merchant, storage);
+          this.notify(e, notifications);
+          return "applied";
+        }
+      case "mandate_ended": {
+        const merchant = await this.onStatus(e, "Cancelled", "merchant", storage) ?? str(e.topics[1]);
+        await this.recordChurn(e, "ended", merchant, storage);
         this.events.emit("applied", e);
         return "applied";
-      case "mandate_completed":
-        await this.onStatus(e, "Completed", null, storage);
+      }
+      case "mandate_completed": {
+        const merchant = await this.onStatus(e, "Completed", null, storage);
+        await this.recordChurn(e, "completed", merchant, storage);
+        this.notify(e, notifications);
         return "applied";
+      }
       case "pause_changed":
         await this.onPauseChanged(e, storage);
         return "applied";
@@ -493,6 +487,19 @@ export class Indexer {
     );
   }
 
+  /** The ledger close time is stable across replays; wall time is only a fallback. */
+  private chargedAt(e: DecodedEvent): number {
+    const closeTime = e.closeTime;
+    if (closeTime === undefined || closeTime === null) {
+      logger.warn(
+        { txHash: e.txHash, ledger: e.ledger },
+        "charge has no ledger close time; stamped with the indexer's clock instead",
+      );
+      return Date.now();
+    }
+    return closeTime * 1000;
+  }
+
   private async onCharged(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId, subscriber, merchant] = e.topics;
     const id = num(mandateId);
@@ -514,7 +521,7 @@ export class Indexer {
         num(e.data.charges_made),
         num(e.data.next_charge),
         e.ledger,
-        Date.now(),
+        this.chargedAt(e),
       ],
     );
 
@@ -544,7 +551,7 @@ export class Indexer {
     status: string,
     endedBy: string | null,
     storage: Storage,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
     const row = await storage.get<{ merchant: string }>(
@@ -552,11 +559,48 @@ export class Indexer {
       [mid],
     );
     if (row) this.merchantCache.invalidate(row.merchant);
-    await storage.run("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?", [
-      status,
-      endedBy,
-      mid,
-    ]);
+    await storage.run("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?", [status, endedBy, mid]);
+    return row?.merchant;
+  }
+
+  /**
+   * Record a mandate lifecycle event in the churn log.
+   *
+   * The row is keyed on (mandate_id, slot) and written with INSERT OR IGNORE,
+   * so replaying a ledger range leaves the log unchanged. `at` is the
+   * ledger's close time, so an event lands in the same bucket however many
+   * times it is applied.
+   *
+   * `slot` is 'start' or 'departure': a mandate has one start and at most one
+   * departure, so a mandate that is both started and cancelled contributes to
+   * both counts but can never be counted as leaving twice.
+   */
+  private async recordChurn(
+    e: DecodedEvent,
+    kind: "started" | "cancelled" | "ended" | "completed",
+    merchant: string | undefined,
+    storage: Storage,
+  ): Promise<void> {
+    // Without a merchant there is nobody to attribute the event to, and
+    // without a close time there is no bucket to file it under. Either way
+    // the projection itself is already written, so the event is skipped
+    // rather than guessed at.
+    if (!merchant) return;
+    const at = e.closeTime;
+    if (at === undefined || at === null) return;
+    const [mandateId] = e.topics;
+    await storage.run(
+      `INSERT OR IGNORE INTO mandate_events (mandate_id, slot, merchant, kind, at, ledger)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        num(mandateId),
+        kind === "started" ? "start" : "departure",
+        merchant,
+        kind,
+        at,
+        e.ledger,
+      ],
+    );
   }
 
   private async onPauseChanged(e: DecodedEvent, storage: Storage): Promise<void> {

@@ -47,6 +47,9 @@ replays that range on restart. Every write is designed for that:
 - `plans` and `mandates` are upserts keyed on the on-chain id.
 - `charges` is keyed on `(tx_hash, mandate_id)`, so a replayed ledger cannot
   double-count revenue.
+- A charge is stamped with the **close time of the ledger it was emitted
+  in**, not with the moment the indexer saw it, so a backfill or a restart
+  cannot collapse a merchant's history onto one instant.
 - Mandate updates are guarded by `WHERE charges_made < ?`, so an out-of-order
   event can never move a mandate backwards.
 
@@ -70,6 +73,27 @@ Run one settlement pass and exit (needs `KEEPER_SECRET`):
 ```bash
 npm run keeper
 ```
+
+### Running it in Docker
+
+The image carries the service, its dependencies and the Node runtime it needs
+(`node:sqlite` wants Node 22.5 or newer), so a checkout and a `.env` are all
+it takes:
+
+```bash
+cp .env.example .env      # the same file the compose file reads
+docker compose up         # builds the image and serves the API on :8080
+docker compose logs -f api
+```
+
+The projection lives in the named volume `payflow-data`, so the container can
+be recreated without losing the indexer's cursor — it picks up where it left
+off instead of replaying the chain. `docker compose down` removes the
+container and keeps the data; `docker compose down -v` removes the data too.
+
+The image runs `node dist/index.js` as the unprivileged `node` user, and
+[`Dockerfile`](Dockerfile) builds it in two stages: `npm ci && npm run build`
+in the builder, production dependencies only in the final image.
 
 ### How the loops behave
 
@@ -132,6 +156,32 @@ longer does:
 
 Secrets are never logged; rotation logs only public keys.
 
+### Settling in parallel with channel accounts
+
+A single account can only have one transaction in flight — the next `charge`
+has to wait for the previous one's sequence number — so one key settles a few
+charges per minute and large merchants get billed hours late. List extra
+signing accounts in `KEEPER_CHANNEL_SECRETS` (comma-separated `S...` keys) and
+one pass distributes the due mandates across them:
+
+- Each channel signs and sequences **its own** transactions and pays its own
+  fees, so sequence numbers live on separate accounts and cannot collide.
+  Channel keys need only XLM for fees: `charge` is permissionless, so no
+  channel key holds user funds or any on-chain authority.
+- Due mandates are pulled from one shared queue by one worker per channel —
+  strictly one transaction at a time *within* a channel, several channels in
+  parallel. With a single channel the pass is exactly the old sequential
+  behaviour, and `KEEPER_SECRET` is always the first channel.
+- Before distributing, each channel's account is checked with one `getAccount`.
+  A channel that cannot pay (unfunded, deleted) is skipped for the pass —
+  logged by public key — and its share settles through the live channels
+  instead of backing off against a dead key. `KEEPER_SECRET_NEXT` rotation
+  still applies to the primary channel, before and during the pass.
+
+A fee-bump design (main key pays every fee) was deliberately rejected: a
+Stellar fee-bump consumes the *fee source's* sequence number, so every
+transaction would sequence against the one main account and serialize again.
+
 ## API
 
 Base path `/api`. All amounts are strings in the token's smallest unit
@@ -154,6 +204,7 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
+| `GET` | `/api/plans/:id/stats` | Per-plan statistics: active and total mandates, cancellations, total collected, average charges per mandate |
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
 | `GET` | `/api/mandates/:id` | One mandate |
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
@@ -164,6 +215,9 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/keeper` | Last 20 keeper passes, failures and mandate backoff (only when enabled) |
 | `GET` | `/api/due` | Mandates chargeable right now |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
+| `GET` | `/api/merchants/:address/subscribers?limit=` | The merchant's distinct subscribers, grouped by lifetime value |
+| `GET` | `/api/merchants/:address/churn?bucket=month&limit=` | Per-bucket churn: mandates started, cancelled, ended and completed, and the net |
+| `GET` | `/api/merchants/:address/revenue?bucket=day&from=&to=` | Revenue over time: gross, fee and net per bucket |
 | `GET` | `/api/merchants/:address/forecast?days=30` | Projected charges over the next N days, net of fees |
 | `GET` | `/api/subscribers/:address/summary` | Mandates and total paid |
 | `GET` | `/api/subscribers/:address/upcoming?days=30` | Charges due over the next N days, with projected times |
@@ -173,6 +227,92 @@ When extra networks are configured (see below), every route also answers under
 mandate ids (`?ids=1,2,3`). Ids that do not exist are omitted; more than 100
 ids returns `400` with `error.code = "too_many_ids"` and a non-numeric id
 returns `400` with `error.code = "invalid_ids"`.
+
+Every address the API takes is checked as a Stellar StrKey — an account
+(`G...`) or a contract (`C...`) — so a mistyped address is a `400
+invalid_request` rather than an empty page. The checksum is checked too: a
+one-character typo has the right shape but the wrong checksum, and it names
+no merchant.
+
+### Merchant churn
+
+`GET /api/merchants/:address/churn` reports how a merchant's mandate base
+moved over time: how many mandates started, how many departed (cancelled by
+the subscriber, ended by the merchant, or completed their full charge count),
+and the net of the two.
+
+```json
+{
+  "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+  "bucket": "month",
+  "buckets": [
+    {
+      "bucket": "2025-01",
+      "started": 3,
+      "cancelled": 1,
+      "ended": 0,
+      "completed": 2,
+      "net": 0
+    }
+  ],
+  "totals": { "started": 3, "cancelled": 1, "ended": 0, "completed": 2, "net": 0 }
+}
+```
+
+- `bucket` picks the period: `day`, `week` or `month` (the default). Buckets
+  are calendar periods in UTC — a month bucket is labelled `2025-01`, a day
+  bucket `2025-01-15`, and a week bucket carries the Monday's date.
+- `limit` caps how many of the most recent buckets are reported (12 by
+  default, 120 at most). Every bucket in the range is present, so a chart has
+  no gaps in it.
+- `net` is `started` minus the departures, i.e. the growth of the mandate
+  base in that bucket.
+
+The counts are bucketed by the **ledger close time** of each event, so they
+describe the chain's own history rather than when the indexer happened to
+index it. Replaying a ledger range therefore leaves the report unchanged.
+
+### Merchant revenue
+
+`GET /api/merchants/:address/revenue` reports what a merchant took in, what
+the protocol took and what was left, over time — the time series behind the
+lifetime totals of `/summary`.
+
+```json
+{
+  "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+  "bucket": "day",
+  "from": null,
+  "to": null,
+  "buckets": [
+    {
+      "bucket": "2025-01-15",
+      "gross": "10000000",
+      "fee": "100000",
+      "net": "9900000",
+      "charges": 1
+    }
+  ],
+  "totals": { "gross": "10000000", "fee": "100000", "net": "9900000", "charges": 1 }
+}
+```
+
+- `bucket` picks the period: `day`, `week` or `month` (the default). Buckets
+  are calendar periods in UTC, labelled like the churn report's.
+- `from` and `to` bound the range in unix seconds, half-open: a charge
+  exactly at `to` is excluded. Without them the report covers the merchant's
+  whole history, and the response echoes the range it was given (`null` when
+  it was unbounded).
+- `limit` caps how many of the most recent buckets are reported (366 by
+  default, 1000 at most). Every bucket between the first and the last one
+  with data is present, so a chart has no gaps in it.
+- `gross` is what the subscribers paid (the charge amount plus the fee),
+  `fee` is the protocol's share of it and `net` is what the merchant kept,
+  so `gross − fee = net`. All three are decimal strings in the token's
+  smallest unit, like every other amount in this API.
+- The buckets are taken from the **ledger close time** of each charge, not
+  from when the indexer saw it, so the report is the chain's own history and
+  replaying a ledger range leaves it unchanged.
 
 ### Error responses
 
@@ -195,17 +335,27 @@ a stable `code` and show the human-readable `message` without parsing prose:
   SQL value, or an RPC URL — `internal_error` always uses fixed copy.
 - `requestId` echoes the response's `X-Request-Id` header so a report can be
   tied to the matching server log line. It is `null` only if no id was minted.
+- `details` is present for `invalid_request` only: one entry per parameter
+  that was wrong, naming it and saying what was expected.
 
 > **Migration note.** This envelope replaces the earlier `{ "error": "<code>" }`
 > string body. Consumers that read the error must now read `error.code`.
 
+> **Migration note (parameters).** A parameter the API does not accept is now
+> answered with `400 invalid_request` instead of being ignored: a mistyped
+> address, an unknown `status`, a non-numeric id, a malformed `limit`, `days`
+> or `bucket`. Before, those were cast and quietly matched nothing, so a
+> client bug looked like an empty page. Valid requests are unaffected; an
+> empty value (`?merchant=`) still means "no filter".
+
 | `error.code` | HTTP | Where |
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
-| `plan_not_found` | 404 | `GET /api/plans/:id` with no such plan |
+| `plan_not_found` | 404 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` with no such plan |
 | `mandate_not_found` | 404 | `GET /api/mandates/:id` with no such mandate |
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
 | `too_many_ids` | 400 | `?ids=` lists more than 100 ids |
+| `invalid_request` | 400 | A query or path parameter is not valid; `error.details` says which |
 | `invalid_token_id` | 400 | `GET /api/tokens/:id` with a malformed contract id |
 | `token_metadata_unavailable` | 502 | `GET /api/tokens/:id` while the token contract cannot be read |
 | `rate_limited` | 429 | API request exceeded the configured per-IP limit; includes `Retry-After` |
@@ -361,6 +511,7 @@ examined without API downtime.
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
 | `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
+| `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
 | `KEEPER_FEE_PERCENTILE` | `90` | Soroban inclusion-fee percentile used for charge transactions (`50`, `60`, `70`, `80`, `90`, `95`, or `99`) |
@@ -478,6 +629,10 @@ Pushing a `v*` tag publishes `ghcr.io/mmm-pay/payflow-backend:<version>` via
 docker run --env-file .env -v payflow_data:/data ghcr.io/mmm-pay/payflow-backend:0.2.0
 ```
 
+For local work, [`docker-compose.yml`](docker-compose.yml) runs the same
+image with `.env` and a named volume (see [Running it in
+Docker](#running-it-in-docker)).
+
 ## Related repositories
 
 | Repo | Role |
@@ -490,8 +645,9 @@ docker run --env-file .env -v payflow_data:/data ghcr.io/mmm-pay/payflow-backend
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `lint`, `typecheck`, `test`,
-`build` and a production `audit`; all five must pass, and Dependabot keeps
-dependencies current. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+`build`, a container build and a production `audit`; all six must pass, and
+Dependabot keeps dependencies current. Changes are recorded in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Security
 

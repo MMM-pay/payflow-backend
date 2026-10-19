@@ -1,0 +1,30 @@
+# Local development with Docker.
+#
+#   cp .env.example .env    # the file already points at the testnet contracts
+#   docker compose up       # builds the image and runs the API on :8080
+#   docker compose logs -f api
+#
+# The projection lives in a named volume, so the container can be recreated
+# without losing the indexer's cursor: the indexer picks up where it left off
+# instead of replaying the whole chain.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: payflow-backend:local
+    # The service reads its configuration from the environment; .env holds it.
+    env_file:
+      - .env
+    environment:
+      # The database is on the volume, not in the image.
+      DATABASE_PATH: /data/payflow.db
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - payflow-data:/data
+    restart: unless-stopped
+
+volumes:
+  payflow-data:

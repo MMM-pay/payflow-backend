@@ -16,7 +16,12 @@ const keyA = Keypair.random();
 const keyB = Keypair.random();
 
 function keeperConfig(
-  secrets: { KEEPER_SECRET?: string; KEEPER_SECRET_NEXT?: string },
+  secrets: {
+    KEEPER_SECRET?: string;
+    KEEPER_SECRET_NEXT?: string;
+    /** Post-loadConfig shape: the schema splits KEEPER_CHANNEL_SECRETS on commas. */
+    KEEPER_CHANNEL_SECRETS?: string[];
+  },
   order?: "oldest" | "largest",
   fees: { KEEPER_FEE_PERCENTILE?: string; KEEPER_MAX_FEE?: string } = {},
 ): Config {
@@ -222,6 +227,214 @@ describe("keeper key rotation", () => {
     };
     const config = loadConfig(env as NodeJS.ProcessEnv);
     assert.equal(config.KEEPER_SECRET_NEXT, keyB.secret());
+  });
+});
+
+/** Collect logger.warn messages while running `fn`. */
+async function captureWarnLog(fn: () => Promise<void>): Promise<string[]> {
+  const messages: string[] = [];
+  const original = logger.warn;
+  (logger as { warn: unknown }).warn = function (this: unknown, ...args: unknown[]) {
+    messages.push(typeof args[1] === "string" ? args[1] : String(args[0]));
+    return (original as (this: unknown, ...a: unknown[]) => void).apply(this, args);
+  };
+  try {
+    await fn();
+  } finally {
+    (logger as { warn: unknown }).warn = original;
+  }
+  return messages;
+}
+
+describe("keeper channel accounts", () => {
+  /**
+   * A fake node that models account sequence numbers the way the real one
+   * does: `getAccount` reports the last consumed sequence, `sendTransaction`
+   * accepts only `last + 1` for the submitting account — anything else is
+   * recorded as a collision — and accepting consumes the sequence.
+   * `getTransaction` resolves after `confirmMs`, so channels that submit
+   * inside the same window are in flight together; `state.maxInFlight`
+   * records the peak.
+   */
+  function sequencingRpc(
+    funded: Set<string>,
+    state: {
+      collisions: string[];
+      submitted: { source: string; sequence: string }[];
+      maxInFlight: number;
+    },
+    confirmMs = 50,
+  ): KeeperRpc {
+    const consumed = new Map<string, bigint>();
+    let inFlight = 0;
+    return {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
+      getAccount: async (address: string) => {
+        if (!funded.has(address)) {
+          throw new Error(`The source account ${address} was not found`);
+        }
+        return new Account(address, (consumed.get(address) ?? 0n).toString()) as never;
+      },
+      prepareTransaction: async (tx) => tx,
+      sendTransaction: async (tx) => {
+        const t = tx as Transaction;
+        const expected = (consumed.get(t.source) ?? 0n) + 1n;
+        state.submitted.push({ source: t.source, sequence: t.sequence });
+        if (BigInt(t.sequence) !== expected) {
+          state.collisions.push(
+            `${t.source} submitted sequence ${t.sequence}, expected ${expected}`,
+          );
+        }
+        consumed.set(t.source, BigInt(t.sequence));
+        inFlight += 1;
+        if (inFlight > state.maxInFlight) state.maxInFlight = inFlight;
+        return { status: "PENDING", hash: Buffer.from(t.hash()).toString("hex") } as never;
+      },
+      getTransaction: async () => {
+        await new Promise((resolve) => setTimeout(resolve, confirmMs));
+        inFlight -= 1;
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS } as never;
+      },
+    };
+  }
+
+  function channelState(): {
+    collisions: string[];
+    submitted: { source: string; sequence: string }[];
+    maxInFlight: number;
+  } {
+    return { collisions: [], submitted: [], maxInFlight: 0 };
+  }
+
+  test("three channels settle in parallel with no sequence-number collisions", async () => {
+    const db = openDatabase(":memory:");
+    for (let id = 1; id <= 6; id += 1) insertDue(db, id, 1_000 + id);
+    const channelA = Keypair.random();
+    const channelB = Keypair.random();
+    const channelC = Keypair.random();
+    const state = channelState();
+    const funded = new Set([
+      channelA.publicKey(),
+      channelB.publicKey(),
+      channelC.publicKey(),
+    ]);
+    const keeper = new Keeper(
+      db,
+      sequencingRpc(funded, state),
+      keeperConfig({
+        KEEPER_SECRET: channelA.secret(),
+        KEEPER_CHANNEL_SECRETS: [channelB.secret(), channelC.secret()],
+      }),
+    );
+    assert.equal(keeper.channelCount, 3, "the primary key plus two channel accounts");
+
+    const results = await keeper.tick(10_000);
+
+    assert.deepEqual(
+      results.map((r) => r.mandateId),
+      [1, 2, 3, 4, 5, 6],
+      "every due mandate settles and results stay in due order across channels",
+    );
+    assert.ok(
+      results.every((r) => r.status === "settled"),
+      `no mandate failed: ${results.map((r) => r.error ?? r.status).join(", ")}`,
+    );
+    assert.deepEqual(
+      state.collisions,
+      [],
+      "each account's transactions advance its sequence by exactly one, never colliding",
+    );
+    assert.equal(state.submitted.length, 6, "one transaction per mandate");
+    const expected = [channelA.publicKey(), channelB.publicKey(), channelC.publicKey()].sort();
+    assert.deepEqual(
+      [...new Set(state.submitted.map((s) => s.source))].sort(),
+      expected,
+      "all three channel accounts signed their own transactions",
+    );
+    assert.ok(
+      state.maxInFlight >= 2,
+      `channels settle in parallel, not one after another (peak in flight: ${state.maxInFlight})`,
+    );
+    db.close();
+  });
+
+  test("a channel whose key is dead is skipped and its mandates settle on live channels", async () => {
+    const db = openDatabase(":memory:");
+    for (let id = 1; id <= 4; id += 1) insertDue(db, id, 1_000 + id);
+    const deadChannel = Keypair.random(); // deliberately unfunded
+    const liveChannel = Keypair.random();
+    const state = channelState();
+    // Primary keyA and the third channel are funded; the middle one is not.
+    const funded = new Set([keyA.publicKey(), liveChannel.publicKey()]);
+    const keeper = new Keeper(
+      db,
+      sequencingRpc(funded, state),
+      keeperConfig({
+        KEEPER_SECRET: keyA.secret(),
+        KEEPER_CHANNEL_SECRETS: [deadChannel.secret(), liveChannel.secret()],
+      }),
+    );
+
+    const warnings = await captureWarnLog(async () => {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(results.map((r) => r.mandateId), [1, 2, 3, 4]);
+      assert.ok(
+        results.every((r) => r.status === "settled"),
+        "the dead channel's share settles through the live channels in the same pass",
+      );
+    });
+
+    assert.ok(
+      warnings.some((m) => m.includes("skipping this channel")),
+      "the dropped channel is logged",
+    );
+    assert.ok(
+      !state.submitted.some((s) => s.source === deadChannel.publicKey()),
+      "the dead key never signs a transaction",
+    );
+    assert.deepEqual(state.collisions, []);
+    db.close();
+  });
+
+  test("a single-key setup is unchanged: one account, no liveness probe", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    const inner = fakeRpc(new Set([keyA.publicKey()]));
+    let accountLookups = 0;
+    const server: KeeperRpc = {
+      ...inner,
+      getAccount: async (address: string) => {
+        accountLookups += 1;
+        return inner.getAccount(address);
+      },
+    };
+    const keeper = new Keeper(db, server, keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+    assert.equal(keeper.channelCount, 1);
+
+    const results = await keeper.tick(10_000);
+
+    assert.deepEqual(results.map((r) => r.mandateId), [1, 2]);
+    assert.ok(results.every((r) => r.status === "settled"));
+    assert.equal(
+      accountLookups,
+      2,
+      "exactly one getAccount per charge: a lone channel is never probed for liveness",
+    );
+    db.close();
+  });
+
+  test("KEEPER_CHANNEL_SECRETS repeating the primary key does not duplicate the channel", () => {
+    const keeper = new Keeper(
+      openDatabase(":memory:"),
+      fakeRpc(new Set()),
+      keeperConfig({
+        KEEPER_SECRET: keyA.secret(),
+        KEEPER_CHANNEL_SECRETS: [keyA.secret(), keyB.secret(), keyA.secret()],
+      }),
+    );
+    assert.equal(keeper.channelCount, 2, "duplicates collapse into the existing channels");
+    assert.deepEqual(keeper.keyPublicKeys, [keyA.publicKey(), keyB.publicKey()]);
   });
 });
 

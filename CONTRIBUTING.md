@@ -11,6 +11,13 @@ npm test
 Node 22.5+ is required — the service uses the built-in `node:sqlite` module and
 native TypeScript execution.
 
+The same service runs in a container, with the projection on a named volume:
+
+```bash
+cp .env.example .env
+docker compose up
+```
+
 ## What CI enforces
 
 | Job | Command |
@@ -19,6 +26,7 @@ native TypeScript execution.
 | `typecheck` | `npm run typecheck` |
 | `test` | `npm test` |
 | `build` | `npm run build` |
+| `docker build` | builds the image, pushes nothing |
 | `audit` | `npm audit --omit=dev --audit-level=high` |
 
 Dependencies are kept current by [Dependabot](.github/dependabot.yml), which

@@ -14,15 +14,20 @@
  */
 import type {
   ChargePage,
+  ChurnBucketSize,
   DuePage,
   ForecastResponse,
   HealthResponse,
   KeeperHistoryResponse,
   MandatePage,
   MandateRow,
+  MerchantChurnResponse,
+  MerchantRevenueResponse,
+  MerchantSubscribersResponse,
   MerchantSummary,
   PlanPage,
   PlanRow,
+  PlanStatsResponse,
   ProtocolResponse,
   StatsResponse,
   SubscriberSummary,
@@ -36,6 +41,8 @@ export type {
   ApiErrorResponse,
   ChargePage,
   ChargeRow,
+  ChurnBucket,
+  ChurnBucketSize,
   DueMandateRow,
   DuePage,
   ForecastResponse,
@@ -45,11 +52,18 @@ export type {
   KeeperPassSummary,
   MandatePage,
   MandateRow,
+  MerchantChurnResponse,
+  MerchantRevenueResponse,
+  MerchantSubscriber,
+  MerchantSubscribersResponse,
   MerchantSummary,
   PlanPage,
   PlanRow,
+  PlanStatsResponse,
   ProtocolFeeChange,
   ProtocolResponse,
+  RevenueBucket,
+  RevenueBucketSize,
   StatsResponse,
   SubscriberSummary,
   TokenFields,
@@ -146,6 +160,10 @@ export class PayflowClient {
     return this.get<PlanRow>(`/api/plans/${id}`);
   }
 
+  planStats(id: number): Promise<PlanStatsResponse> {
+    return this.get<PlanStatsResponse>(`/api/plans/${id}/stats`);
+  }
+
   mandates(query: MandatesQuery = {}): Promise<MandatePage> {
     return this.get<MandatePage>("/api/mandates", query);
   }
@@ -170,6 +188,40 @@ export class PayflowClient {
     return this.get<ForecastResponse>(
       `/api/merchants/${encodeURIComponent(address)}/forecast`,
       days !== undefined ? { days } : undefined,
+    );
+  }
+
+  merchantSubscribers(address: string, query: PageQuery = {}): Promise<MerchantSubscribersResponse> {
+    return this.get<MerchantSubscribersResponse>(
+      `/api/merchants/${encodeURIComponent(address)}/subscribers`,
+      query,
+    );
+  }
+
+  /** The merchant's churn report: starts and departures per time bucket. */
+  merchantChurn(
+    address: string,
+    query: { bucket?: ChurnBucketSize; limit?: number } = {},
+  ): Promise<MerchantChurnResponse> {
+    return this.get<MerchantChurnResponse>(
+      `/api/merchants/${encodeURIComponent(address)}/churn`,
+      query,
+    );
+  }
+
+  /**
+   * The merchant's revenue over time: gross, fee and net per time bucket.
+   *
+   * `from` and `to` bound the range in unix seconds; without them the
+   * report covers the merchant's whole history.
+   */
+  merchantRevenue(
+    address: string,
+    query: { bucket?: ChurnBucketSize; from?: number; to?: number; limit?: number } = {},
+  ): Promise<MerchantRevenueResponse> {
+    return this.get<MerchantRevenueResponse>(
+      `/api/merchants/${encodeURIComponent(address)}/revenue`,
+      query,
     );
   }
 
