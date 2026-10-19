@@ -132,6 +132,32 @@ longer does:
 
 Secrets are never logged; rotation logs only public keys.
 
+### Settling in parallel with channel accounts
+
+A single account can only have one transaction in flight — the next `charge`
+has to wait for the previous one's sequence number — so one key settles a few
+charges per minute and large merchants get billed hours late. List extra
+signing accounts in `KEEPER_CHANNEL_SECRETS` (comma-separated `S...` keys) and
+one pass distributes the due mandates across them:
+
+- Each channel signs and sequences **its own** transactions and pays its own
+  fees, so sequence numbers live on separate accounts and cannot collide.
+  Channel keys need only XLM for fees: `charge` is permissionless, so no
+  channel key holds user funds or any on-chain authority.
+- Due mandates are pulled from one shared queue by one worker per channel —
+  strictly one transaction at a time *within* a channel, several channels in
+  parallel. With a single channel the pass is exactly the old sequential
+  behaviour, and `KEEPER_SECRET` is always the first channel.
+- Before distributing, each channel's account is checked with one `getAccount`.
+  A channel that cannot pay (unfunded, deleted) is skipped for the pass —
+  logged by public key — and its share settles through the live channels
+  instead of backing off against a dead key. `KEEPER_SECRET_NEXT` rotation
+  still applies to the primary channel, before and during the pass.
+
+A fee-bump design (main key pays every fee) was deliberately rejected: a
+Stellar fee-bump consumes the *fee source's* sequence number, so every
+transaction would sequence against the one main account and serialize again.
+
 ## API
 
 Base path `/api`. All amounts are strings in the token's smallest unit
@@ -362,6 +388,7 @@ examined without API downtime.
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
 | `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
+| `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
 | `KEEPER_FEE_PERCENTILE` | `90` | Soroban inclusion-fee percentile used for charge transactions (`50`, `60`, `70`, `80`, `90`, `95`, or `99`) |

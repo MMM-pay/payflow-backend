@@ -77,6 +77,45 @@ describe("keeper order", () => {
   });
 });
 
+describe("keeper channel secrets", () => {
+  test("defaults to no channels, so single-key setups are untouched", () => {
+    assert.deepEqual(loadConfig({ ...BASE }).KEEPER_CHANNEL_SECRETS, []);
+  });
+
+  test("a comma-separated list is split, trimmed and kept in order", () => {
+    const a = Keypair.random().secret();
+    const b = Keypair.random().secret();
+    assert.deepEqual(
+      loadConfig({ ...BASE, KEEPER_CHANNEL_SECRETS: ` ${a} , ${b}` }).KEEPER_CHANNEL_SECRETS,
+      [a, b],
+    );
+  });
+
+  test("blanks between commas are dropped", () => {
+    const a = Keypair.random().secret();
+    assert.deepEqual(
+      loadConfig({ ...BASE, KEEPER_CHANNEL_SECRETS: `,${a},` }).KEEPER_CHANNEL_SECRETS,
+      [a],
+    );
+  });
+
+  test("anything that is not a Stellar secret seed is rejected", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_CHANNEL_SECRETS: "not-a-secret" }),
+      /KEEPER_CHANNEL_SECRETS/,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          KEEPER_CHANNEL_SECRETS: `${Keypair.random().secret()},GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH`,
+        }),
+      /KEEPER_CHANNEL_SECRETS/,
+      "a public key is not a signing secret",
+    );
+  });
+});
+
 describe("keeper inclusion fee configuration", () => {
   test("uses the default percentile and cap", () => {
     const config = loadConfig(env());
