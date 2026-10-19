@@ -95,6 +95,23 @@ export interface PlanPage {
   plans: PlanRow[];
 }
 
+/** Per-plan statistics for comparing plans at a glance. */
+export interface PlanStatsResponse {
+  planId: number;
+  /** Mandates with status `Active`. */
+  activeMandates: number;
+  /** All mandates for this plan, any status. */
+  totalMandates: number;
+  /** Mandates with status `Cancelled`. */
+  cancellations: number;
+  /** String sum of settled charge amounts, token's smallest unit. */
+  totalCollected: string;
+  /** Settled charges across all mandates of this plan. */
+  totalCharges: number;
+  /** Mean settled charges per mandate (plain division; 0 when no mandates). */
+  averageChargesPerMandate: number;
+}
+
 export interface MandatePage {
   mandates: MandateRow[];
 }

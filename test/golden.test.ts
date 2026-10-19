@@ -86,6 +86,7 @@ const ROUTES: RouteSpec[] = [
   { file: "ready", method: "GET", path: "/ready", status: 200 },
   { file: "plans", method: "GET", path: "/api/plans", status: 200 },
   { file: "plan_by_id", method: "GET", path: `/api/plans/1`, status: 200 },
+  { file: "plan_stats", method: "GET", path: "/api/plans/1/stats", status: 200 },
   { file: "mandates", method: "GET", path: "/api/mandates", status: 200 },
   { file: "mandate_by_id", method: "GET", path: "/api/mandates/1", status: 200 },
   { file: "mandate_charges", method: "GET", path: "/api/mandates/1/charges", status: 200 },

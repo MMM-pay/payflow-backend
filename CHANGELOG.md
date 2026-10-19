@@ -7,6 +7,11 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **Per-plan statistics (#29).** `GET /api/plans/:id/stats` reports a plan's
+  active and total mandates, cancellations, gross amount collected and the
+  average number of settled charges per mandate, so merchants can compare
+  plans side by side. The collected total stays a decimal string in the
+  token's smallest unit, and an unknown plan is `404 plan_not_found`.
 - **Zero-downtime keeper key rotation (#71).** The keeper accepts a standby
   key in `KEEPER_SECRET_NEXT`: if the active key's source account is unusable
   it rotates mid-pass and retries the same mandate, and after a pass settles

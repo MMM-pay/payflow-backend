@@ -1,10 +1,10 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
-import { getPlanById, listPlans } from "../lib/queries.ts";
+import { getPlanById, getPlanStats, listPlans } from "../lib/queries.ts";
 import type { TokenMetadataService } from "../lib/tokens.ts";
 import { limitOf, tokenFields } from "./helpers.ts";
 import { sendApiError } from "./errors.ts";
-import type { PlanPage } from "./types.ts";
+import type { PlanPage, PlanStatsResponse } from "./types.ts";
 
 /**
  * `GET /plans` and `GET /plans/:id`.
@@ -36,6 +36,34 @@ export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Rou
       return;
     }
     res.json({ ...row, ...(await tokenFields(tokens, row.token)) });
+  });
+
+  /** `GET /plans/:id/stats`: active and total mandates, cancellations, gross
+   * collected, and average charges per mandate. */
+  r.get("/plans/:id/stats", (req, res) => {
+    const planId = Number(req.params.id);
+    // A plan id is a positive integer; anything else cannot name a plan.
+    if (!Number.isInteger(planId) || planId <= 0) {
+      sendApiError(res, req, 404, "plan_not_found");
+      return;
+    }
+    if (!getPlanById(db, planId)) {
+      sendApiError(res, req, 404, "plan_not_found");
+      return;
+    }
+    const stats = getPlanStats(db, planId);
+    const body: PlanStatsResponse = {
+      planId,
+      activeMandates: stats.activeMandates,
+      totalMandates: stats.totalMandates,
+      cancellations: stats.cancellations,
+      totalCollected: String(stats.totalCollected),
+      totalCharges: stats.totalCharges,
+      // A plan with no mandates has no average; report 0 rather than NaN.
+      averageChargesPerMandate:
+        stats.totalMandates === 0 ? 0 : stats.totalCharges / stats.totalMandates,
+    };
+    res.json(body);
   });
 
   return r;

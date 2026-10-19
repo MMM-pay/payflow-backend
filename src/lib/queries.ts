@@ -66,6 +66,73 @@ export function getPlanById(db: DatabaseSync, id: number): PlanRow | undefined {
     .get(id) as unknown as PlanRow | undefined;
 }
 
+/** A plan's statistics, grouped from its mandates and their settled charges. */
+export interface PlanStatsAggregate {
+  planId: number;
+  activeMandates: number;
+  totalMandates: number;
+  cancellations: number;
+  totalCollected: bigint;
+  totalCharges: number;
+}
+
+/**
+ * Per-plan statistics: active and total mandates, cancellations, gross amount
+ * collected and the average number of settled charges per mandate.
+ *
+ * Starts from mandates so a plan with no settled charges still appears with a
+ * total collected of `0`. The collected sum reads as bigint, so no amount
+ * round-trips through a JavaScript number; replaying a ledger range is
+ * idempotent because charges are keyed on (tx_hash, mandate_id).
+ */
+export function getPlanStats(
+  db: DatabaseSync,
+  planId: number,
+): PlanStatsAggregate {
+  const mandateCounts = db
+    .prepare(
+      `SELECT COUNT(*) AS total_mandates,
+              SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) AS active_mandates,
+              SUM(CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END) AS cancellations
+         FROM mandates
+        WHERE plan_id = ?`,
+    )
+    .get(planId) as {
+      total_mandates: number;
+      active_mandates: number;
+      cancellations: number;
+    } | undefined;
+
+  const revenueStmt = db
+    .prepare(
+      `SELECT COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total_collected,
+              COUNT(c.tx_hash) AS total_charges
+         FROM charges c
+         JOIN mandates m ON m.id = c.mandate_id
+        WHERE m.plan_id = ?`,
+    );
+  // Read the sum as bigint so a large collected total never round-trips
+  // through a JavaScript number at stroop scale.
+  revenueStmt.setReadBigInts(true);
+  const revenue = revenueStmt.get(planId) as {
+    total_collected: bigint;
+    // COUNT also reads as bigint under setReadBigInts; counts are small, so
+    // coerce back to a number.
+    total_charges: bigint;
+  } | undefined;
+
+  const total = mandateCounts?.total_mandates ?? 0;
+  return {
+    planId,
+    activeMandates: mandateCounts?.active_mandates ?? 0,
+    totalMandates: total,
+    cancellations: mandateCounts?.cancellations ?? 0,
+    totalCollected: revenue?.total_collected ?? 0n,
+    // Charges settled is a count, never an amount; safe to coerce to a number.
+    totalCharges: Number(revenue?.total_charges ?? 0n),
+  };
+}
+
 /**
  * Batch the token contract id for a set of plan ids. A mandate carries no
  * token of its own — it inherits its plan's — so enriching a page of
