@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { test, describe } from "node:test";
+import { test, describe, mock } from "node:test";
 import { nativeToScVal, rpc } from "@stellar/stellar-sdk";
 import { openDatabase, readCursor, writeCursor } from "../src/lib/db.ts";
 import { Indexer, type IndexerRpc } from "../src/indexer.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
 import { drain, every, serial } from "../src/lib/loop.ts";
+import { logger } from "../src/lib/logger.ts";
+import type { Archive } from "../src/lib/stellar.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
@@ -201,12 +203,75 @@ describe("indexer sync", () => {
     assert.deepEqual(plans(db), [1]);
   });
 
-  test("a cursor that fell out of retention restarts at the oldest ledger", async () => {
+  test("a cursor that fell out of retention restarts at the oldest ledger when gaps are allowed", async () => {
     const db = openDatabase(":memory:");
     writeCursor(db, 100);
     const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
-    await new Indexer(db, fakeRpc(chain), net()).tick();
+    await new Indexer(db, fakeRpc(chain), net({ allowGaps: true } as never)).tick();
     assert.equal(chain.calls[0]!.startLedger, 600);
+    assert.equal(readCursor(db, 0), 700);
+    db.close();
+  });
+
+  test("refuses to advance the cursor past a gap without ALLOW_GAPS", async () => {
+    const db = openDatabase(":memory:");
+    writeCursor(db, 100);
+    const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
+    const ix = new Indexer(db, fakeRpc(chain) as never, net() as never);
+    const warnings: unknown[] = [];
+    mock.method(logger, "warn", (...args: unknown[]): void => {
+      warnings.push(args);
+    });
+    try {
+      await assert.rejects(() => ix.tick(), /missing ledgers/);
+      assert.equal(readCursor(db, 0), 100, "the cursor does not advance past the gap");
+      assert.ok(
+        warnings.some((args) => {
+          const obj = args[0] as { gapFrom?: number; gapTo?: number } | undefined;
+          return obj?.gapFrom === 100 && obj?.gapTo === 600;
+        }),
+        "the warning names the exact missing ledger range",
+      );
+      // The failure is logged and retried on the next pass: the loop is not
+      // crashed, so a second tick fails the same way instead of advancing.
+      await assert.rejects(() => ix.tick(), /missing ledgers/);
+      assert.equal(readCursor(db, 0), 100);
+    } finally {
+      mock.restoreAll();
+      db.close();
+    }
+  });
+
+  test("backfills a gap from the archive before indexing continues", async () => {
+    const db = openDatabase(":memory:");
+    writeCursor(db, 100);
+    const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
+    const archiveEvents = [rawEvent(150, 1), rawEvent(400, 2)];
+    const archive: Archive = {
+      getEvents: async (req: Record<string, unknown>) => {
+        let pool: rpc.Api.EventResponse[];
+        if (req.cursor !== undefined) {
+          pool = archiveEvents.slice(Number(req.cursor));
+        } else {
+          const start = req.startLedger as number;
+          const end = (req.endLedger as number | undefined) ?? Infinity;
+          pool = archiveEvents.filter((e) => e.ledger >= start && e.ledger < end);
+        }
+        const page = pool.slice(0, Math.min(200, req.limit as number));
+        return {
+          events: page,
+          cursor: page.length ? String(archiveEvents.indexOf(page[page.length - 1]!) + 1) : undefined,
+        } as never;
+      },
+    };
+    const ix = new Indexer(db, fakeRpc(chain) as never, net() as never, undefined, archive);
+
+    const r = await ix.tick();
+
+    assert.deepEqual(plans(db), [1, 2], "the archive's events are projected");
+    assert.equal(r.cursor, 700, "indexing continues after the gap is backfilled");
+    assert.equal(readCursor(db, 0), 700);
+    db.close();
   });
 
   test("follows cursor pages but ignores events past the range end", async () => {

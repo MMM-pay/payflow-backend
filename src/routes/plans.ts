@@ -2,9 +2,16 @@ import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
 import { getPlanById, getPlanStats, listPlans } from "../lib/queries.ts";
 import type { TokenMetadataService } from "../lib/tokens.ts";
-import { limitOf, tokenFields } from "./helpers.ts";
+import { encodeCursor, limitOf, tokenFields } from "./helpers.ts";
 import { sendApiError } from "./errors.ts";
-import { addressSchema, idSchema, limitSchema, present, validate } from "./validate.ts";
+import {
+  addressSchema,
+  cursorSchema,
+  idSchema,
+  limitSchema,
+  present,
+  validate,
+} from "./validate.ts";
 import type { PlanPage, PlanStatsResponse } from "./types.ts";
 
 /**
@@ -27,16 +34,29 @@ export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Rou
       present(req.query.merchant),
     );
     if (!merchant.ok) return;
+    const cursor = validate(
+      req,
+      res,
+      "cursor",
+      cursorSchema.optional(),
+      present(req.query.cursor),
+    );
+    if (!cursor.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
+    const page = listPlans(db, {
+      merchant: merchant.value,
+      cursor: cursor.value,
+      limit: limitOf(limit.value),
+    });
     const plans = await Promise.all(
-      listPlans(db, {
-        merchant: merchant.value,
-        limit: limitOf(limit.value),
-      }).map(async (row) => ({ ...row, ...(await tokenFields(tokens, row.token)) })),
+      page.rows.map(async (row) => ({ ...row, ...(await tokenFields(tokens, row.token)) })),
     );
-    const body: PlanPage = { plans };
+    const body: PlanPage = {
+      plans,
+      nextCursor: page.nextCursorId === null ? null : encodeCursor(page.nextCursorId),
+    };
     res.json(body);
   });
 

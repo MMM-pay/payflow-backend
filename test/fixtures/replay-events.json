@@ -1,0 +1,258 @@
+{
+  "events": [
+    {
+      "ledger": 1000,
+      "txHash": "tx-plan-1",
+      "contractId": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "ledgerClosedAt": 1700000000,
+      "topic": [
+        {
+          "symbol": "plan_created"
+        },
+        {
+          "address": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH"
+        },
+        {
+          "u64": "1"
+        }
+      ],
+      "value": {
+        "map": [
+          {
+            "key": {
+              "symbol": "amount"
+            },
+            "val": {
+              "i128": "10000000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "name"
+            },
+            "val": {
+              "string": "Pro Monthly"
+            }
+          },
+          {
+            "key": {
+              "symbol": "period"
+            },
+            "val": {
+              "u64": "2592000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "token"
+            },
+            "val": {
+              "address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "ledger": 1001,
+      "txHash": "tx-sub-1",
+      "contractId": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "ledgerClosedAt": 1700000060,
+      "topic": [
+        {
+          "symbol": "subscribed"
+        },
+        {
+          "u64": "1"
+        },
+        {
+          "address": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR"
+        },
+        {
+          "address": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH"
+        }
+      ],
+      "value": {
+        "map": [
+          {
+            "key": {
+              "symbol": "amount"
+            },
+            "val": {
+              "i128": "10000000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "fee_bps"
+            },
+            "val": {
+              "u32": 100
+            }
+          },
+          {
+            "key": {
+              "symbol": "max_charges"
+            },
+            "val": {
+              "u32": 0
+            }
+          },
+          {
+            "key": {
+              "symbol": "next_charge"
+            },
+            "val": {
+              "timepoint": "1700000000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "period"
+            },
+            "val": {
+              "u64": "2592000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "plan_id"
+            },
+            "val": {
+              "u64": "1"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "ledger": 1002,
+      "txHash": "tx-charge-1",
+      "contractId": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "ledgerClosedAt": 1700000120,
+      "topic": [
+        {
+          "symbol": "charged"
+        },
+        {
+          "u64": "1"
+        },
+        {
+          "address": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR"
+        },
+        {
+          "address": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH"
+        }
+      ],
+      "value": {
+        "map": [
+          {
+            "key": {
+              "symbol": "amount"
+            },
+            "val": {
+              "i128": "9900000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "charges_made"
+            },
+            "val": {
+              "u32": 1
+            }
+          },
+          {
+            "key": {
+              "symbol": "fee"
+            },
+            "val": {
+              "i128": "100000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "next_charge"
+            },
+            "val": {
+              "timepoint": "1700060000"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "ledger": 1003,
+      "txHash": "tx-deposit-1",
+      "contractId": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "ledgerClosedAt": 1700000180,
+      "topic": [
+        {
+          "symbol": "deposit"
+        },
+        {
+          "address": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR"
+        },
+        {
+          "address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        }
+      ],
+      "value": {
+        "map": [
+          {
+            "key": {
+              "symbol": "amount"
+            },
+            "val": {
+              "i128": "50000000"
+            }
+          },
+          {
+            "key": {
+              "symbol": "balance"
+            },
+            "val": {
+              "i128": "50000000"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "ledger": 1004,
+      "txHash": "tx-fee-1",
+      "contractId": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "ledgerClosedAt": 1700000240,
+      "topic": [
+        {
+          "symbol": "fee_changed"
+        },
+        {
+          "address": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH"
+        }
+      ],
+      "value": {
+        "map": [
+          {
+            "key": {
+              "symbol": "new_fee_bps"
+            },
+            "val": {
+              "u32": 125
+            }
+          },
+          {
+            "key": {
+              "symbol": "old_fee_bps"
+            },
+            "val": {
+              "u32": 100
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "cursor": "5",
+  "latestLedger": 1004
+}

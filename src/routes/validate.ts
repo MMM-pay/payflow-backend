@@ -83,6 +83,32 @@ export const unixSecondsSchema = z
 export const bucketSchema = z.enum(["day", "week", "month"]);
 
 /**
+ * An opaque cursor returned by a list endpoint. It encodes the primary key
+ * of the last row on the page (`{ id }`) as base64url JSON, so clients treat
+ * it as an opaque token and the server pages by primary key, never by offset.
+ */
+export const cursorSchema = z
+  .string()
+  .transform((value, ctx) => {
+    let decoded: { id: unknown };
+    try {
+      decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    } catch {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "must be a cursor returned by the API" });
+      return z.NEVER;
+    }
+    if (
+      typeof decoded?.id !== "number" ||
+      !Number.isSafeInteger(decoded.id) ||
+      decoded.id <= 0
+    ) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "must be a cursor returned by the API" });
+      return z.NEVER;
+    }
+    return decoded.id;
+  });
+
+/**
  * An absent or empty query value.
  *
  * `?merchant=` means "no filter" in every client that builds the URL, so an

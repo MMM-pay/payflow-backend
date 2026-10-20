@@ -27,17 +27,22 @@ import type {
   VaultEventPage,
 } from "../routes/types.ts";
 
-export interface ListPlansFilter {
-  merchant?: string | undefined;
+/** A primary-key cursor names the last row of the previous page. */
+export interface ListCursorFilter {
+  /** The primary key to page after: rows with `id < cursor` are returned. */
+  cursor?: number | undefined;
   limit: number;
 }
 
-export interface ListMandatesFilter {
+export interface ListPlansFilter extends ListCursorFilter {
+  merchant?: string | undefined;
+}
+
+export interface ListMandatesFilter extends ListCursorFilter {
   ids?: number[] | undefined;
   subscriber?: string | undefined;
   merchant?: string | undefined;
   status?: string | undefined;
-  limit: number;
 }
 
 export interface ForecastMandateRow {
@@ -59,16 +64,53 @@ export interface UpcomingMandateRow {
   max_charges: number;
 }
 
-/** List plans ordered newest-first, optionally filtered by merchant. */
-export function listPlans(db: DatabaseSync, filter: ListPlansFilter): PlanRow[] {
-  const rows = filter.merchant
-    ? db
-        .prepare("SELECT * FROM plans WHERE merchant = ? ORDER BY id DESC LIMIT ?")
-        .all(filter.merchant, filter.limit)
-    : db
-        .prepare("SELECT * FROM plans ORDER BY id DESC LIMIT ?")
-        .all(filter.limit);
-  return rows as unknown as PlanRow[];
+/**
+ * List plans ordered newest-first, optionally filtered by merchant, paginated
+ * by a primary-key cursor. Fetch one extra row so the caller can tell whether
+ * a further page exists.
+ */
+export function listPlans(
+  db: DatabaseSync,
+  filter: ListPlansFilter,
+): { rows: PlanRow[]; nextCursorId: number | null } {
+  return cursorPage(
+    db,
+    "FROM plans",
+    filter.merchant ? "WHERE merchant = ?" : "",
+    filter.merchant ? [filter.merchant] : [],
+    filter,
+  );
+}
+
+/**
+ * Page by primary key: fetch `limit + 1` rows ordered by `id DESC`, starting
+ * strictly below `cursor` when one is given. The extra row tells whether a
+ * further page exists; the cursor names a primary key, never an offset, so
+ * inserts or deletes between pages cannot skip or repeat rows.
+ */
+export function cursorPage<T extends { id: number }>(
+  db: DatabaseSync,
+  fromSql: string,
+  whereSql: string,
+  args: unknown[],
+  filter: ListCursorFilter,
+): { rows: T[]; nextCursorId: number | null } {
+  let where = whereSql;
+  if (filter.cursor !== undefined) {
+    where += where.length ? ` AND id < ?` : ` WHERE id < ?`;
+    args.push(filter.cursor);
+  }
+  args.push(filter.limit + 1);
+  const separator = where.length ? " " : "";
+  // `fromSql` ("FROM plans" / "FROM mandates") and `whereSql` ("WHERE ..." or
+  // "") are built from fixed fragments; every value is a bound parameter, so
+  // this interpolation is structural, not user data.
+  // eslint-disable-next-line no-restricted-syntax
+  const rows = db.prepare(`SELECT * ${fromSql}${separator}${where} ORDER BY id DESC LIMIT ?`).all(...(args as never[])) as unknown as T[];
+  if (rows.length > filter.limit) {
+    return { rows: rows.slice(0, filter.limit) as T[], nextCursorId: rows[filter.limit - 1]!.id };
+  }
+  return { rows, nextCursorId: null };
 }
 
 /** Look up a single plan by on-chain id. */
@@ -163,15 +205,21 @@ export function planTokensByIds(db: DatabaseSync, planIds: number[]): Map<number
   return new Map(rows.map((row) => [row.id, row.token]));
 }
 
-/** List mandates ordered newest-first with optional id batch, subscriber, merchant, and status filters. */
+/**
+ * List mandates ordered newest-first with optional id batch, subscriber,
+ * merchant, and status filters, paginated by a primary-key cursor. Fetch one
+ * extra row so the caller can tell whether a further page exists.
+ */
 export function listMandates(
   db: DatabaseSync,
   filter: ListMandatesFilter,
-): MandateRow[] {
+): { rows: MandateRow[]; nextCursorId: number | null } {
+  if (filter.ids !== undefined && filter.ids.length === 0) {
+    return { rows: [], nextCursorId: null };
+  }
   const where: string[] = [];
   const args: unknown[] = [];
   if (filter.ids !== undefined) {
-    if (filter.ids.length === 0) return [];
     where.push(`id IN (${filter.ids.map(() => "?").join(",")})`);
     args.push(...filter.ids);
   }
@@ -188,14 +236,7 @@ export function listMandates(
     args.push(filter.status);
   }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  args.push(filter.limit);
-  const rows = db
-    // `clause` is assembled above from fixed predicates; every value is a
-    // bound parameter, so this interpolation is structural, not user data.
-    // eslint-disable-next-line no-restricted-syntax
-    .prepare(`SELECT * FROM mandates ${clause} ORDER BY id DESC LIMIT ?`)
-    .all(...(args as never[]));
-  return rows as unknown as MandateRow[];
+  return cursorPage(db, "FROM mandates", clause, args, filter);
 }
 
 /** Look up a single mandate by on-chain id. */

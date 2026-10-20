@@ -31,6 +31,14 @@ export interface RpcStatus {
 /** Obtains a server handle for a URL; injectable so tests can fake endpoints. */
 export type Dial = (url: string) => RpcLike;
 
+/** A full-history archive able to re-serve a ledger range the RPC no longer
+ * keeps. Only `getEvents` is needed; the archive is expected to answer the
+ * same shape as Soroban RPC (`startLedger`, `endLedger`, `limit`, `cursor`).
+ */
+export interface Archive {
+  getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse>;
+}
+
 /**
  * Hung endpoints must become errors, not promises that never settle, or
  * failover has nothing to react to; the SDK default is no timeout at all.
@@ -183,6 +191,33 @@ export class FailoverRpc implements RpcStatus {
     tx: Transaction | FeeBumpTransaction,
   ): Promise<rpc.Api.SimulateTransactionResponse> {
     return this.run("simulateTransaction", (server) => server.simulateTransaction(tx));
+  }
+}
+
+/**
+ * A full-history archive reachable over HTTP. It must answer the same
+ * `getEvents` shape as Soroban RPC (`startLedger`, `endLedger`, `limit`,
+ * `cursor`) so the indexer can backfill a gap it cannot reach through RPC.
+ * The archive is only asked for events in a bounded range, and filters are
+ * not forwarded: the archive serves everything in the range and the indexer
+ * applies only the contract events it understands, ignoring the rest.
+ */
+export class HttpArchive implements Archive {
+  private readonly url: string;
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  async getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse> {
+    const url = new URL(this.url);
+    url.searchParams.set("startLedger", String(request.startLedger));
+    if (request.endLedger !== undefined) url.searchParams.set("endLedger", String(request.endLedger));
+    if (request.limit !== undefined) url.searchParams.set("limit", String(request.limit));
+    if (request.cursor) url.searchParams.set("cursor", request.cursor);
+    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(RPC_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`archive ${this.url} responded ${res.status}`);
+    return (await res.json()) as rpc.Api.GetEventsResponse;
   }
 }
 

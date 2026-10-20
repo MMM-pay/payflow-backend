@@ -2,6 +2,7 @@ import { Router } from "express";
 import type { EventEmitter } from "node:events";
 import type { DatabaseSync } from "node:sqlite";
 import type { TokenMetadataService } from "../lib/tokens.ts";
+import type { WebhookDispatcher } from "../lib/webhooks.ts";
 import { mandatesRouter } from "./mandates.ts";
 import {
   defaultMerchantSummaryCache,
@@ -15,6 +16,7 @@ import { subscribersRouter } from "./subscribers.ts";
 import { tokensRouter } from "./tokens.ts";
 import { streamRouter } from "./stream.ts";
 import { vaultRouter } from "./vault.ts";
+import { webhooksRouter } from "./webhooks.ts";
 
 export { defaultMerchantSummaryCache, MerchantSummaryCache };
 
@@ -26,6 +28,8 @@ export interface NetworkRoutes {
   /** Resolves this network's token contract ids to symbol/name/decimals. */
   tokens: TokenMetadataService;
   events?: EventEmitter | undefined;
+  /** Delivers charge events to registered webhooks. */
+  webhooks?: WebhookDispatcher | undefined;
 }
 
 /**
@@ -49,6 +53,7 @@ export function buildApiRouter(networks: NetworkRoutes[]): Router {
         network.summaryCache,
         network.defaultToken,
         network.events,
+        network.webhooks,
       ),
     );
   }
@@ -59,6 +64,7 @@ export function buildApiRouter(networks: NetworkRoutes[]): Router {
       defaultNetwork.summaryCache,
       defaultNetwork.defaultToken,
       defaultNetwork.events,
+      defaultNetwork.webhooks,
     ),
   );
   return router;
@@ -85,6 +91,7 @@ export function buildRoutes(
   summaryCache: MerchantSummaryCache = defaultMerchantSummaryCache,
   defaultToken?: string,
   events?: EventEmitter,
+  webhooks?: WebhookDispatcher,
 ): Router {
   const r = Router();
   r.use((_req, res, next) => {
@@ -99,6 +106,7 @@ export function buildRoutes(
   r.use(statsRouter(db));
   r.use(tokensRouter(tokens));
   if (events) r.use(streamRouter(events, db));
+  if (webhooks) r.use(webhooksRouter(db, webhooks));
   r.use(vaultRouter(db));
   return r;
 }

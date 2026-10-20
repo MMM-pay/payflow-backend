@@ -58,7 +58,7 @@ replays that range on restart. Every write is designed for that:
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 408 tests, no network needed
+npm test                  # 414 tests, no network needed
 npm run dev
 ```
 
@@ -231,6 +231,7 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/mandates/:id` | One mandate |
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
+| `POST` | `/api/webhooks` | Register a URL to receive signed `charged` events; proves control of the merchant address with a signature |
 | `GET` | `/api/vault/:address` | Latest balance per token |
 | `GET` | `/api/vault/:address/events?limit=` | Vault deposit, withdrawal and debit history, newest first |
 | `GET` | `/api/protocol` | Current protocol fee (`fee_bps`) and fee-change history |
@@ -445,6 +446,32 @@ a stable `code` and show the human-readable `message` without parsing prose:
 > `GET /api/mandates/:id` does. Before, it answered `200` with an empty
 > list, so "no such mandate" and "no charges yet" looked the same.
 
+### Webhooks
+
+Merchants can register a URL to receive signed `POST`s whenever one of their
+mandates charges, instead of polling. `POST /api/webhooks` registers a URL,
+and the caller proves control of the merchant's Stellar address with an
+ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`
+(signatures older than ten minutes are refused). The response carries the
+HMAC-SHA256 secret used to sign deliveries; treat it as a secret and never
+log it.
+
+Every delivery is a `POST` to the registered URL carrying:
+
+- `Idempotency-Key`: a UUID reused across retries, so receivers can collapse
+  duplicate attempts (delivery is at-least-once).
+- `Payflow-Signature: sha256=<hex>`: an HMAC-SHA256 over the request body
+  using the webhook's secret, so the merchant can verify the request came
+  from this service.
+- The charge event as a JSON body (`event`, `mandate_id`, `subscriber`,
+  `merchant`, `amount`, `fee`, `ledger`).
+
+Failing deliveries retry with exponential backoff (1 minute, doubling, up to
+six hours) for at most five attempts. A webhook that gives up is marked
+failed and stops receiving deliveries until re-registered. Undelivered
+deliveries are retried on a short cadence, so a silent indexer still makes
+delivery progress.
+
 | `error.code` | HTTP | Where |
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
@@ -619,6 +646,8 @@ examined without API downtime.
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
+| `ARCHIVE_URL` | *(empty)* | Full-history archive URL used to backfill the gap between the stored cursor and the oldest ledger the RPC still serves |
+| `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |

@@ -9,6 +9,7 @@ import { Indexer } from "../src/indexer.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 import { MerchantSummaryCache } from "../src/routes/index.ts";
+import { encodeCursor } from "../src/routes/helpers.ts";
 import type { MerchantSummary } from "../src/routes/types.ts";
 import { asReader, TokenMetadataService } from "../src/lib/tokens.ts";
 import { testAddress } from "./addresses.ts";
@@ -506,6 +507,123 @@ describe("http api", () => {
   test("X-Request-Id is exposed to browsers through CORS", async () => {
     const res = await fetch(`${base}/health`, { headers: { Origin: "http://localhost:3000" } });
     assert.match(res.headers.get("access-control-expose-headers") ?? "", /x-request-id/i);
+  });
+});
+
+describe("cursor pagination", () => {
+  /** Exactly 250 plans for one merchant, newest first: five pages of fifty at
+   *  the default limit, so a caller must follow `nextCursor` to see every row. */
+  const PAGE_MERCHANT = testAddress(50);
+  const pageDb = openDatabase(":memory:");
+  const pageIx = new Indexer(pageDb, {} as never, {} as never);
+  let pageServer: Server;
+  let pageBase: string;
+
+  before(async () => {
+    for (let id = 1; id <= 250; id += 1) {
+      pageIx.apply(ev("plan_created", [PAGE_MERCHANT, BigInt(id)], {
+        token: "C", amount: BigInt(10_000_000 * id), period: 2_592_000n, name: `Plan ${id}`,
+      }));
+    }
+    for (let id = 1; id <= 250; id += 1) {
+      pageIx.apply(ev("subscribed", [BigInt(id), testAddress(50 + id), PAGE_MERCHANT], {
+        plan_id: BigInt(id), amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
+      }));
+    }
+
+    const app = createApp(pageDb, config);
+    await new Promise<void>((resolve) => {
+      pageServer = app.listen(0, () => {
+        const addr = pageServer.address();
+        pageBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    pageServer.close();
+    pageDb.close();
+  });
+
+  const pageGet = async (path: string) => {
+    const res = await fetch(pageBase + path);
+    return {
+      status: res.status,
+      body: (await res.json()) as { plans?: unknown[]; mandates?: unknown[]; nextCursor: string | null },
+    };
+  };
+
+  test("pages through a seeded set of 250 plans with an opaque cursor", async () => {
+    const pages: number[][] = [];
+    let cursor: string | undefined;
+    let lastNextCursor: string | null | undefined;
+    for (let page = 0; page < 10; page += 1) {
+      const url = `/api/plans?merchant=${PAGE_MERCHANT}&limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const { status, body } = await pageGet(url);
+      assert.equal(status, 200);
+      const ids = (body.plans as { id: number }[]).map((plan) => plan.id);
+      pages.push(ids);
+      lastNextCursor = body.nextCursor;
+      if (body.nextCursor === null) break;
+      cursor = body.nextCursor;
+    }
+    assert.equal(pages.length, 5, "five pages of fifty");
+    assert.equal(pages.flat().length, 250, "every seeded plan is on exactly one page");
+    assert.equal(new Set(pages.flat()).size, 250, "no row appears on two pages");
+    assert.deepEqual(pages[0], [...Array(50)].map((_, i) => 250 - i), "first page is the newest 50");
+    for (const page of pages) {
+      assert.deepEqual(page, [...page].sort((a, b) => b - a), "each page is newest-first");
+    }
+    assert.equal(pages[4]![0], 50, "the final page starts where the previous one left off");
+    assert.equal(pages[4]!.length, 50, "the last page is a full page with no cursor");
+    assert.equal(lastNextCursor, null, "nextCursor is null on the final page");
+  });
+
+  test("the limit cap of 200 is unchanged", async () => {
+    const first = await pageGet(`/api/plans?merchant=${PAGE_MERCHANT}&limit=999`);
+    assert.equal(first.status, 200);
+    assert.equal(first.body.plans!.length, 200, "an oversize limit is capped");
+    assert.ok(typeof first.body.nextCursor === "string");
+    const last = await pageGet(
+      `/api/plans?merchant=${PAGE_MERCHANT}&limit=200&cursor=${encodeURIComponent(first.body.nextCursor!)}`,
+    );
+    assert.equal(last.body.plans!.length, 50);
+    assert.equal(last.body.nextCursor, null);
+  });
+
+  test("an invalid cursor is refused", async () => {
+    const garbage = await pageGet("/api/plans?cursor=not-a-cursor");
+    assert.equal(garbage.status, 400);
+    assert.equal((garbage.body as { error: { code: string } }).error.code, "invalid_request");
+    const truncated = await pageGet("/api/plans?cursor=AAAA");
+    assert.equal(truncated.status, 400);
+  });
+
+  test("a cursor before the first row is an empty final page", async () => {
+    // `id < 1` matches nothing: a caller past the beginning of the list gets
+    // an empty page and no further cursor.
+    const before = await pageGet(`/api/plans?merchant=${PAGE_MERCHANT}&cursor=${encodeURIComponent(encodeCursor(1))}`);
+    assert.equal(before.status, 200);
+    assert.deepEqual(before.body.plans, []);
+    assert.equal(before.body.nextCursor, null);
+  });
+
+  test("mandates page with the same cursor shape", async () => {
+    const first = await pageGet(`/api/mandates?merchant=${PAGE_MERCHANT}&limit=50`);
+    assert.equal(first.body.mandates!.length, 50);
+    assert.ok(typeof first.body.nextCursor === "string");
+    const second = await pageGet(
+      `/api/mandates?merchant=${PAGE_MERCHANT}&limit=50&cursor=${encodeURIComponent(first.body.nextCursor!)}`,
+    );
+    assert.equal(second.body.mandates!.length, 50);
+    const lastId = (first.body.mandates as { id: number }[]).at(-1)!.id;
+    const secondFirst = (second.body.mandates as { id: number }[])[0]!.id;
+    assert.ok(secondFirst < lastId, "the second page starts after the first page's last row");
+    const third = await pageGet(
+      `/api/mandates?merchant=${PAGE_MERCHANT}&limit=50&cursor=${encodeURIComponent(second.body.nextCursor!)}`,
+    );
+    assert.equal(third.body.mandates!.length, 50);
   });
 });
 

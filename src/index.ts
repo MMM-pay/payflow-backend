@@ -1,7 +1,8 @@
 import { loadConfig, networkConfigs } from "./config.ts";
 import { openDatabase } from "./lib/db.ts";
-import { makeRpc } from "./lib/stellar.ts";
+import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
+import { WebhookDispatcher } from "./lib/webhooks.ts";
 import { createApp } from "./app.ts";
 import { Indexer } from "./indexer.ts";
 import { Keeper } from "./keeper.ts";
@@ -20,7 +21,13 @@ const networks = networkConfigs(config);
 const runtimes = networks.map((network) => {
   const db = openDatabase(network.databasePath);
   const server = makeRpc(network);
-  const indexer = new Indexer(db, server, network);
+  // A full-history archive backfills the gap between the stored cursor and
+  // the oldest ledger the RPC still serves, so an outage longer than RPC
+  // retention does not silently shrink the projection.
+  const archive = network.archiveUrl ? new HttpArchive(network.archiveUrl) : undefined;
+  const indexer = new Indexer(db, server, network, undefined, archive);
+  const dispatcher = new WebhookDispatcher({ db, events: indexer.events });
+  dispatcher.bind(indexer.events);
   const runPass = serial(async () => {
     try {
       const r = await withSpan(`indexer.pass.${network.name}`, () => indexer.tick());
@@ -54,7 +61,7 @@ const runtimes = networks.map((network) => {
     // serves the corrected projection instead of a stale cache entry.
     (merchant) => indexer.merchantCache.invalidate(merchant),
   );
-  return { network, db, server, indexer, runPass, tokens, reconciler };
+  return { network, db, server, indexer, runPass, tokens, reconciler, dispatcher };
 });
 const defaultRuntime = runtimes[0]!;
 
@@ -123,6 +130,7 @@ const app = createApp(
     summaryCache: rt.indexer.merchantCache,
     rpc: rt.server,
     tokens: rt.tokens,
+    webhooks: rt.dispatcher,
   })),
   config,
   adminHooks,
@@ -173,6 +181,15 @@ for (const rt of runtimes) {
         }
       } catch {
         // Reconciler.tick logs and swallows its own failures; this is defensive.
+      }
+    }),
+    // Retry undelivered webhooks on their own cadence so a slow or silent
+    // indexer loop still makes delivery progress.
+    every(5_000, async () => {
+      try {
+        await rt.dispatcher.retryDue(Math.floor(Date.now() / 1000));
+      } catch {
+        // retryDue logs its own failures; the loop keeps going.
       }
     }),
   );

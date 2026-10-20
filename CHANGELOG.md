@@ -159,6 +159,35 @@ All notable changes to payflow-backend. The format follows
   database, and its routes under `/api/<name>/...`; unprefixed routes keep
   serving the default network unchanged. `/health` reports every network.
 - A route test suite for two configured networks.
+- **Cursor pagination for list endpoints (#3).** `GET /api/plans` and
+  `GET /api/mandates` accept an opaque `?cursor=` and return `nextCursor`,
+  keyed on the primary key (`id DESC`) instead of an offset, so clients can
+  page past the 200-row cap. `nextCursor` is `null` on the final page, the
+  existing `limit` behaviour is unchanged (capped at 200), and an invalid
+  cursor is answered `400 invalid_request`. The typed client gained `cursor`
+  on `PlansQuery` and `MandatesQuery`, and the OpenAPI document gained the
+  parameter and `nextCursor` on both pages.
+- **Full-history archive backfill (#4).** The indexer detects when the stored
+  cursor falls behind the oldest ledger the RPC still serves, logs a
+  structured warning naming the exact missing ledger range, and refuses to
+  advance the cursor past the gap unless `ALLOW_GAPS=true` is set. With
+  `ARCHIVE_URL` configured, an `HttpArchive` backfills the gap with
+  idempotent event application before indexing continues, so a service
+  offline longer than RPC retention does not silently under-report. Both
+  variables are in `.env.example` and the README's configuration table.
+- **Webhook dispatcher for charge events (#5).** Merchants register a URL
+  with `POST /api/webhooks`, proving control of their Stellar address with an
+  ed25519 signature. Each `charged` event dispatches a signed `POST`
+  (`Payflow-Signature: sha256=<hex>` HMAC, `Idempotency-Key` for at-least-once
+  delivery) per registered webhook. Failing deliveries retry with exponential
+  backoff for at most five attempts before the webhook is marked failed. The
+  indexer's `events` feed drives delivery, and a short-cadence retry pass
+  makes progress between indexer passes.
+- **Replay test against recorded testnet events (#6).** `test/fixtures/replay-events.json`
+  records five real `getEvents` responses from the deployed contracts, and
+  `test/replay.test.ts` replays them through `decodeEvent` and the projection,
+  asserts the resulting database state matches a committed snapshot, and proves
+  that replaying the fixture twice leaves the database unchanged.
 
 ### Changed
 

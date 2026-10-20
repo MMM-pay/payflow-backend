@@ -79,6 +79,8 @@ export type {
 
 export interface PlansQuery {
   merchant?: string;
+  /** Opaque cursor from a previous page; fetch the page after it. */
+  cursor?: string;
   limit?: number;
 }
 
@@ -88,6 +90,8 @@ export interface MandatesQuery {
   subscriber?: string;
   merchant?: string;
   status?: string;
+  /** Opaque cursor from a previous page; fetch the page after it. */
+  cursor?: string;
   limit?: number;
 }
 

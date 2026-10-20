@@ -12,6 +12,7 @@ import {
   parseCloseTime,
   specProblems,
   str,
+  type Archive,
   type DecodedEvent,
 } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
@@ -26,6 +27,10 @@ const PAGE_LIMIT = 200;
 
 /** The RPC calls the indexer makes. Narrow so tests can supply a fake. */
 export type IndexerRpc = Pick<rpc.Server, "getLatestLedger" | "getHealth" | "getEvents">;
+
+/** A full-history archive able to re-serve a ledger range the RPC no longer
+ * keeps. Only `getEvents` is needed (see `lib/stellar.ts`). */
+export type { Archive };
 
 /** What `apply` did with an event, so a pass can account for every one. */
 export type ApplyOutcome = "applied" | "mismatched" | "unknown";
@@ -123,14 +128,24 @@ export class Indexer {
     server: IndexerRpc,
     config: IndexerConfig,
     merchantCache: MerchantSummaryCache = defaultMerchantSummaryCache,
+    archive?: Archive,
   ) {
     this.db = db;
     this.server = server;
     this.config = config;
     this.merchantCache = merchantCache;
+    this.archive = archive;
     // Publish the starting state, so a scrape sees the series from the first
     // moment and not only once the first pass has run.
     this.publishMetrics(0);
+  }
+
+  /** The archive used to backfill a gap, if ARCHIVE_URL was configured. */
+  private readonly archive: Archive | undefined;
+
+  /** Advance past a gap the RPC cannot serve; accepts silent under-reporting. */
+  private get allowGaps(): boolean {
+    return "ALLOW_GAPS" in this.config ? this.config.ALLOW_GAPS === true : this.config.allowGaps === true;
   }
 
   private contractIds(): string[] {
@@ -181,6 +196,19 @@ export class Indexer {
    * the oldest ledger the RPC node still serves. The result is clamped to the
    * node's retention window, since RPC rejects ranges that begin before it.
    */
+  /**
+   * Where this pass starts: the saved cursor; with none, the configured start
+   * ledger (normally the one the contracts were deployed at); with neither,
+   * the oldest ledger the RPC node still serves. The result is clamped to the
+   * node's retention window, since RPC rejects ranges that begin before it.
+   *
+   * When the saved cursor falls behind the oldest ledger the RPC still
+   * serves, every ledger in [cursor, oldest) is unreachable through this
+   * node — a gap. It is reported as a structured warning naming the exact
+   * missing range, and the cursor is not advanced past it unless an archive
+   * backfills it or ALLOW_GAPS=true accepts the loss: serving numbers that
+   * quietly understate revenue is worse than reporting the gap loudly.
+   */
   private async firstLedger(saved: number): Promise<number> {
     const health = await this.server.getHealth();
     const oldest = health.oldestLedger;
@@ -189,11 +217,66 @@ export class Indexer {
     if (wanted > 0 && wanted >= oldest) return wanted;
     if (wanted > 0) {
       logger.warn(
-        { wanted, oldest },
-        "start ledger is older than the RPC retention window; events before it are lost",
+        { gapFrom: wanted, gapTo: oldest, oldestLedger: oldest },
+        "gap between the indexed cursor and the oldest ledger the RPC serves",
+      );
+      if (this.archive) {
+        const applied = await this.backfillGap(wanted, oldest);
+        logger.info(
+          { gapFrom: wanted, gapTo: oldest, events: applied },
+          "backfilled gap from archive",
+        );
+        return oldest;
+      }
+      if (!this.allowGaps) {
+        const err = new Error(
+          `will not advance indexer cursor past missing ledgers [${wanted}, ${oldest}); set ALLOW_GAPS=true or configure ARCHIVE_URL`,
+        );
+        logger.error({ gapFrom: wanted, gapTo: oldest }, err.message);
+        throw err;
+      }
+      logger.warn(
+        { gapFrom: wanted, gapTo: oldest },
+        "ALLOW_GAPS=true: advancing past missing ledgers; events before the oldest RPC ledger are lost",
       );
     }
     return oldest;
+  }
+
+  /**
+   * Re-apply every contract event in [start, end) from the full-history
+   * archive, then advance the cursor to `end`. Writes are idempotent, so a
+   * backfill interrupted mid-range is replayed from the saved cursor on the
+   * next pass instead of duplicating anything.
+   */
+  private async backfillGap(start: number, end: number): Promise<number> {
+    if (!this.archive) return 0;
+    const filters: rpc.Api.EventFilter[] = [{ type: "contract", contractIds: this.contractIds() }];
+    let applied = 0;
+    let cursor: string | undefined;
+    let pastEnd = false;
+    for (;;) {
+      const request: rpc.Api.GetEventsRequest = cursor
+        ? { cursor, filters, limit: PAGE_LIMIT }
+        : { startLedger: start, endLedger: end, filters, limit: PAGE_LIMIT };
+      const page = await this.archive.getEvents(request);
+      for (const raw of page.events ?? []) {
+        if (raw.ledger >= end) {
+          pastEnd = true;
+          break;
+        }
+        const decoded = decodeEvent(raw);
+        if (!decoded) continue;
+        if (this.apply(decoded) !== "mismatched") applied += 1;
+      }
+      if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
+      cursor = page.cursor;
+    }
+    // Only advance after the whole gap is applied, so a retry replays it
+    // safely: every apply path is idempotent.
+    writeCursor(this.db, end);
+    this.status.cursor = end;
+    return applied;
   }
 
   /**

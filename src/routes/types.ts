@@ -113,6 +113,8 @@ export interface DueMandateRow {
 
 export interface PlanPage {
   plans: PlanRow[];
+  /** Opaque cursor to fetch the page after this one; null on the final page. */
+  nextCursor: string | null;
 }
 
 /** Per-plan statistics for comparing plans at a glance. */
@@ -134,6 +136,8 @@ export interface PlanStatsResponse {
 
 export interface MandatePage {
   mandates: MandateRow[];
+  /** Opaque cursor to fetch the page after this one; null on the final page. */
+  nextCursor: string | null;
 }
 
 export interface ChargePage {
@@ -353,6 +357,17 @@ export interface UpcomingChargesResponse {
   totalUpcoming: string;
   truncated: boolean;
   assumptions: string[];
+}
+
+/** A registered webhook destination for charge events, returned to the
+ *  merchant at registration (including the HMAC signing secret). */
+export interface WebhookRegistration {
+  id: number;
+  merchant: string;
+  url: string;
+  /** HMAC-SHA256 key used to sign delivery requests. */
+  secret: string;
+  active: boolean;
 }
 
 export interface StatsResponse {

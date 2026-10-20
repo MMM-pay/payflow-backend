@@ -119,6 +119,26 @@ const schema = z.object({
   INDEXER_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
   INDEXER_START_LEDGER: z.coerce.number().int().nonnegative().default(0),
   /**
+   * A full-history archive that can re-serve ledgers the RPC node no longer
+   * keeps. When the stored cursor falls behind the oldest ledger RPC serves
+   * (a gap), the archive backfills it before indexing continues. The archive
+   * must answer the same getEvents shape as Soroban RPC
+   * (`startLedger`, `endLedger`, `limit`, `cursor`). Unset means gaps are
+   * reported and refused instead of backfilled.
+   */
+  ARCHIVE_URL: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || isHttpUrl(value), "must be an http(s) URL"),
+  /**
+   * Let the indexer advance its cursor past a gap the RPC cannot serve,
+   * accepting that history in the gap is lost and the projection will
+   * under-report. Without this the indexer refuses to advance past a gap
+   * until ARCHIVE_URL is configured.
+   */
+  ALLOW_GAPS: z.string().default("false").transform((v) => v === "true"),
+  /**
    * How often the reconciler re-checks a sample of active mandates against the
    * contract state. An indexer pass can miss an event (RPC gap, bug); this
    * pass repairs drift the projection would otherwise keep forever.
@@ -181,6 +201,10 @@ export interface NetworkConfig {
   startLedger: number;
   /** SQLite file holding this network's projection. */
   databasePath: string;
+  /** Full-history archive URL used to backfill a detected gap. */
+  archiveUrl?: string | undefined;
+  /** Advance the cursor past a gap the RPC cannot serve. */
+  allowGaps?: boolean | undefined;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -232,7 +256,11 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
       databasePath: config.DATABASE_PATH,
     },
     ...names.map((name) => extraNetwork(name, config, env)),
-  ];
+  ].map((network) => ({
+    ...network,
+    archiveUrl: config.ARCHIVE_URL,
+    allowGaps: config.ALLOW_GAPS,
+  }));
 }
 
 function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): NetworkConfig {

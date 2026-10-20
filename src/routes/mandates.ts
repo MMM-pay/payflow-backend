@@ -9,10 +9,11 @@ import {
   planTokensByIds,
 } from "../lib/queries.ts";
 import type { TokenMetadataService } from "../lib/tokens.ts";
-import { limitOf, tokenFields } from "./helpers.ts";
+import { encodeCursor, limitOf, tokenFields } from "./helpers.ts";
 import { sendApiError } from "./errors.ts";
 import {
   addressSchema,
+  cursorSchema,
   idSchema,
   limitSchema,
   mandateStatusSchema,
@@ -90,26 +91,38 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
       present(req.query.status),
     );
     if (!status.ok) return;
+    const cursor = validate(
+      req,
+      res,
+      "cursor",
+      cursorSchema.optional(),
+      present(req.query.cursor),
+    );
+    if (!cursor.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
-    const rows = listMandates(db, {
+    const page = listMandates(db, {
       ids: parsedIds,
       subscriber: subscriber.value,
       merchant: merchant.value,
       status: status.value,
+      cursor: cursor.value,
       limit: limitOf(limit.value),
     });
     // A mandate carries no token of its own; it inherits its plan's, batched
     // into one read per page (see lib/queries.ts).
-    const planTokens = planTokensByIds(db, rows.map((row) => row.plan_id));
+    const planTokens = planTokensByIds(db, page.rows.map((row) => row.plan_id));
     const mandates = await Promise.all(
-      rows.map(async (row) => ({
+      page.rows.map(async (row) => ({
         ...row,
         ...(await tokenFields(tokens, planTokens.get(row.plan_id))),
       })),
     );
-    const body: MandatePage = { mandates };
+    const body: MandatePage = {
+      mandates,
+      nextCursor: page.nextCursorId === null ? null : encodeCursor(page.nextCursorId),
+    };
     res.json(body);
   });
 
