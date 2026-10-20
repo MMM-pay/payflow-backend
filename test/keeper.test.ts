@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
-import { Account, Keypair, StrKey, Transaction, scValToNative } from "@stellar/stellar-sdk";
+import {
+  Account,
+  Keypair,
+  StrKey,
+  Transaction,
+  nativeToScVal,
+  scValToNative,
+} from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
@@ -736,6 +743,170 @@ describe("keeper pass history", () => {
     assert.doesNotMatch(failure.error, new RegExp(keyA.publicKey()));
     assert.doesNotMatch(failure.error, new RegExp(keyA.secret()));
     assert.equal(history.at(-1)!.backoff[0]!.retryIn, 60);
+    db.close();
+  });
+});
+
+/**
+ * The keeper's vault balance check.
+ *
+ * `charge` pulls the whole amount out of the subscriber's vault, so a vault
+ * that holds less cannot pay: the simulation fails and the transaction is
+ * wasted. Reading `vault.balance` first skips those mandates.
+ */
+describe("keeper vault balance check", () => {
+  /** The token the seeded plans are denominated in. */
+  const TOKEN = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+  /** A plan, so a mandate knows which token its vault balance is about. */
+  function insertPlan(db: ReturnType<typeof openDatabase>, id: number, token: string): void {
+    db.prepare(
+      `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
+       VALUES (?, ?, 'p', ?, '1000', 60, 1, 1)`,
+    ).run(id, MERCHANT, token);
+  }
+
+  /**
+   * A node that answers the vault balance with `balance`, and refuses to
+   * answer when it is null. Every simulation is recorded, so a test can see
+   * which subscriber and token were asked about.
+   */
+  function balanceRpc(
+    balance: bigint | null,
+    submitted: string[],
+    asked: { subscriber: string; token: string }[] = [],
+  ): KeeperRpc {
+    return {
+      ...fakeRpc(new Set([keyA.publicKey()]), submitted),
+      simulateTransaction: async (tx: Transaction) => {
+        const { func } = tx.operations[0] as unknown as {
+          func: { invokeContract: { functionName?: string; args: unknown[] } };
+        };
+        asked.push({
+          subscriber: String(scValToNative(func.invokeContract.args[0]! as never)),
+          token: String(scValToNative(func.invokeContract.args[1]! as never)),
+        });
+        if (balance === null) throw new Error("rpc unavailable");
+        return {
+          result: { retval: nativeToScVal(balance, { type: "i128" }) },
+        } as never;
+      },
+    } as unknown as KeeperRpc;
+  }
+
+  test("reads the subscriber's balance for the mandate's token before settling", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    insertMandate(db, 1, 1_000, "1000");
+    const submitted: string[] = [];
+    const asked: { subscriber: string; token: string }[] = [];
+    const keeper = new Keeper(
+      db,
+      balanceRpc(1_000n, submitted, asked),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.deepEqual(asked, [{ subscriber: SUBSCRIBER, token: TOKEN }]);
+    assert.equal(results[0]!.status, "settled", "a vault that can cover the charge settles it");
+    assert.equal(submitted.length, 1);
+    db.close();
+  });
+
+  test("skips a mandate the vault cannot cover, and logs the shortfall once", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    insertMandate(db, 1, 1_000, "1000");
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      balanceRpc(400n, submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const warnings = await captureWarnLog(async () => {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(results, [], "nothing was settled");
+    });
+
+    assert.equal(submitted.length, 0, "no transaction was built for a mandate the vault cannot cover");
+    assert.equal(
+      warnings.filter((message) => message.includes("cannot cover")).length,
+      1,
+      "the skipped mandate is logged once",
+    );
+    const pass = keeper.passHistory()[0]!;
+    assert.equal(pass.skipped?.length, 1);
+    assert.deepEqual(pass.skipped?.[0], {
+      mandateId: 1,
+      required: "1000",
+      balance: "400",
+      shortfall: "600",
+    });
+    db.close();
+  });
+
+  test("a skipped mandate does not take the batch's place", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    // Two mandates of the same subscriber: the first one costs more than the
+    // vault holds, the second one fits in what is left.
+    insertMandate(db, 1, 1_000, "1000");
+    insertMandate(db, 2, 1_001, "100");
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      balanceRpc(400n, submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.deepEqual(results.map((r) => r.mandateId), [2], "the affordable mandate still settles");
+    assert.equal(results[0]!.status, "settled");
+    assert.equal(submitted.length, 1, "only the affordable mandate was charged");
+    const pass = keeper.passHistory()[0]!;
+    assert.equal(pass.skipped?.length, 1);
+    assert.equal(pass.skipped?.[0]?.mandateId, 1);
+    assert.equal(pass.skipped?.[0]?.shortfall, "600");
+    db.close();
+  });
+
+  test("a balance that cannot be read leaves the charge to decide", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    insertMandate(db, 1, 1_000, "1000");
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      balanceRpc(null, submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.equal(results[0]!.status, "settled", "an unreadable balance is not a shortfall");
+    assert.equal(submitted.length, 1);
+    assert.equal(keeper.passHistory()[0]!.skipped?.length, 0);
+    db.close();
+  });
+
+  test("an RPC without simulations settles exactly as before", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    insertMandate(db, 1, 1_000, "1000");
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      fakeRpc(new Set([keyA.publicKey()]), submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.equal(results[0]!.status, "settled");
+    assert.equal(submitted.length, 1);
     db.close();
   });
 });

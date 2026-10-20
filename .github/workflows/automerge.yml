@@ -21,13 +21,17 @@ on:
         type: boolean
         default: false
 
+# The shared workflow merges pull requests and closes the issues that the
+# merged pull request closes. These are the permissions it needs. The job
+# below repeats them, because a called workflow gets the permissions of the
+# job that calls it and can never widen them.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  checks: read
-  statuses: read
-  actions: write
+  contents: write # merge the pull request: the merge commits to the base branch
+  pull-requests: write # read pull requests, their files and their reviews, and merge them
+  issues: write # comment on pull requests and close the issues a merge closes
+  checks: read # read the check runs on the head commit
+  statuses: read # read the combined commit status of the head commit
+  actions: write # approve held CI runs from forks and dispatch the next workflow
 
 concurrency:
   group: automerge
@@ -35,7 +39,21 @@ concurrency:
 
 jobs:
   automerge:
-    uses: MMM-pay/.github/.github/workflows/automerge.yml@main
+    # The called workflow runs with exactly these permissions: it cannot ask
+    # for more, and it cannot be given less than it needs to do its job.
+    permissions:
+      contents: write # merge the pull request
+      pull-requests: write # read the pull request, its files and its reviews
+      issues: write # comment on the pull request and close the linked issues
+      checks: read # read the check runs on the head commit
+      statuses: read # read the combined commit status
+      actions: write # approve held fork CI runs and dispatch the post-merge workflow
+    # Pinned to the commit, so that a moved branch in the shared repository
+    # cannot change what runs here. Dependabot keeps the pin current: it
+    # moves a tagged action to the newest release, and it follows the latest
+    # commit of the shared repository's default branch, which publishes no
+    # releases of its own.
+    uses: MMM-pay/.github/.github/workflows/automerge.yml@587622ca84b602f128cc3961da02560e950fe1c9 # main
     with:
       post_merge_workflows: "ci.yml"
       request_pages_build: false

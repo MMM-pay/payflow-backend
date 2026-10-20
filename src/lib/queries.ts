@@ -10,7 +10,7 @@ import type {
   ChargeRow,
   ChurnBucket,
   ChurnBucketSize,
-  DueMandateRow,
+  DueMandateRecord,
   ProtocolResponse,
   MandateRow,
   MerchantChurnResponse,

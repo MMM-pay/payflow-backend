@@ -8,13 +8,26 @@ on:
   # Lets the auto-merge workflow run CI on main after it merges a PR.
   workflow_dispatch:
 
+# Every job below only reads the repository: it checks the code out and runs
+# a command against it. Nothing here writes to the repository, the API or the
+# package registry, so the token gets read-only access to the contents and
+# nothing else. Any permission that is not listed is set to none.
+#
+# The npm cache is not affected by this: it is written through the runner's
+# own cache token, not through GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    # Check the code out and read it. Nothing else.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -24,9 +37,12 @@ jobs:
   typecheck:
     name: typecheck
     runs-on: ubuntu-latest
+    # Check the code out and read it. Nothing else.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -36,9 +52,12 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # Check the code out and read it. Nothing else.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -79,9 +98,13 @@ jobs:
   audit:
     name: audit
     runs-on: ubuntu-latest
+    # Check the code out and read it. The audit talks to the npm registry,
+    # not to the repository, so it needs no permission of its own.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -91,9 +114,12 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    # Check the code out and read it. Nothing else.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -107,10 +133,15 @@ jobs:
   docker:
     name: docker build
     runs-on: ubuntu-latest
+    # Check the code out and build the image from it. The build pushes
+    # nothing, so it needs no permission beyond reading the source: the
+    # build cache is written through the runner's own cache token.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: false

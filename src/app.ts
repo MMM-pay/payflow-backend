@@ -12,11 +12,13 @@ import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
 import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
 import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
+import { buildOpenApiDocument } from "./routes/openapi.ts";
 import { asReader, TokenMetadataService } from "./lib/tokens.ts";
 import { sendApiError } from "./routes/errors.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
+import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
 
 /**
@@ -269,6 +271,32 @@ export function createApp(
       handler: (req, res) => sendApiError(res, req, 429, "rate_limited"),
     }),
   );
+
+  // The API's own description: an OpenAPI 3.1 document covering every route
+  // this instance serves. It is built once and cached, so a scrape costs
+  // nothing beyond the JSON response.
+  const openApiDocument = buildOpenApiDocument({
+    networks: runtimes.map((rt) => rt.config.name),
+  });
+  app.get("/api/openapi.json", (_req, res) => {
+    res.setHeader("Cache-Control", "public, max-age=60");
+    res.json(openApiDocument);
+  });
+
+  // Prometheus metrics. Opt-in: without METRICS_ENABLED the path does not
+  // exist and answers 404 like any other unknown route.
+  if (config.METRICS_ENABLED) {
+    app.get("/metrics", (_req, res) => {
+      // The gauges describe the projection as it stands, not as it stood
+      // after the last pass, so they are refreshed before the render.
+      for (const rt of runtimes) {
+        if (rt.indexer) publishIndexerMetrics(rt.indexer, rt.config.name);
+      }
+      res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      res.send(metrics.render());
+    });
+  }
 
   // Always 200 so a slow backfill does not get the service restarted; the
   // body says whether the projection is current.

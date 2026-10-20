@@ -7,6 +7,26 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **An OpenAPI description of the API (#7).** `GET /api/openapi.json` serves an
+  OpenAPI 3.1 document covering every route and `/health`, with the parameters
+  each route takes, the responses it answers and the schema of each body.
+  Amounts are documented as decimal strings in the token's smallest unit, so a
+  generated client knows not to read them as numbers. A test compares the
+  document with the routes Express registers, so a route that is added without
+  being documented fails the build.
+- **Prometheus metrics (#9).** With `METRICS_ENABLED=true` the service serves
+  `/metrics` in the Prometheus text format: gauges for the indexer's cursor,
+  the latest ledger and the lag, and counters for the events applied, the
+  charges settled, the charges failed and the keeper passes. The endpoint is
+  off by default; the new variable is in `.env.example` and the README's
+  configuration table.
+- **The keeper skips mandates the vault cannot cover (#8).** Before it settles
+  anything, the keeper reads `vault.balance(subscriber, token)` from the
+  contract — a read-only simulation, no transaction and no fee — and skips a
+  mandate whose amount the vault does not hold, logging the shortfall once per
+  pass. A balance that cannot be read is not treated as a shortfall, so an RPC
+  hiccup never stops a settlement. `GET /api/due` gained a `funded` flag per
+  mandate, computed from the last vault balance the indexer saw.
 - **Merchant revenue over time (#12).** `GET /api/merchants/:address/revenue`
   reports what a merchant took in, what the protocol took and what was left,
   in `day`, `week` or `month` buckets: `gross`, `fee` and `net` per bucket,
@@ -129,6 +149,10 @@ All notable changes to payflow-backend. The format follows
 
 ### Changed
 
+- **A mandate that does not exist has no charges (#10).**
+  `GET /api/mandates/:id/charges` used to answer `200` with an empty list for
+  an unknown id, so "no such mandate" and "no charges yet" looked the same. It
+  now answers `404 mandate_not_found`, like `GET /api/mandates/:id` does.
 - **A charge is stamped with the chain's clock (#13).** `charges.created_at`
   was the moment the indexer happened to see the charge, so every charge
   indexed in one backfill shared one timestamp and any time-based view of the

@@ -114,6 +114,15 @@ in the builder, production dependencies only in the final image.
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
   queue would block every other mandate.
+- **A mandate the vault cannot cover is skipped, not charged.** Before it
+  settles anything, the keeper reads `vault.balance(subscriber, token)` from
+  the contract — a read-only simulation, no transaction and no fee. One read
+  per subscriber and token per pass, so a subscriber with several mandates
+  costs one read, not one each. A mandate whose amount the vault cannot cover
+  is skipped, and the skip is logged once per pass with the shortfall. The
+  other mandates of the pass settle as usual, and a balance that cannot be
+  read (RPC down) is not treated as a shortfall: the charge decides, exactly
+  as before.
 - **Events are validated against the contract spec.** Every decoded event is
   checked against `src/lib/event_spec.json` before it is projected. A renamed
   or retyped contract field makes the event fail validation: it is logged with
@@ -202,6 +211,8 @@ When extra networks are configured (see below), every route also answers under
 |---|---|---|
 | `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, `paused` state, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
 | `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
+| `GET` | `/metrics` | Prometheus metrics: the indexer's gauges and the keeper's counters (only when `METRICS_ENABLED=true`) |
+| `GET` | `/api/openapi.json` | The OpenAPI 3.1 description of this API |
 | `GET` | `/api/plans?merchant=&limit=` | Published plans |
 | `GET` | `/api/plans/:id` | One plan |
 | `GET` | `/api/plans/:id/stats` | Per-plan statistics: active and total mandates, cancellations, total collected, average charges per mandate |
@@ -212,8 +223,8 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/vault/:address` | Latest balance per token |
 | `GET` | `/api/vault/:address/events?limit=` | Vault deposit, withdrawal and debit history, newest first |
 | `GET` | `/api/protocol` | Current protocol fee (`fee_bps`) and fee-change history |
-| `GET` | `/api/keeper` | Last 20 keeper passes, failures and mandate backoff (only when enabled) |
-| `GET` | `/api/due` | Mandates chargeable right now |
+| `GET` | `/api/keeper` | Last 20 keeper passes, failures, skipped mandates and mandate backoff (only when enabled) |
+| `GET` | `/api/due` | Mandates chargeable right now, each with a `funded` flag |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/merchants/:address/subscribers?limit=` | The merchant's distinct subscribers, grouped by lifetime value |
 | `GET` | `/api/merchants/:address/churn?bucket=month&limit=` | Per-bucket churn: mandates started, cancelled, ended and completed, and the net |
@@ -233,6 +244,76 @@ Every address the API takes is checked as a Stellar StrKey — an account
 invalid_request` rather than an empty page. The checksum is checked too: a
 one-character typo has the right shape but the wrong checksum, and it names
 no merchant.
+
+### The OpenAPI description
+
+`GET /api/openapi.json` serves an [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0)
+document describing every route above, with the parameters each one takes, the
+responses it answers and the schema of each body. Amounts are documented as
+decimal strings in the token's smallest unit, so a generated client knows not
+to read them as numbers.
+
+The document is served by the instance it belongs to, so it lists the routes
+that instance actually has: the operator endpoints (`/admin/...`), the metrics
+endpoint and the keeper history are in it whatever the configuration says,
+and each says in its description what has to be true for it to answer.
+
+```bash
+curl -s localhost:8080/api/openapi.json | jq '.paths | keys'
+```
+
+A test compares the document with the routes Express registers, so a route
+that is added without being documented fails the build.
+
+### Metrics
+
+With `METRICS_ENABLED=true` the service serves `/metrics` in the Prometheus
+text format. It is off by default: the numbers are operational data, and a
+deployment that does not scrape them should not expose them.
+
+| Metric | Type | What it says |
+|---|---|---|
+| `payflow_indexer_cursor` | gauge | The ledger up to which events have been projected |
+| `payflow_indexer_latest_ledger` | gauge | The latest ledger the RPC node reported |
+| `payflow_indexer_lag` | gauge | How many ledgers the projection trails the network by |
+| `payflow_events_applied_total` | counter | Contract events applied to the projection |
+| `payflow_charges_settled_total` | counter | Charges the keeper settled |
+| `payflow_charges_failed_total` | counter | Charges the keeper could not settle |
+| `payflow_keeper_passes_total` | counter | Keeper passes run |
+
+The three indexer gauges carry a `network` label, so an instance that serves
+testnet and mainnet reports both. The counters are the process's own totals:
+they reset when the process restarts, which is what Prometheus expects.
+
+### The due list and the vault balance
+
+`GET /api/due` lists the mandates that can be charged right now. Each one
+carries a `funded` flag: whether the last vault balance the indexer saw covers
+the charge.
+
+```json
+{
+  "now": 1750000000,
+  "due": [
+    {
+      "id": 7,
+      "subscriber": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
+      "merchant": "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH",
+      "next_charge": 1749999940,
+      "amount": "10000000",
+      "funded": true
+    }
+  ]
+}
+```
+
+The balance is the one the indexer last saw, so it can be behind the chain: a
+subscriber who has just funded their vault is reported as not funded until the
+deposit is indexed. The keeper does not rely on it — it reads
+`vault.balance(subscriber, token)` from the contract before it settles
+anything, and skips a mandate the vault cannot cover. A skipped mandate is
+logged once per pass with the shortfall, and it does not take the pass's place:
+the other mandates settle as usual.
 
 ### Merchant churn
 
@@ -348,11 +429,16 @@ a stable `code` and show the human-readable `message` without parsing prose:
 > client bug looked like an empty page. Valid requests are unaffected; an
 > empty value (`?merchant=`) still means "no filter".
 
+> **Migration note (charges).** `GET /api/mandates/:id/charges` now answers
+> `404 mandate_not_found` for a mandate that does not exist, like
+> `GET /api/mandates/:id` does. Before, it answered `200` with an empty
+> list, so "no such mandate" and "no charges yet" looked the same.
+
 | `error.code` | HTTP | Where |
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
 | `plan_not_found` | 404 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` with no such plan |
-| `mandate_not_found` | 404 | `GET /api/mandates/:id` with no such mandate |
+| `mandate_not_found` | 404 | `GET /api/mandates/:id` or `GET /api/mandates/:id/charges` with no such mandate |
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
 | `too_many_ids` | 400 | `?ids=` lists more than 100 ids |
 | `invalid_request` | 400 | A query or path parameter is not valid; `error.details` says which |
@@ -526,6 +612,7 @@ examined without API downtime.
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
 | `API_RATE_LIMIT_MAX` | `120` | Maximum requests per IP in each API rate-limit window |
+| `METRICS_ENABLED` | `false` | Serve the Prometheus metrics at `/metrics` |
 | `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |

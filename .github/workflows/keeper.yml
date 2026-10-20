@@ -14,6 +14,10 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+# The job checks the code out and runs the indexer and the keeper against the
+# testnet. It never writes to the repository: the indexer database lives in
+# the Actions cache, which the runner writes through its own cache token and
+# not through GITHUB_TOKEN.
 permissions:
   contents: read
 
@@ -25,6 +29,10 @@ jobs:
   settle:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Check the code out and read it. The keeper key arrives as a repository
+    # secret, which does not need a permission of its own.
+    permissions:
+      contents: read
     env:
       STELLAR_NETWORK: testnet
       SOROBAN_RPC_URL: https://soroban-testnet.stellar.org
@@ -37,15 +45,15 @@ jobs:
       KEEPER_ENABLED: "true"
       KEEPER_SECRET: ${{ secrets.KEEPER_SECRET }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
       - run: npm ci
       # Restore the projection from the previous run so each run only indexes
       # the ledgers since then. A cache miss just means a full re-index.
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: keeper.db
           key: keeper-db-${{ env.SUBSCRIPTION_ID }}-${{ github.run_id }}
@@ -55,7 +63,7 @@ jobs:
       - name: Settle due mandates
         if: env.KEEPER_SECRET != ''
         run: npm run keeper
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         if: always()
         with:
           path: keeper.db

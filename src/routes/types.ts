@@ -82,6 +82,17 @@ export interface ChargeRow {
   created_at: number;
 }
 
+/** A due mandate as the projection holds it; its plan names the token. */
+export interface DueMandateRecord {
+  id: number;
+  subscriber: string;
+  merchant: string;
+  next_charge: number;
+  amount: string;
+  /** The plan the mandate was opened against; its token names the vault balance. */
+  plan_id: number;
+}
+
 /** A mandate from the `/due` list: the chargeable subset of a mandate. */
 export interface DueMandateRow {
   id: number;
@@ -89,6 +100,15 @@ export interface DueMandateRow {
   merchant: string;
   next_charge: number;
   amount: string;
+  /**
+   * Whether the last known vault balance covers this charge.
+   *
+   * The balance is the one the indexer last saw, so it can be behind the
+   * chain; the keeper reads the balance from the contract before it settles.
+   * A subscriber the projection has never seen holds nothing, so its
+   * mandates are reported as not funded.
+   */
+  funded: boolean;
 }
 
 export interface PlanPage {
@@ -168,6 +188,20 @@ export interface KeeperPassSummary {
   attempted: number;
   settled: number;
   failures: { mandateId: number; error: string }[];
+  /**
+   * Mandates the keeper did not try to settle because the subscriber's vault
+   * could not cover the charge. Every amount is a decimal string in the
+   * token's smallest unit.
+   */
+  skipped?: {
+    mandateId: number;
+    /** The amount the charge needs. */
+    required: string;
+    /** The balance the vault holds. */
+    balance: string;
+    /** What is missing. */
+    shortfall: string;
+  }[];
   backoff: { mandateId: number; failures: number; retryAt: number; retryIn: number }[];
 }
 

@@ -3,6 +3,7 @@ import type { Storage } from "../lib/store/types.ts";
 import {
   getMandateById,
   listDueMandates,
+  listLatestVaultBalances,
   listMandateCharges,
   listMandates,
   planTokensByIds,
@@ -20,6 +21,7 @@ import {
 } from "./validate.ts";
 import type {
   ChargePage,
+  DueMandateRow,
   DuePage,
   MandatePage,
 } from "./types.ts";

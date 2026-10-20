@@ -34,6 +34,11 @@ opens weekly updates for npm packages and GitHub Actions.
 
 ## Code standards
 
+- **Pin actions to a commit SHA.** Write `uses: owner/action@<sha> # v1.2.3`,
+  never a tag: a tag can be moved, and a moved tag runs someone else's code
+  with the workflow's token. Dependabot updates the SHA and the comment.
+- **Give every workflow and job the least permissions it needs.** List them
+  explicitly with a comment saying what each one is for.
 - **Strict TypeScript.** `strict`, `noUncheckedIndexedAccess`, and
   `exactOptionalPropertyTypes` are on. Do not weaken them; fix the type.
 - **No TypeScript parameter properties.** Node's type stripping rejects them.

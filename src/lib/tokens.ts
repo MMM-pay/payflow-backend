@@ -13,17 +13,15 @@
  * an unavailable metadata read and retried on the next lookup.
  */
 import {
-  Account,
   Asset,
   Contract,
-  StrKey,
   TransactionBuilder,
-  hash,
   rpc,
   scValToNative,
 } from "@stellar/stellar-sdk";
 import type { TokenMetadata } from "../routes/types.ts";
 import { logger } from "./logger.ts";
+import { simulationSource } from "./simulate.ts";
 
 /** Stroops per lumien: fixed by the protocol, never read from the network. */
 export const NATIVE_DECIMALS = 7;
@@ -76,15 +74,6 @@ export function nativeMetadata(networkPassphrase: string): TokenMetadata {
     name: "Stellar Lumens",
     decimals: NATIVE_DECIMALS,
   };
-}
-
-/**
- * Source account for a read-only simulation. Simulation ignores the sequence
- * number and never sees a signature, so a deterministic address derived from
- * the token id is enough — and keeps two tokens' calls from sharing a hash.
- */
-function simulationSource(tokenId: string): Account {
-  return new Account(StrKey.encodeEd25519PublicKey(hash(Buffer.from(tokenId, "utf8"))), "0");
 }
 
 /** Simulates one zero-argument view function and decodes its return value. */
