@@ -238,6 +238,27 @@ interface RunResult {
 }
 
 /**
+ * Start a stand-in for the API and answer `/health` with `body`.
+ *
+ * The body is sent as JSON unless it is a string, which is sent as it is —
+ * that is how a proxy or a different service answers, and the CLI has to
+ * survive it.
+ */
+async function withStubApi(body: unknown, run: (url: string) => Promise<void>): Promise<void> {
+  const server = createServer((_req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(typeof body === "string" ? body : JSON.stringify(body));
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const address = server.address() as AddressInfo;
+  try {
+    await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    server.close();
+  }
+}
+
+/**
  * Run the CLI with its collaborators replaced.
  *
  * The database is a fresh in-memory projection per command, the clock is
@@ -463,6 +484,78 @@ describe("cli status", () => {
     const result = await run(["status", "--offline", "--api", "http://127.0.0.1:1"]);
     assert.equal(result.code, 0, "an API that is down does not fail the command");
     assert.match(result.stdout, /api:\s+.*unreachable/);
+  });
+
+  test("reports the live indexer's health, which the projection does not hold", async () => {
+    await withStubApi(
+      {
+        status: "catching_up",
+        network: "testnet",
+        indexer: {
+          cursor: 100,
+          latestLedger: 400,
+          lag: 300,
+          paused: true,
+          freshnessSeconds: 42,
+          lastRunAt: "2026-10-20T00:00:00.000Z",
+          lastError: "rpc timeout",
+          mismatchedEvents: 3,
+          reconciliations: 7,
+          corrections: 1,
+        },
+      },
+      async (url) => {
+        const result = await run(["status", "--offline", "--api", url]);
+        assert.equal(result.code, 0);
+        assert.match(result.stdout, /api:\s+.*catching_up on testnet/);
+        assert.match(result.stdout, /indexer:\s+cursor 100, latest 400, lag 300, paused/);
+        assert.match(result.stdout, /freshness:\s+42s/);
+        assert.match(result.stdout, /last run:\s+2026-10-20T00:00:00.000Z/);
+        assert.match(result.stdout, /last error: rpc timeout/);
+        assert.match(result.stdout, /mismatched: 3 event\(s\) failed validation/);
+      },
+    );
+  });
+
+  test("the JSON output carries the API's health", async () => {
+    await withStubApi(
+      {
+        status: "ok",
+        network: "testnet",
+        indexer: { cursor: 100, latestLedger: 100, lag: 0, paused: false },
+      },
+      async (url) => {
+        const result = await run(["status", "--offline", "--api", url, "--json"]);
+        assert.equal(result.code, 0);
+        const payload = JSON.parse(result.stdout) as {
+          api: {
+            reachable: boolean;
+            health: { status: string; indexer: { cursor: number; lag: number; paused: boolean } };
+          };
+        };
+        assert.equal(payload.api.reachable, true);
+        assert.equal(payload.api.health.status, "ok");
+        assert.equal(payload.api.health.indexer.cursor, 100);
+        assert.equal(payload.api.health.indexer.lag, 0);
+        assert.equal(payload.api.health.indexer.paused, false);
+      },
+    );
+  });
+
+  test("an API that answers with something else is tolerated", async () => {
+    await withStubApi({ hello: "world" }, async (url) => {
+      const result = await run(["status", "--offline", "--api", url]);
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /api:\s+.*— unknown/);
+    });
+  });
+
+  test("an API that answers with no JSON at all is tolerated", async () => {
+    await withStubApi("not json at all", async (url) => {
+      const result = await run(["status", "--offline", "--api", url]);
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /api:\s+.*— unknown/);
+    });
   });
 });
 

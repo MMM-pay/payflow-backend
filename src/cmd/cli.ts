@@ -555,6 +555,28 @@ async function statusCommand(context: CommandContext): Promise<number> {
     write(`keeper:       ${keeper.summary}`);
     if (api !== null) {
       write(`api:          ${api.summary}`);
+      // The running indexer knows things the projection does not: whether it
+      // is held back, what it last failed on, how many events it rejected.
+      const live = api.health?.indexer ?? null;
+      if (live !== null) {
+        write(
+          `  indexer:    cursor ${live.cursor ?? "?"}, latest ${live.latestLedger ?? "?"}, lag ${
+            live.lag ?? "unknown"
+          }${live.paused ? ", paused" : ""}`,
+        );
+        if (live.freshnessSeconds !== null) {
+          write(`  freshness:  ${live.freshnessSeconds}s`);
+        }
+        if (live.lastRunAt !== null) {
+          write(`  last run:   ${live.lastRunAt}`);
+        }
+        if (live.lastError !== null) {
+          write(`  last error: ${live.lastError}`);
+        }
+        if (live.mismatchedEvents !== null && live.mismatchedEvents > 0) {
+          write(`  mismatched: ${live.mismatchedEvents} event(s) failed validation`);
+        }
+      }
     }
     return 0;
   } finally {
@@ -611,25 +633,124 @@ function keeperSummary(
 }
 
 /**
+ * The live indexer's health, as the API reports it.
+ *
+ * The running service is the only place this exists: the projection holds
+ * the cursor, but not whether the indexer is paused, what it last failed on
+ * or how many events failed validation.
+ */
+export interface ApiIndexerHealth {
+  /** The ledger the indexer has applied up to. */
+  cursor: number | null;
+  /** The ledger the network is on. */
+  latestLedger: number | null;
+  /** How far behind the indexer is. */
+  lag: number | null;
+  /** True when the indexer loop is held back at runtime. */
+  paused: boolean;
+  /** How long ago the network's last ledger closed. */
+  freshnessSeconds: number | null;
+  /** When the indexer last ran. */
+  lastRunAt: string | null;
+  /** The last error the indexer ran into. */
+  lastError: string | null;
+  /** Contract events that failed validation. */
+  mismatchedEvents: number | null;
+  /** Reconcile passes run. */
+  reconciliations: number | null;
+  /** Mandate rows the reconciler corrected. */
+  corrections: number | null;
+}
+
+/** What the API's `/health` says, as far as the CLI reads it. */
+export interface ApiHealth {
+  /** The API's own verdict: `ok`, `catching_up` or `starting`. */
+  status: string;
+  /** The network the API serves. */
+  network: string | null;
+  /** The live indexer's health, when the API runs one. */
+  indexer: ApiIndexerHealth | null;
+}
+
+/** A number in a JSON body, when the body holds one. */
+function jsonNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** A string in a JSON body, when the body holds one. */
+function jsonString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * Read the API's `/health` body.
+ *
+ * The body is the API's own `HealthResponse`, but the CLI reads it from an
+ * HTTP response whose shape it does not control: an older API, a proxy or a
+ * different service may answer with something else. Every field is therefore
+ * optional, and a body that is not a health report at all yields the API's
+ * verdict alone.
+ */
+export function parseApiHealth(body: unknown): ApiHealth {
+  const raw = (
+    typeof body === "object" && body !== null ? body : {}
+  ) as Record<string, unknown>;
+  const rawIndexer =
+    typeof raw.indexer === "object" && raw.indexer !== null
+      ? (raw.indexer as Record<string, unknown>)
+      : null;
+  return {
+    status: jsonString(raw.status) ?? "unknown",
+    network: jsonString(raw.network),
+    indexer:
+      rawIndexer === null
+        ? null
+        : {
+            cursor: jsonNumber(rawIndexer.cursor),
+            latestLedger: jsonNumber(rawIndexer.latestLedger),
+            lag: jsonNumber(rawIndexer.lag),
+            paused: rawIndexer.paused === true,
+            freshnessSeconds: jsonNumber(rawIndexer.freshnessSeconds),
+            lastRunAt: jsonString(rawIndexer.lastRunAt),
+            lastError: jsonString(rawIndexer.lastError),
+            mismatchedEvents: jsonNumber(rawIndexer.mismatchedEvents),
+            reconciliations: jsonNumber(rawIndexer.reconciliations),
+            corrections: jsonNumber(rawIndexer.corrections),
+          },
+  };
+}
+
+/**
  * Ask a running API instance how it sees itself.
  *
  * The probe is best effort: an API that is not running is a fact the
  * operator wants to know, not a failure of the command.
  */
-async function probeApi(
-  url: string,
-): Promise<{ url: string; reachable: boolean; summary: string }> {
+async function probeApi(url: string): Promise<{
+  url: string;
+  reachable: boolean;
+  summary: string;
+  health: ApiHealth | null;
+}> {
   const target = url.endsWith("/health") ? url : `${url.replace(/\/$/, "")}/health`;
   try {
     const response = await fetch(target, { signal: AbortSignal.timeout(5_000) });
-    const body = (await response.json()) as { status?: string; network?: string };
-    const summary = `${body.status ?? "unknown"}${body.network ? ` on ${body.network}` : ""}`;
-    return { url: target, reachable: response.ok, summary: `${target} — ${summary}` };
+    let body: unknown = null;
+    try {
+      body = await response.json();
+    } catch {
+      // A body that is not JSON is not a health report; the verdict below is
+      // all that can be said about it.
+    }
+    const health = parseApiHealth(body);
+    const summary = `${health.status}${health.network ? ` on ${health.network}` : ""}`;
+    return { url: target, reachable: response.ok, summary: `${target} — ${summary}`, health };
   } catch (err) {
     return {
       url: target,
       reachable: false,
       summary: `${target} — unreachable: ${err instanceof Error ? err.message : String(err)}`,
+      health: null,
     };
   }
 }
