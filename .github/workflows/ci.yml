@@ -47,9 +47,6 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      # `npm run typecheck` checks the sources and the tests, so a broken
-      # test type — one that hides a real API change until the test fails at
-      # run time — fails this job.
       - run: npm run typecheck
 
   test:
