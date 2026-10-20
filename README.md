@@ -58,7 +58,7 @@ replays that range on restart. Every write is designed for that:
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 466 tests, no network needed
+npm test                  # 472 tests, no network needed
 npm run dev
 ```
 
@@ -107,7 +107,9 @@ Two rules shape it:
 
 - **Nothing destructive happens by accident.** `charge` moves a subscriber's
   money and `reindex` rewrites the projection, so both refuse to run until
-  `--yes` says so.
+  `--yes` says so. `reindex --from` also refuses to move the cursor *forward*,
+  because the ledgers in between would never be applied; `--skip-ahead` is
+  how an operator accepts that gap on purpose.
 - **Amounts stay strings.** An amount is printed as the decimal string the
   projection stores and compared as a bigint; it never becomes a JavaScript
   number, so a stroop-scale amount keeps every digit. Secrets are never
@@ -116,6 +118,16 @@ Two rules shape it:
 `status`, `mandate` and `due` read the projection only and need no network;
 `--offline` keeps `status` from asking the RPC for the latest ledger at all.
 `charge` and `reindex` need the network, and `charge` needs `KEEPER_SECRET`.
+
+Point `status` at a running API to see what the service thinks of itself:
+
+```bash
+npm run cli -- status --api http://127.0.0.1:3000
+```
+
+That adds the API's verdict and the *live* indexer's health — whether it is
+paused, how far it trails, what it last failed on and how many events it
+rejected — which the projection file on its own does not hold.
 
 ### Running it in Docker
 

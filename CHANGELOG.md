@@ -15,7 +15,12 @@ All notable changes to payflow-backend. The format follows
   the indexer themselves, so the CLI cannot drift from what the service does.
   Every command has its own `--help`. The two commands that change something
   refuse to run until `--yes` says so, amounts are printed as the decimal
-  strings the projection stores, and no secret is ever printed.
+  strings the projection stores, and no secret is ever printed. `status --api`
+  adds the running instance's verdict and the live indexer's health — whether
+  it is paused, what it last failed on, how many events it rejected — which the
+  projection file on its own does not hold. `reindex --from` refuses to move
+  the cursor *forwards*, because the ledgers in between would never be applied;
+  `--skip-ahead` is how an operator accepts that gap on purpose.
 - **Keeper dry-run mode (#38).** `KEEPER_DRY_RUN=true` makes a settlement pass
   rehearse instead of settle: every due charge is built and simulated against
   the RPC exactly as a real pass would — account lookup, inclusion fee,

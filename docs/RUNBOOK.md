@@ -71,6 +71,10 @@ the service does, so it cannot disagree with the API.
 # The indexer's and the API's health: cursor, lag, counts, due mandates
 npm run cli -- status
 
+# ...and what a running instance thinks of itself: whether the indexer is
+# paused, what it last failed on, how many events it rejected
+npm run cli -- status --api http://127.0.0.1:3000
+
 # One mandate, its plan, its token and the charges it has settled
 npm run cli -- mandate 42
 
@@ -97,6 +101,20 @@ a charge moves a subscriber's money and spends a fee, and a re-index
 rewrites the projection. Re-indexing is safe to repeat — every write is an
 idempotent upsert or an `INSERT OR IGNORE`, so applying the same ledger
 range twice leaves the projection unchanged.
+
+Re-indexing *backwards* is safe; moving the cursor *forwards* is not, because
+the ledgers in between would never be applied and the indexer would not
+notice the gap it leaves behind. `reindex --from` refuses to do that, and
+says so:
+
+```
+error: refusing to move the cursor forward from 500000 to 900000: the ledgers
+in between would never be applied; re-index from 500000 or lower, or pass
+--skip-ahead to accept the gap
+```
+
+Use `--skip-ahead` only when the gap is intended — a node that no longer
+serves the older ledgers, for instance.
 
 ---
 
