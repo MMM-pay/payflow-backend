@@ -92,6 +92,25 @@ const schema = z.object({
     .bigint()
     .min(BigInt(BASE_FEE), `must be at least BASE_FEE (${BASE_FEE})`)
     .default(100_000n),
+  /**
+   * Settle due mandates through the subscription contract's `charge_many`
+   * entry point — one transaction for up to `KEEPER_BATCH_SIZE` mandates,
+   * instead of one `charge` transaction each — to cut keeper fees. On `true`
+   * (the default) the keeper still falls back to single charges the moment
+   * the contract's simulation reports that `charge_many` does not exist;
+   * `false` never batches. See MMM-pay/payflow-contract#8 for the entry
+   * point this uses.
+   */
+  KEEPER_BATCH: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true"),
+  /**
+   * Mandates per `charge_many` call. The contract caps the list so one call
+   * stays inside the per-transaction resource limits; keep this at or below
+   * that cap (the planned cap is 10).
+   */
+  KEEPER_BATCH_SIZE: z.coerce.number().int().min(2).max(25).default(10),
   KEEPER_ENABLED: z
     .string()
     .default("false")

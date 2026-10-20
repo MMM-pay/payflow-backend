@@ -58,7 +58,7 @@ replays that range on restart. Every write is designed for that:
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 394 tests, no network needed
+npm test                  # 408 tests, no network needed
 npm run dev
 ```
 
@@ -123,6 +123,17 @@ in the builder, production dependencies only in the final image.
   other mandates of the pass settle as usual, and a balance that cannot be
   read (RPC down) is not treated as a shortfall: the charge decides, exactly
   as before.
+- **Batch settlement when the contract supports it.** Due mandates are
+  grouped into one `charge_many` transaction of up to `KEEPER_BATCH_SIZE`
+  mandates (default 10) instead of one `charge` each, so a pass pays one fee
+  for the whole group. Support is detected from the contract itself: the
+  first simulation that reports no `charge_many` switches the keeper to
+  single charges for the rest of the process (a `SIGHUP` reload re-detects,
+  for a redeployed contract), and a batch that cannot run — refused in
+  simulation, rejected, or failed on chain — falls back to single charges
+  for that group in that pass. The contract's per-id `Vec<bool>` result
+  still fails and backs off skipped mandates individually, and
+  `KEEPER_BATCH=false` disables batching entirely.
 - **Events are validated against the contract spec.** Every decoded event is
   checked against `src/lib/event_spec.json` before it is projected. A renamed
   or retyped contract field makes the event fail validation: it is logged with
@@ -602,6 +613,8 @@ examined without API downtime.
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
 | `KEEPER_FEE_PERCENTILE` | `90` | Soroban inclusion-fee percentile used for charge transactions (`50`, `60`, `70`, `80`, `90`, `95`, or `99`) |
 | `KEEPER_MAX_FEE` | `100000` | Maximum inclusion fee in stroops; congestion retries cannot exceed this cap |
+| `KEEPER_BATCH` | `true` | Settle due mandates through the contract's `charge_many` in groups, falling back to single `charge` transactions when the contract does not support it |
+| `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |

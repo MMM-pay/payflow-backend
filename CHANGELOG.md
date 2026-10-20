@@ -7,6 +7,19 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **Batch settlement with `charge_many` (#37).** When the subscription contract
+  exposes `charge_many(mandate_ids: Vec<u64>) -> Vec<bool>`
+  (MMM-pay/payflow-contract#8), the keeper groups up to `KEEPER_BATCH_SIZE`
+  (default 10) due mandates into one transaction — one fee, one signature and
+  one confirmation for the whole group instead of each mandate's own — and
+  reads the per-id results so a mandate the contract skipped still fails and
+  backs off individually. Support is detected from the contract: the first
+  simulation that reports the entry point missing (and any batch that is
+  rejected or fails on chain) falls back to single `charge` transactions for
+  that group, with the missing entry point remembered until a config reload,
+  so an unsupported contract costs at most one extra simulation and never a
+  settlement. `KEEPER_BATCH=false` disables batching; both new variables are
+  documented in the README's configuration table.
 - **An OpenAPI description of the API (#7).** `GET /api/openapi.json` serves an
   OpenAPI 3.1 document covering every route and `/health`, with the parameters
   each route takes, the responses it answers and the schema of each body.
