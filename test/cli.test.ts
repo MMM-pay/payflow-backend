@@ -843,4 +843,53 @@ describe("cli reindex", () => {
     assert.equal(result.code, 1);
     assert.match(result.stderr, /--from must be a non-negative integer/);
   });
+
+  test("refuses to move the cursor forward, which would skip the ledgers in between", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "payflow-cli-"));
+    const path = join(dir, "payflow.db");
+    try {
+      // A projection that has already been indexed up to ledger 100.
+      const seed = openDatabase(path);
+      writeCursor(seed, 100);
+      seed.close();
+
+      const result = await run(["reindex", "--from", "150", "--yes"], {
+        openDb: () => openDatabase(path),
+        rpc: () => fakeRpc({ latest: 200, oldest: 0 }),
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /refusing to move the cursor forward from 100 to 150/);
+      assert.match(result.stderr, /--skip-ahead/);
+
+      // The refused command changed nothing: the cursor is where it was.
+      const projection = openDatabase(path);
+      assert.equal(readCursor(projection, 0), 100);
+      projection.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("--skip-ahead accepts the gap the operator asked for", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "payflow-cli-"));
+    const path = join(dir, "payflow.db");
+    try {
+      const seed = openDatabase(path);
+      writeCursor(seed, 100);
+      seed.close();
+
+      const result = await run(["reindex", "--from", "150", "--yes", "--skip-ahead"], {
+        openDb: () => openDatabase(path),
+        rpc: () => fakeRpc({ latest: 200, oldest: 0 }),
+      });
+      assert.equal(result.code, 0);
+      assert.match(result.stdout, /re-indexed testnet from ledger 150/);
+
+      const projection = openDatabase(path);
+      assert.equal(readCursor(projection, 0), 200);
+      projection.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

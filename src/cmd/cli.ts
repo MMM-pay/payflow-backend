@@ -247,6 +247,10 @@ const COMMAND_LIST: CommandSpec[] = [
         description: "Ledger to restart from (default: the network's start ledger)",
       },
       { name: "yes", description: "Confirm: move the cursor back and re-apply events" },
+      {
+        name: "skip-ahead",
+        description: "Allow --from to move the cursor forward, leaving the ledgers in between unapplied",
+      },
     ],
     notes: [
       "Re-indexing is safe: every write is an idempotent upsert or an",
@@ -255,6 +259,9 @@ const COMMAND_LIST: CommandSpec[] = [
       "window is applied, so an interrupted run resumes where it stopped.",
       "The command refuses to run without --yes, because it rewrites the",
       "projection and moves the cursor.",
+      "Moving the cursor forward is refused as well: the ledgers in between",
+      "would never be applied, and the indexer would not notice the gap it",
+      "leaves. --skip-ahead accepts it.",
     ],
   },
 ];
@@ -987,6 +994,17 @@ async function reindexCommand(context: CommandContext): Promise<number> {
     const from = optionValue(args.options, "from");
     const start = from === undefined ? context.network.startLedger : nonNegativeInt(from, "--from");
     const before = readCursor(db, 0);
+
+    // Moving the cursor forward would leave the ledgers in between unapplied:
+    // the indexer starts at the cursor, so it would never see them and the
+    // projection would carry a gap nobody is told about. Re-indexing *back*
+    // is safe — the events are re-applied — but skipping forward is a loss,
+    // so the operator has to accept it out loud.
+    if (before > 0 && start > before && !flag(args.options, "skip-ahead")) {
+      throw new CliError(
+        `refusing to move the cursor forward from ${before} to ${start}: the ledgers in between would never be applied; re-index from ${before} or lower, or pass --skip-ahead to accept the gap`,
+      );
+    }
 
     writeCursor(db, start);
     const rpc = (deps.rpc ?? makeRpc)(context.network);
