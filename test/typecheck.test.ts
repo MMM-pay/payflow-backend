@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
-import { spawnSync } from "node:child_process";
 import { cp, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 /** The repository root: the tsconfig lives there. */
 const root = fileURLToPath(new URL("..", import.meta.url));
 
-/** The compiler the CI job runs. */
-const tsc = fileURLToPath(new URL("../node_modules/typescript/bin/tsc", import.meta.url));
+/** The file the compiler reports the error against. */
+function reportedPath(file: ts.SourceFile): string {
+  return file.fileName.split("\\").join("/");
+}
 
 describe("test files are type-checked", () => {
   test("a type error in a test file fails the typecheck the CI job runs", async () => {
@@ -31,34 +33,51 @@ describe("test files are type-checked", () => {
       await cp(join(root, "package.json"), join(dir, "package.json"));
       // The compiler finds the dependencies through node_modules.
       await symlink(join(root, "node_modules"), join(dir, "node_modules"), "dir");
+
       // The probe: a file under `test/` with a deliberate type error.
-      await writeFile(
-        join(dir, "test", "typecheck-probe.ts"),
-        'export const broken: number = "not a number";\n',
-        "utf8",
+      const probe = join(dir, "test", "typecheck-probe.ts");
+      await writeFile(probe, 'export const broken: number = "not a number";\n', "utf8");
+
+      // The project the CI typecheck job compiles: the compiler reads
+      // `tsconfig.test.json` — which extends `tsconfig.json` and includes
+      // `test/` — and reports the errors it finds. The CI job fails because
+      // `tsc` exits non-zero, and `tsc` exits non-zero when there are
+      // errors, so the errors are what has to be looked at.
+      const configFile = ts.readConfigFile(join(dir, "tsconfig.test.json"), ts.sys.readFile);
+      assert.ok(configFile.config, "tsconfig.test.json is readable");
+      const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, dir);
+      assert.ok(
+        parsed.fileNames.some((name) => name.endsWith("test/typecheck-probe.ts")),
+        "the probe is part of the project the compiler checks",
       );
 
-      // The exact command the CI typecheck job runs for the tests.
-      const result = spawnSync(
-        process.execPath,
-        [tsc, "--noEmit", "-p", join(dir, "tsconfig.test.json")],
-        { cwd: dir, encoding: "utf8" },
-      );
-      const output = `${result.stdout}${result.stderr}`;
+      const program = ts.createProgram({
+        rootNames: parsed.fileNames,
+        options: { ...parsed.options, noEmit: true },
+      });
+      const errors = ts
+        .getPreEmitDiagnostics(program)
+        .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error);
 
-      assert.notEqual(result.status, 0, `the typecheck must fail:\n${output}`);
-      assert.match(output, /typecheck-probe\.ts/, "the error names the file that carries it");
-      assert.match(output, /error TS\d+/, "the failure is a type error");
+      const inProbe = errors.filter(
+        (diagnostic) => diagnostic.file && reportedPath(diagnostic.file) === probe,
+      );
+      assert.ok(inProbe.length > 0, "the probe's type error is reported");
+      assert.match(
+        ts.flattenDiagnosticMessageText(inProbe[0]!.messageText, " "),
+        /not assignable to type 'number'/,
+        "the failure is a type error",
+      );
 
       // Every other file is clean, so the failure above is the probe's and
       // not a pre-existing one: the repository's own tests type-check.
-      const failures = output
-        .split("\n")
-        .filter((line) => /error TS\d+/.test(line) && /test[\\/]/.test(line));
-      assert.ok(failures.length > 0, `the probe is reported:\n${output}`);
-      assert.ok(
-        failures.every((line) => line.includes("typecheck-probe.ts")),
-        `only the probe fails:\n${output}`,
+      const elsewhere = errors.filter(
+        (diagnostic) => diagnostic.file && reportedPath(diagnostic.file) !== probe,
+      );
+      assert.deepEqual(
+        elsewhere.map((diagnostic) => `${reportedPath(diagnostic.file!)}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, " ")}`),
+        [],
+        "only the probe fails",
       );
     } finally {
       // The symlink is removed first, so the cleanup cannot reach the
