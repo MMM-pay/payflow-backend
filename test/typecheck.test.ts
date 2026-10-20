@@ -26,6 +26,9 @@ describe("test files are type-checked", () => {
       await cp(join(root, "test"), join(dir, "test"), { recursive: true });
       await cp(join(root, "tsconfig.json"), join(dir, "tsconfig.json"));
       await cp(join(root, "tsconfig.test.json"), join(dir, "tsconfig.test.json"));
+      // The package manifest decides that the files are ES modules, which is
+      // what lets them use `import.meta`.
+      await cp(join(root, "package.json"), join(dir, "package.json"));
       // The compiler finds the dependencies through node_modules.
       await symlink(join(root, "node_modules"), join(dir, "node_modules"), "dir");
       // The probe: a file under `test/` with a deliberate type error.

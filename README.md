@@ -58,7 +58,7 @@ replays that range on restart. Every write is designed for that:
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 419 tests, no network needed
+npm test                  # 466 tests, no network needed
 npm run dev
 ```
 
@@ -73,6 +73,49 @@ Run one settlement pass and exit (needs `KEEPER_SECRET`):
 ```bash
 npm run keeper
 ```
+
+Answer the questions an incident asks, without writing SQL (see
+[the operator CLI](#the-operator-cli)):
+
+```bash
+npm run cli -- status
+npm run cli -- mandate 42
+npm run cli -- due
+```
+
+### The operator CLI
+
+`npm run cli -- <command>` is the same projection the API serves, read and
+written through the same code, so it cannot drift from what the service does.
+
+| Command | What it does |
+|---|---|
+| `status` | The indexer's and the API's health for a network: cursor, lag, counts, due mandates, keeper channels |
+| `mandate <id>` | One mandate, its plan, its token and the charges it has settled |
+| `due` | The mandates that are due for charging, each with the `funded` flag the last indexed vault balance gives |
+| `charge <id>` | Trigger a charge for one mandate, through the keeper |
+| `reindex` | Rebuild the projection from a ledger |
+
+Every command has its own help:
+
+```bash
+npm run cli -- --help
+npm run cli -- charge --help
+```
+
+Two rules shape it:
+
+- **Nothing destructive happens by accident.** `charge` moves a subscriber's
+  money and `reindex` rewrites the projection, so both refuse to run until
+  `--yes` says so.
+- **Amounts stay strings.** An amount is printed as the decimal string the
+  projection stores and compared as a bigint; it never becomes a JavaScript
+  number, so a stroop-scale amount keeps every digit. Secrets are never
+  printed: the keeper's public keys are shown, its secret seeds are not.
+
+`status`, `mandate` and `due` read the projection only and need no network;
+`--offline` keeps `status` from asking the RPC for the latest ledger at all.
+`charge` and `reindex` need the network, and `charge` needs `KEEPER_SECRET`.
 
 ### Running it in Docker
 

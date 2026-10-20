@@ -7,6 +7,15 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **An operator CLI (#41).** `npm run cli -- <command>` answers the questions an
+  incident asks — is the projection current, what does mandate 42 look like,
+  what is due, settle this mandate, rebuild the projection — without an ad-hoc
+  script or a hand-written SQL query. `status`, `mandate` and `due` read the
+  projection only and need no network; `charge` and `reindex` use the keeper and
+  the indexer themselves, so the CLI cannot drift from what the service does.
+  Every command has its own `--help`. The two commands that change something
+  refuse to run until `--yes` says so, amounts are printed as the decimal
+  strings the projection stores, and no secret is ever printed.
 - **Keeper dry-run mode (#38).** `KEEPER_DRY_RUN=true` makes a settlement pass
   rehearse instead of settle: every due charge is built and simulated against
   the RPC exactly as a real pass would — account lookup, inclusion fee,

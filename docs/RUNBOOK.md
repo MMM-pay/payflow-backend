@@ -61,6 +61,43 @@ journalctl -u payflow-backend -g "cannot cover" --no-pager
 Each line names the mandate and the shortfall, so a subscriber that needs a
 top-up can be found without reading the chain.
 
+### The operator CLI
+
+`npm run cli -- <command>` answers the same questions from the projection
+itself, without hand-written SQL. It reads and writes through the same code
+the service does, so it cannot disagree with the API.
+
+```bash
+# The indexer's and the API's health: cursor, lag, counts, due mandates
+npm run cli -- status
+
+# One mandate, its plan, its token and the charges it has settled
+npm run cli -- mandate 42
+
+# The mandates that are due for charging, and whether the vault covers them
+npm run cli -- due
+
+# Settle one mandate now (needs KEEPER_SECRET; spends a fee)
+npm run cli -- charge 42 --yes
+
+# Rebuild the projection from a ledger (rewrites the projection; moves the cursor)
+npm run cli -- reindex --from 500000 --yes
+
+# Every command has its own help
+npm run cli -- --help
+npm run cli -- reindex --help
+```
+
+`status`, `mandate` and `due` read the projection only and need no network;
+`--offline` keeps `status` from asking the RPC for the latest ledger at all.
+`charge` and `reindex` need the network.
+
+The two commands that change something refuse to run until `--yes` says so:
+a charge moves a subscriber's money and spends a fee, and a re-index
+rewrites the projection. Re-indexing is safe to repeat — every write is an
+idempotent upsert or an `INSERT OR IGNORE`, so applying the same ledger
+range twice leaves the projection unchanged.
+
 ---
 
 ## 2. Incident 1: Indexer Stuck or Lagging
@@ -87,21 +124,19 @@ If the indexer process is frozen or hung on a slow RPC call, restart the service
 sudo systemctl restart payflow-backend
 ```
 
-If the cursor is stuck on a corrupt range or needs rewinding by 1,000 ledgers to replay events:
+If the cursor is stuck on a corrupt range or needs rewinding to replay events, re-index from an earlier ledger. Every write is an idempotent upsert or an `INSERT OR IGNORE`, so replaying a range leaves the projection unchanged:
 ```bash
 # 1. Stop backend service
 sudo systemctl stop payflow-backend
 
 # 2. View current cursor
-CURRENT_CURSOR=$(sqlite3 payflow.db "SELECT value FROM meta WHERE key = 'cursor';")
-echo "Current cursor: $CURRENT_CURSOR"
+npm run cli -- status --offline
 
-# 3. Rewind cursor by 1000 ledgers (or to a known good ledger)
-NEW_CURSOR=$((CURRENT_CURSOR - 1000))
-sqlite3 payflow.db "UPDATE meta SET value = '$NEW_CURSOR' WHERE key = 'cursor';"
+# 3. Rewind to a known good ledger and replay from there
+npm run cli -- reindex --from 500000 --yes
 
-# 4. Run standalone indexer to catch up and verify
-npm run indexer
+# 4. Verify the projection caught up
+npm run cli -- status --offline
 
 # 5. Restart backend service
 sudo systemctl start payflow-backend

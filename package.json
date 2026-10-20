@@ -20,6 +20,7 @@
     "dev": "node --watch --experimental-strip-types src/index.ts",
     "indexer": "node --experimental-strip-types src/cmd/indexer.ts",
     "keeper": "node --experimental-strip-types src/cmd/keeper.ts",
+    "cli": "node --experimental-strip-types src/cmd/cli.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "typecheck:src": "tsc --noEmit -p tsconfig.json",
