@@ -16,7 +16,8 @@
 > **Live demo:** https://mmm-pay.github.io/payflow-frontend/ Â·
 > **Docs:** https://mmm-pay.github.io/payflow-docs/ ·
 > **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
-> **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md)
+> **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md) ·
+> **API changelog:** [API_CHANGELOG.md](API_CHANGELOG.md)
 
 ---
 
@@ -329,6 +330,12 @@ curl -s localhost:8080/api/openapi.json | jq '.paths | keys'
 
 A test compares the document with the routes Express registers, so a route
 that is added without being documented fails the build.
+
+The document's `externalDocs` points at
+[API_CHANGELOG.md](API_CHANGELOG.md), which records what changed in the API
+between releases and how long a deprecated field or route keeps working before
+it is removed — one minor release of notice, announced in the response with
+`Deprecation` and `Sunset` headers.
 
 ### Metrics
 
@@ -825,7 +832,8 @@ Docker](#running-it-in-docker)).
 See [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `lint`, `typecheck`, `test`,
 `build`, a container build and a production `audit`; all six must pass, and
 Dependabot keeps dependencies current. Changes are recorded in
-[CHANGELOG.md](CHANGELOG.md).
+[CHANGELOG.md](CHANGELOG.md), and changes to the API surface in
+[API_CHANGELOG.md](API_CHANGELOG.md).
 
 ## Security
 

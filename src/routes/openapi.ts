@@ -87,6 +87,7 @@ export interface OpenApiDocument {
   };
   servers?: { url: string; description?: string }[];
   tags?: { name: string; description?: string }[];
+  externalDocs?: { url: string; description?: string };
   paths: Record<string, PathItemObject>;
   components?: {
     schemas?: Record<string, SchemaObject>;
@@ -96,6 +97,16 @@ export interface OpenApiDocument {
 
 /** The API version, as `package.json` has it. */
 const API_VERSION = "0.2.0";
+
+/**
+ * The API changelog, which also carries the deprecation policy.
+ *
+ * It is linked from the document's `externalDocs` so a generated client keeps
+ * a pointer to it: a caller can see what changed between the version it was
+ * built against and the one it calls, and how long a deprecated field or
+ * route keeps working.
+ */
+const API_CHANGELOG_URL = "https://github.com/MMM-pay/payflow-backend/blob/main/API_CHANGELOG.md";
 
 /** How the document is mounted and what it may mention. */
 export interface OpenApiOptions {
@@ -1566,7 +1577,8 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       description:
         "The API serves a projection of the Payflow contracts' events: plans, mandates, the charges settled against them and the vault balances behind them.\n\n" +
         "Every amount is a decimal string in the token's smallest unit (stroops for XLM), never a JSON number, so no precision is lost. Every non-2xx response uses the same envelope, `{ \"error\": { \"code\", \"message\", \"requestId\" } }`, where `code` is stable per condition.\n\n" +
-        "When the instance serves more than one network, the same paths are also reachable under `/api/<network>/...`.",
+        "When the instance serves more than one network, the same paths are also reachable under `/api/<network>/...`.\n\n" +
+        "What changed in the API between releases, and how long a deprecated field or route keeps working before it is removed, is recorded in [API_CHANGELOG.md](API_CHANGELOG.md).",
       license: { name: "Apache-2.0", identifier: "Apache-2.0" },
     },
     servers: [{ url: "/", description: "This service." }],
@@ -1584,6 +1596,10 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       { name: "service", description: "Health, readiness, metrics and this document." },
       { name: "admin", description: "Operator endpoints; they need a bearer token." },
     ],
+    externalDocs: {
+      url: API_CHANGELOG_URL,
+      description: "The API changelog and the deprecation policy.",
+    },
     paths,
     components: {
       schemas: componentSchemas(),

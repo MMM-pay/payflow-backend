@@ -28,6 +28,13 @@ All notable changes to payflow-backend. The format follows
   projection file on its own does not hold. `reindex --from` refuses to move
   the cursor *forwards*, because the ledgers in between would never be applied;
   `--skip-ahead` is how an operator accepts that gap on purpose.
+- **An API changelog and a deprecation policy (#172).** `API_CHANGELOG.md`
+  records what changed in the HTTP API apart from the service's own changelog,
+  and states how long a deprecated field or route keeps working: one minor
+  release of notice, announced in the response with `Deprecation` and `Sunset`
+  headers and in the OpenAPI document with `deprecated: true`. The document's
+  `externalDocs` links the file, and a test reads it to prove the link and the
+  policy are both there.
 - **Keeper dry-run mode (#38).** `KEEPER_DRY_RUN=true` makes a settlement pass
   rehearse instead of settle: every due charge is built and simulated against
   the RPC exactly as a real pass would — account lookup, inclusion fee,
