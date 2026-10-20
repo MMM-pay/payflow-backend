@@ -14,6 +14,11 @@ function reportedPath(file: ts.SourceFile): string {
   return file.fileName.split("\\").join("/");
 }
 
+/** A path the way the compiler reports it, whatever the platform. */
+function comparablePath(path: string): string {
+  return path.split("\\").join("/");
+}
+
 describe("test files are type-checked", () => {
   test("a type error in a test file fails the typecheck the CI job runs", async () => {
     // The check runs against a copy of the repository, with the probe
@@ -35,7 +40,7 @@ describe("test files are type-checked", () => {
       await symlink(join(root, "node_modules"), join(dir, "node_modules"), "dir");
 
       // The probe: a file under `test/` with a deliberate type error.
-      const probe = join(dir, "test", "typecheck-probe.ts");
+      const probe = comparablePath(join(dir, "test", "typecheck-probe.ts"));
       await writeFile(probe, 'export const broken: number = "not a number";\n', "utf8");
 
       // The project the CI typecheck job compiles: the compiler reads
@@ -61,8 +66,7 @@ describe("test files are type-checked", () => {
 
       const inProbe = errors.filter(
         (diagnostic) => diagnostic.file && reportedPath(diagnostic.file) === probe,
-      );
-      assert.ok(inProbe.length > 0, "the probe's type error is reported");
+      );      assert.ok(inProbe.length > 0, "the probe's type error is reported");
       assert.match(
         ts.flattenDiagnosticMessageText(inProbe[0]!.messageText, " "),
         /not assignable to type 'number'/,
