@@ -256,9 +256,9 @@ export async function listDueMandates(
   db: Storage,
   now: number,
   limit: number,
-): Promise<DueMandateRow[]> {
-  return db.all<DueMandateRow>(
-      `SELECT id, subscriber, merchant, next_charge, amount
+): Promise<DueMandateRecord[]> {
+  return db.all<DueMandateRecord>(
+      `SELECT id, subscriber, merchant, plan_id, next_charge, amount
          FROM mandates
         WHERE status = 'Active' AND next_charge <= ?
           AND (max_charges = 0 OR charges_made < max_charges)

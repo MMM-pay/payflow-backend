@@ -79,6 +79,14 @@ describe("keeper order", () => {
   });
 });
 
+describe("metrics configuration", () => {
+  test("is disabled by default and accepts the explicit opt-in", () => {
+    assert.equal(loadConfig({ ...BASE }).METRICS_ENABLED, false);
+    assert.equal(loadConfig({ ...BASE, METRICS_ENABLED: "true" }).METRICS_ENABLED, true);
+    assert.equal(loadConfig({ ...BASE, METRICS_ENABLED: "false" }).METRICS_ENABLED, false);
+  });
+});
+
 describe("keeper channel secrets", () => {
   test("defaults to no channels, so single-key setups are untouched", () => {
     assert.deepEqual(loadConfig({ ...BASE }).KEEPER_CHANNEL_SECRETS, []);

@@ -1,9 +1,9 @@
 import { Router } from "express";
 import type { Storage } from "../lib/store/types.ts";
 import {
+  getVaultBalances,
   getMandateById,
   listDueMandates,
-  listLatestVaultBalances,
   listMandateCharges,
   listMandates,
   planTokensByIds,
@@ -117,7 +117,7 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
 
-  const row = await getMandateById(db, id.value);
+    const row = await getMandateById(db, id.value);
     if (!row) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
@@ -132,6 +132,10 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
+    if (!(await getMandateById(db, id.value))) {
+      sendApiError(res, req, 404, "mandate_not_found");
+      return;
+    }
     const charges = await listMandateCharges(db, id.value, limitOf(limit.value));
     const body: ChargePage = { charges };
     res.json(body);
@@ -144,7 +148,33 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
 
     const now = Math.floor(Date.now() / 1000);
     const due = await listDueMandates(db, now, limitOf(limit.value));
-    const body: DuePage = { now, due };
+    const planTokens = await planTokensByIds(db, due.map((mandate) => mandate.plan_id));
+    const balances = new Map<string, bigint>();
+    const subscribers = [...new Set(due.map((mandate) => mandate.subscriber))];
+    await Promise.all(
+      subscribers.map(async (subscriber) => {
+        const vaultBalances = await getVaultBalances(db, subscriber);
+        for (const balance of vaultBalances) {
+          balances.set(`${subscriber}|${balance.token}`, BigInt(balance.balance));
+        }
+      }),
+    );
+    const body: DuePage = {
+      now,
+      due: due.map((mandate) => {
+        const token = planTokens.get(mandate.plan_id);
+        const balance = token ? balances.get(`${mandate.subscriber}|${token}`) : undefined;
+        const row: DueMandateRow = {
+          id: mandate.id,
+          subscriber: mandate.subscriber,
+          merchant: mandate.merchant,
+          next_charge: mandate.next_charge,
+          amount: mandate.amount,
+          funded: balance !== undefined && balance >= BigInt(mandate.amount),
+        };
+        return row;
+      }),
+    };
     res.json(body);
   });
 

@@ -11,9 +11,11 @@ import {
 } from "@stellar/stellar-sdk";
 import type { Config } from "./config.ts";
 import { logger } from "./lib/logger.ts";
+import { metrics } from "./lib/metrics.ts";
+import { simulationSource } from "./lib/simulate.ts";
 import { asStorage } from "./lib/store/index.ts";
 import type { Storage } from "./lib/store/types.ts";
-import { listDueMandates } from "./lib/queries.ts";
+import { listDueMandates, planTokensByIds } from "./lib/queries.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
 
 export interface DueMandate {
@@ -302,7 +304,7 @@ export class Keeper {
    */
   private async queryDueLargest(now: number, limit: number): Promise<DueMandate[]> {
     const rows = await this.db.all<DueMandate>(
-        `SELECT id, subscriber, merchant, next_charge, amount
+        `SELECT id, subscriber, merchant, plan_id, next_charge, amount
            FROM mandates
           WHERE status = 'Active'
             AND next_charge <= ?
@@ -321,8 +323,9 @@ export class Keeper {
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
     const due = await this.findDue(now);
-    const fee = due.length > 0 ? await this.inclusionFee() : undefined;
-    const channels = due.length > 0 ? await this.distributableChannels() : [];
+    const { chargeable, skipped } = await this.withoutShortfalls(due);
+    const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
+    const channels = chargeable.length > 0 ? await this.distributableChannels() : [];
     // One worker per channel pulls from the shared queue: within a channel
     // mandates settle strictly one after the other (one account, one sequence
     // stream), across channels they run in parallel. The cursor and the
@@ -383,7 +386,7 @@ export class Keeper {
 
     // A mandate carries no token of its own; it inherits its plan's, and the
     // vault balance is per (subscriber, token).
-    const tokens = planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
+    const tokens = await planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
     // One read per subscriber and token per pass: a subscriber with several
     // mandates on the same plan is one balance, not one read each.
     const balances = new Map<string, bigint | null>();
