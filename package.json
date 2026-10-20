@@ -21,7 +21,9 @@
     "indexer": "node --experimental-strip-types src/cmd/indexer.ts",
     "keeper": "node --experimental-strip-types src/cmd/keeper.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "typecheck:src": "tsc --noEmit -p tsconfig.json",
+    "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint src test"
   },
   "dependencies": {

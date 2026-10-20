@@ -126,9 +126,17 @@ after(() => {
   mainnetDb.close();
 });
 
-const get = async (path: string) => {
+/**
+ * GET a path and return its status and its parsed JSON body.
+ *
+ * The body is typed as `Record<string, unknown>` by default: a test that
+ * reads a field has to say what shape it expects, so a renamed field is a
+ * type error rather than a silently `undefined` value. A test that knows the
+ * exact shape can pass it as the type argument.
+ */
+const get = async <T = Record<string, unknown>>(path: string) => {
   const res = await fetch(base + path);
-  return { status: res.status, body: await res.json() as Record<string, never> };
+  return { status: res.status, body: (await res.json()) as T };
 };
 
 describe("http api", () => {
@@ -266,8 +274,8 @@ describe("http api", () => {
   test("unknown plan stats is 404", async () => {
     const { status } = await get("/api/plans/999/stats");
     assert.equal(status, 404);
-    const { body } = await get("/api/plans/999/stats");
-    assert.equal((body as { error: { code: string } }).error.code, "plan_not_found");
+    const { body } = await get<{ error: { code: string } }>("/api/plans/999/stats");
+    assert.equal(body.error.code, "plan_not_found");
   });
 
   test("mandate charge history", async () => {
@@ -468,8 +476,8 @@ describe("http api", () => {
 
   test("limit caps the subscriber page", async () => {
     const { body } = await get(`/api/merchants/${MERCHANT}/subscribers?limit=1`);
-    assert.equal(body.subscribers.length, 1);
-    assert.equal(body.subscribers[0]?.subscriber, SUBSCRIBER);
+    assert.equal((body.subscribers as unknown[]).length, 1);
+    assert.equal((body.subscribers as { subscriber: string }[])[0]?.subscriber, SUBSCRIBER);
   });
 
   test("subscriber summary includes fee in total paid", async () => {
@@ -595,7 +603,7 @@ describe("cursor pagination", () => {
   test("an invalid cursor is refused", async () => {
     const garbage = await pageGet("/api/plans?cursor=not-a-cursor");
     assert.equal(garbage.status, 400);
-    assert.equal((garbage.body as { error: { code: string } }).error.code, "invalid_request");
+    assert.equal((garbage.body as unknown as { error: { code: string } }).error.code, "invalid_request");
     const truncated = await pageGet("/api/plans?cursor=AAAA");
     assert.equal(truncated.status, 400);
   });
@@ -1139,8 +1147,9 @@ describe("subscriber upcoming charges", () => {
     const upEv = (name: string, topics: unknown[], data: Record<string, unknown>, tx: string): DecodedEvent => ({
       name, contractId: "C", ledger: 1, txHash: tx, topics, data,
     });
-    const sub = (id: number, subscriber: string, merchant: string, data: Record<string, unknown>): void =>
+    const sub = (id: number, subscriber: string, merchant: string, data: Record<string, unknown>): void => {
       ix.apply(upEv("subscribed", [BigInt(id), subscriber, merchant], { plan_id: 1n, ...data }, `sub-${id}`));
+    };
 
     // Due an hour ago: projected from now, not from the stale next_charge.
     sub(101, DUE_SUB, M_DUE, {
@@ -1473,9 +1482,9 @@ describe("multiple networks", () => {
     const { body } = await get("/health");
     assert.equal(body.network, "testnet", "the top-level fields stay the default network");
     const networks = body.networks as unknown as Record<string, { status: string; indexer: { cursor: number } }>;
-    assert.equal(networks.testnet.status, "ok");
-    assert.equal(networks.mainnet.status, "ok");
-    assert.equal(networks.mainnet.indexer.cursor, 500);
+    assert.equal(networks.testnet?.status, "ok");
+    assert.equal(networks.mainnet?.status, "ok");
+    assert.equal(networks.mainnet?.indexer.cursor, 500);
   });
 
   test("an unknown network segment is a 404", async () => {

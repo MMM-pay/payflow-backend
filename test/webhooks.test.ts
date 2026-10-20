@@ -262,7 +262,7 @@ describe("webhooks", () => {
 
     const row1 = db
       .prepare("SELECT * FROM webhook_deliveries ORDER BY id DESC LIMIT 1")
-      .get() as { attempt: number; status: string; retry_at: number };
+      .get() as { id: number; attempt: number; status: string; retry_at: number };
     assert.equal(row1.attempt, 2, "the failed first attempt is rescheduled");
     assert.equal(row1.status, "pending");
     assert.ok(row1.retry_at >= T + 119 && row1.retry_at <= T + 121, "first retry in one minute");

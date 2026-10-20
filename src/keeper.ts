@@ -27,7 +27,13 @@ export interface DueMandate {
   plan_id: number;
 }
 
-/** The RPC calls the keeper makes. Narrow so tests can supply a fake. */
+/**
+ * The RPC calls the keeper makes. Narrow so tests can supply a fake.
+ *
+ * `simulateTransaction` is optional: the vault-balance read is an
+ * optimisation, not a requirement, so an RPC that cannot simulate settles
+ * exactly as it did before the check was added.
+ */
 export type KeeperRpc = Pick<
   rpc.Server,
   | "getAccount"
@@ -35,18 +41,8 @@ export type KeeperRpc = Pick<
   | "prepareTransaction"
   | "sendTransaction"
   | "getTransaction"
-  /** Read-only contract calls; the vault balance check uses them. */
-  | "simulateTransaction"
->;
-
-/**
- * The part of the RPC the vault-balance read needs.
- *
- * A fake RPC in a test may not implement it, and the read is an optimisation
- * rather than a requirement: without it the keeper settles exactly as it did
- * before.
- */
-type VaultBalanceRpc = Partial<Pick<KeeperRpc, "simulateTransaction">>;
+> &
+  Partial<Pick<rpc.Server, "simulateTransaction">>;
 
 /** First retry delay after a failed charge; doubles per failure. */
 const BACKOFF_BASE_S = 60;
@@ -488,8 +484,7 @@ export class Keeper {
    * caller's loop must not crash over it.
    */
   private async vaultBalance(subscriber: string, token: string): Promise<bigint | null> {
-    const simulator = this.server as VaultBalanceRpc;
-    if (typeof simulator.simulateTransaction !== "function") return null;
+    if (typeof this.server.simulateTransaction !== "function") return null;
     const vaultId = this.config.VAULT_ID;
     if (!vaultId) return null;
     try {
@@ -506,7 +501,7 @@ export class Keeper {
         )
         .setTimeout(0)
         .build();
-      const res = await simulator.simulateTransaction(tx);
+      const res = await this.server.simulateTransaction(tx);
       if ("error" in res && res.error) {
         logger.warn(
           { subscriber, token, reason: res.error.slice(0, 200).replace(/\s+/g, " ") },

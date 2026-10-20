@@ -39,10 +39,11 @@ test("spans are exported as OTLP JSON, nested spans share a trace, errors are ma
   await stop();
   server.close();
 
-  assert.equal(bodies[0].url, "/v1/traces");
-  const spans = bodies[0].json.resourceSpans[0].scopeSpans[0].spans;
+  const first = bodies[0]!;
+  assert.equal(first.url, "/v1/traces");
+  const spans = first.json.resourceSpans[0]!.scopeSpans[0]!.spans;
   const byName = Object.fromEntries(spans.map((s) => [s.name, s])) as Record<string, Span>;
-  assert.equal(byName.inner.traceId, byName.outer.traceId);
-  assert.equal(byName.inner.parentSpanId, byName.outer.spanId);
-  assert.equal(byName.failing.status.code, 2);
+  assert.equal(byName.inner!.traceId, byName.outer!.traceId);
+  assert.equal(byName.inner!.parentSpanId, byName.outer!.spanId);
+  assert.equal(byName.failing!.status.code, 2);
 });

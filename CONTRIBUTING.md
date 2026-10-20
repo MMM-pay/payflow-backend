@@ -23,11 +23,16 @@ docker compose up
 | Job | Command |
 |---|---|
 | `lint` | `npm run lint` |
-| `typecheck` | `npm run typecheck` |
+| `typecheck` | `npm run typecheck` (the sources and the tests) |
 | `test` | `npm test` |
 | `build` | `npm run build` |
 | `docker build` | builds the image, pushes nothing |
 | `audit` | `npm audit --omit=dev --audit-level=high` |
+
+The typecheck job runs `tsc` twice: once over `src/` and once over `test/`
+(`tsconfig.test.json`). A test that no longer type-checks is a build
+failure, not a surprise at run time — a broken test type usually means the
+API it exercises has changed shape.
 
 Dependencies are kept current by [Dependabot](.github/dependabot.yml), which
 opens weekly updates for npm packages and GitHub Actions.

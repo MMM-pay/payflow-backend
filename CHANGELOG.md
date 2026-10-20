@@ -187,6 +187,11 @@ All notable changes to payflow-backend. The format follows
 
 ### Changed
 
+- **The test files are type-checked (#50).** `tsconfig.json` only covered
+  `src/`, so a type error in a test was never reported: it surfaced as a
+  confusing runtime failure, or not at all. A `tsconfig.test.json` now covers
+  `test/` as well, the CI typecheck job runs it, and `npm run typecheck` runs
+  both. The types that were wrong are fixed, not worked around.
 - **A mandate that does not exist has no charges (#10).**
   `GET /api/mandates/:id/charges` used to answer `200` with an empty list for
   an unknown id, so "no such mandate" and "no charges yet" looked the same. It

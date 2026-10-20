@@ -63,7 +63,7 @@ function fakeRpc(funded: Set<string>, submitted: string[] = []): KeeperRpc {
       }
       return new Account(address, "1") as never;
     },
-    prepareTransaction: async (tx) => tx,
+    prepareTransaction: async (tx) => tx as Transaction,
     sendTransaction: async (tx) => {
       const hash = Buffer.from((tx as Transaction).hash()).toString("hex");
       submitted.push(hash);
@@ -284,7 +284,7 @@ describe("keeper channel accounts", () => {
         }
         return new Account(address, (consumed.get(address) ?? 0n).toString()) as never;
       },
-      prepareTransaction: async (tx) => tx,
+      prepareTransaction: async (tx) => tx as Transaction,
       sendTransaction: async (tx) => {
         const t = tx as Transaction;
         const expected = (consumed.get(t.source) ?? 0n) + 1n;
@@ -621,7 +621,7 @@ describe("keeper congestion fee retry", () => {
         fees.push((tx as Transaction & { fee: string }).fee);
         attempts += 1;
         if (attempts === 1) return { status: "TRY_AGAIN_LATER" };
-        return { status: "PENDING", hash: tx.hash().toString("hex") };
+        return { status: "PENDING", hash: Buffer.from(tx.hash()).toString("hex") };
       },
     } as unknown as KeeperRpc;
     const keeper = new Keeper(
