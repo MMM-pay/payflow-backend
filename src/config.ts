@@ -92,6 +92,18 @@ const schema = z.object({
     .bigint()
     .min(BigInt(BASE_FEE), `must be at least BASE_FEE (${BASE_FEE})`)
     .default(100_000n),
+  /**
+   * Rehearse a pass: every due charge is built and simulated against the
+   * RPC exactly as a real pass would, but nothing is signed or submitted —
+   * no `sendTransaction`, no backoff changes, no pass history, no metrics.
+   * Each mandate's outcome is logged as `simulated`, carrying the
+   * simulation's error when the charge would fail. Made for a first run on
+   * a new deployment: see what the keeper would do before it costs a fee.
+   */
+  KEEPER_DRY_RUN: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
   KEEPER_ENABLED: z
     .string()
     .default("false")

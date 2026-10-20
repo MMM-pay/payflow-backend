@@ -7,6 +7,15 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **Keeper dry-run mode (#38).** `KEEPER_DRY_RUN=true` makes a settlement pass
+  rehearse instead of settle: every due charge is built and simulated against
+  the RPC exactly as a real pass would — account lookup, inclusion fee,
+  vault-balance skips and key rotation included — but the keeper stops after
+  the simulation: nothing is signed, `sendTransaction` is never called, and
+  backoff, pass history and metrics are left untouched. Each mandate answers
+  `simulated`, carrying the simulation's error when the charge would fail, so
+  an operator can exercise a first run on a new deployment before it costs a
+  fee. The new variable is in the README's configuration table.
 - **An OpenAPI description of the API (#7).** `GET /api/openapi.json` serves an
   OpenAPI 3.1 document covering every route and `/health`, with the parameters
   each route takes, the responses it answers and the schema of each body.

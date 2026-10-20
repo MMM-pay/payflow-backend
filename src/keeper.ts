@@ -79,7 +79,13 @@ function isCongestionFailure(err: unknown): boolean {
 
 export interface SettleResult {
   mandateId: number;
-  status: "settled" | "failed";
+  /**
+   * `settled` and `failed` are real, on-chain outcomes. `simulated` is a
+   * dry run (`KEEPER_DRY_RUN=true`): the charge was simulated against the
+   * RPC and nothing was submitted — an `error` on a `simulated` result is
+   * the simulation's refusal, i.e. the charge would have failed.
+   */
+  status: "settled" | "failed" | "simulated";
   txHash?: string;
   error?: string;
 }
@@ -163,6 +169,17 @@ export interface Channel {
  * `getAccount` (only when several channels are configured); an unusable
  * channel is dropped for the pass, logged by public key, so its mandates
  * settle through the live channels instead of backing off against a dead key.
+ *
+ * ### Dry run (#38)
+ *
+ * With `KEEPER_DRY_RUN=true` a pass rehearses settlement: it builds and
+ * simulates every charge exactly as a real pass would — account lookup,
+ * inclusion fee, vault-balance skips and key rotation included — but stops
+ * after `prepareTransaction`. Nothing is signed, `sendTransaction` is never
+ * called, and the keeper's bookkeeping is untouched: no backoff, no pass
+ * history, no metrics. Each mandate answers `simulated`, carrying the
+ * simulation's error when the charge would fail, so an operator can
+ * rehearse a first run on a new deployment before it costs a fee.
  */
 export class Keeper {
   private readonly db: DatabaseSync;
@@ -338,6 +355,17 @@ export class Keeper {
     const { chargeable, skipped } = await this.withoutShortfalls(due);
     const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
     const channels = chargeable.length > 0 ? await this.distributableChannels() : [];
+    // Read once per pass: the banner, pass history and metrics for one
+    // pass all reflect the same mode even if a SIGHUP reload lands mid-pass.
+    // Backoff follows each result's own status (see `record`), so a
+    // simulation is never recorded as a real failure from either direction.
+    const dryRun = this.config.KEEPER_DRY_RUN;
+    if (dryRun && chargeable.length > 0) {
+      logger.info(
+        { mandates: chargeable.length },
+        "keeper dry run: simulating each charge; nothing will be submitted",
+      );
+    }
     // One worker per channel pulls from the shared queue: within a channel
     // mandates settle strictly one after the other (one account, one sequence
     // stream), across channels they run in parallel. The cursor and the
@@ -361,12 +389,16 @@ export class Keeper {
     );
     ordered.sort((a, b) => a.slot - b.slot);
     const results = ordered.map((entry) => entry.result);
+    // A dry run only reports: pass history and metrics describe work that
+    // actually happened on chain, and there was none. A pending retirement
+    // stays armed for the first pass that really settles.
+    if (dryRun) return results;
     this.announceRetirement(results);
     this.recordPass(now, results, skipped);
     metrics.increment("keeper_passes");
     for (const result of results) {
       if (result.status === "settled") metrics.increment("charges_settled");
-      else metrics.increment("charges_failed");
+      else if (result.status === "failed") metrics.increment("charges_failed");
     }
     return results;
   }
@@ -665,6 +697,9 @@ export class Keeper {
   }
 
   private record(result: SettleResult, now: number): void {
+    // A simulated result is neither a settlement nor a failure: a dry run
+    // must leave the backoff exactly as it was.
+    if (result.status === "simulated") return;
     if (result.status === "settled") {
       this.backoff.delete(result.mandateId);
       return;
@@ -722,13 +757,23 @@ export class Keeper {
         if (isKeyFailure(err) && this.rotateToStandby(lane, mandateId)) {
           continue;
         }
-        logger.warn({ mandateId, fee: fee.toString(), error }, "charge skipped");
-        return { mandateId, status: "failed", error };
+        logger.warn(
+          { mandateId, fee: fee.toString(), error },
+          this.config.KEEPER_DRY_RUN ? "dry run: charge simulation failed" : "charge skipped",
+        );
+        return this.config.KEEPER_DRY_RUN
+          ? { mandateId, status: "simulated", error }
+          : { mandateId, status: "failed", error };
       }
     }
   }
 
-  /** Builds, simulates, signs and submits one `charge` with the channel's active key. */
+  /**
+   * Builds and simulates one `charge` with the channel's active key, then
+   * signs and submits it — unless `KEEPER_DRY_RUN` stops it after the
+   * simulation, answering `simulated` without ever touching a secret or the
+   * network's submit path.
+   */
   private async submit(mandateId: number, fee: bigint, channel: Channel): Promise<SettleResult> {
     const key = channel.keys[channel.active]!;
     const account = await this.server.getAccount(key.publicKey());
@@ -745,6 +790,15 @@ export class Keeper {
       .build();
 
     const prepared = await this.server.prepareTransaction(tx);
+    if (this.config.KEEPER_DRY_RUN) {
+      // Dry run: the simulation above is the whole exercise. The
+      // transaction is never signed or sent, so nothing reaches the chain.
+      logger.info(
+        { mandateId, fee: fee.toString() },
+        "dry run: charge simulated; not submitting",
+      );
+      return { mandateId, status: "simulated" };
+    }
     prepared.sign(key);
 
     const sent = await this.server.sendTransaction(prepared);

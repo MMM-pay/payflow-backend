@@ -31,6 +31,7 @@ function keeperConfig(
   },
   order?: "oldest" | "largest",
   fees: { KEEPER_FEE_PERCENTILE?: string; KEEPER_MAX_FEE?: string } = {},
+  toggles: { KEEPER_DRY_RUN?: boolean } = {},
 ): Config {
   return {
     PLAN_REGISTRY_ID: CONTRACT,
@@ -41,6 +42,7 @@ function keeperConfig(
     KEEPER_FEE_PERCENTILE: "90",
     KEEPER_MAX_FEE: "100000",
     ...fees,
+    ...toggles,
     ...secrets,
   } as unknown as Config;
 }
@@ -907,6 +909,136 @@ describe("keeper vault balance check", () => {
 
     assert.equal(results[0]!.status, "settled");
     assert.equal(submitted.length, 1);
+    db.close();
+  });
+});
+
+/**
+ * `KEEPER_DRY_RUN=true`: a pass builds and simulates every charge exactly as
+ * a real one would, then stops — no signing, no `sendTransaction`, and no
+ * bookkeeping changes (backoff, pass history, metrics). The acceptance
+ * criterion for the issue is the first test: zero sendTransaction calls.
+ */
+describe("keeper dry run", () => {
+  test("simulates every due charge and never calls sendTransaction", async () => {
+    const db = openDatabase(":memory:");
+    for (let id = 1; id <= 3; id += 1) insertDue(db, id, 1_000 + id);
+    // fakeRpc records a submission only from its sendTransaction, so an
+    // empty list is direct evidence the submit path was never reached.
+    const submitted: string[] = [];
+    const server = fakeRpc(new Set([keyA.publicKey()]), submitted);
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_DRY_RUN: true }),
+    );
+
+    const messages = await captureInfoLog(async () => {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(
+        results.map((r) => [r.mandateId, r.status]),
+        [
+          [1, "simulated"],
+          [2, "simulated"],
+          [3, "simulated"],
+        ],
+        "each due mandate reports its simulation outcome, in due order",
+      );
+      assert.ok(
+        results.every((r) => r.txHash === undefined),
+        "a simulated result carries no transaction hash: nothing landed",
+      );
+    });
+
+    assert.equal(submitted.length, 0, "no sendTransaction call in dry run");
+    assert.ok(
+      messages.some((m) => m.includes("dry run")),
+      "the mode and the outcomes are logged for the operator",
+    );
+    assert.equal(keeper.passHistory().length, 0, "a dry run records no pass history");
+    assert.equal(keeper.retryIn(1, 10_000), 0, "no backoff comes from a dry run");
+    assert.equal(keeper.backoffList(10_000).length, 0);
+    db.close();
+  });
+
+  test("a failed simulation is reported per mandate and retried next pass", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    insertDue(db, 3, 1_002);
+    const submitted: string[] = [];
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()]), submitted),
+      prepareTransaction: async (tx: Transaction) => {
+        const { func } = tx.operations[0] as unknown as {
+          func: { invokeContract: { args: Parameters<typeof scValToNative>[0][] } };
+        };
+        const mandateId = Number(scValToNative(func.invokeContract.args[0]!));
+        if (mandateId === 2) throw new Error("Simulation failed: InsufficientBalance");
+        return tx;
+      },
+    } as unknown as KeeperRpc;
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_DRY_RUN: true }),
+    );
+
+    const warnings = await captureWarnLog(async () => {
+      const first = await keeper.tick(10_000);
+      assert.deepEqual(
+        first.map((r) => r.status),
+        ["simulated", "simulated", "simulated"],
+        "a dry run reports simulations, never real outcomes",
+      );
+      assert.match(
+        first[1]!.error ?? "",
+        /InsufficientBalance/,
+        "the simulation's refusal rides along on the result",
+      );
+      assert.equal(first[0]!.error, undefined, "a charge that would succeed carries no error");
+
+      // Nothing entered backoff, so the next dry pass rehearses everything.
+      const second = await keeper.tick(10_001);
+      assert.deepEqual(
+        second.map((r) => r.mandateId),
+        [1, 2, 3],
+        "a dry-run failure does not back its mandate off",
+      );
+    });
+
+    assert.ok(
+      warnings.some((m) => m.includes("dry run: charge simulation failed")),
+      "the would-fail charge is logged as a simulation failure",
+    );
+    assert.equal(keeper.retryIn(2, 10_001), 0);
+    assert.equal(keeper.passHistory().length, 0, "still no pass history from dry runs");
+    assert.equal(submitted.length, 0, "no sendTransaction call in either pass");
+    db.close();
+  });
+
+  test("KEEPER_DRY_RUN=false submits and records exactly as before", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    const submitted: string[] = [];
+    const server = fakeRpc(new Set([keyA.publicKey()]), submitted);
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_DRY_RUN: false }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.deepEqual(
+      results.map((r) => r.status),
+      ["settled", "settled"],
+      "a real pass still reports on-chain outcomes",
+    );
+    assert.equal(submitted.length, 2, "one transaction per mandate");
+    assert.equal(keeper.passHistory().length, 1, "real passes still record history");
+    assert.match(results[0]!.txHash ?? "", /^[0-9a-f]{64}$/);
     db.close();
   });
 });

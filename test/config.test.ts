@@ -131,6 +131,17 @@ describe("keeper inclusion fee configuration", () => {
   });
 });
 
+describe("keeper dry-run configuration", () => {
+  test("KEEPER_DRY_RUN defaults to off: a normal pass submits", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_DRY_RUN, false);
+    assert.equal(loadConfig({ ...BASE, KEEPER_DRY_RUN: "false" }).KEEPER_DRY_RUN, false);
+  });
+
+  test("KEEPER_DRY_RUN=true turns the rehearsal on", () => {
+    assert.equal(loadConfig({ ...BASE, KEEPER_DRY_RUN: "true" }).KEEPER_DRY_RUN, true);
+  });
+});
+
 const ID = VALID_CONTRACT_ID;
 
 /** Environment holding only what the default network needs. */

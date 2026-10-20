@@ -58,7 +58,7 @@ replays that range on restart. Every write is designed for that:
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 414 tests, no network needed
+npm test                  # 419 tests, no network needed
 npm run dev
 ```
 
@@ -114,6 +114,14 @@ in the builder, production dependencies only in the final image.
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
   queue would block every other mandate.
+- **Dry run before the first real pass.** `KEEPER_DRY_RUN=true` makes a pass
+  rehearse settlement: every due charge is built and simulated exactly as a
+  real pass would — account lookup, inclusion fee, vault-balance skips and
+  key rotation included — but nothing is signed or submitted, and no
+  backoff, pass history or metrics change. Each mandate is logged as
+  `simulated`, carrying the simulation's error when the charge would fail, so
+  a new deployment can be exercised before it costs a fee. Set it back to
+  `false` (or edit the env and send `SIGHUP`) to settle for real.
 - **A mandate the vault cannot cover is skipped, not charged.** Before it
   settles anything, the keeper reads `vault.balance(subscriber, token)` from
   the contract — a read-only simulation, no transaction and no fee. One read
@@ -622,6 +630,7 @@ examined without API downtime.
 | `TOKEN_ID` | — | Default token for the flat merchant-summary amounts. Unset, they span every token |
 | `NETWORKS` | *(empty)* | Extra networks to serve, comma-separated (see below) |
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
+| `KEEPER_DRY_RUN` | `false` | Rehearse each pass: simulate every due charge and log the outcome without signing or submitting anything |
 | `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
 | `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
