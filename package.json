@@ -22,7 +22,7 @@
     "keeper": "node --experimental-strip-types src/cmd/keeper.ts",
     "cli": "node --experimental-strip-types src/cmd/cli.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "typecheck": "npm run typecheck:src && npm run typecheck:test",
     "typecheck:src": "tsc --noEmit -p tsconfig.json",
     "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint src test"
