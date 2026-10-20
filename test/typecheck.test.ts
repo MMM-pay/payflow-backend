@@ -9,12 +9,13 @@ import ts from "typescript";
 /** The repository root: the tsconfig lives there. */
 const root = fileURLToPath(new URL("..", import.meta.url));
 
-/** The file the compiler reports the error against. */
-function reportedPath(file: ts.SourceFile): string {
-  return file.fileName.split("\\").join("/");
-}
-
-/** A path the way the compiler reports it, whatever the platform. */
+/**
+ * A path the way the compiler reports it, whatever the platform.
+ *
+ * The compiler names the file a diagnostic belongs to with the separators of
+ * the platform it runs on, so both sides of the comparison are normalised:
+ * on Windows the probe's path would otherwise never match.
+ */
 function comparablePath(path: string): string {
   return path.split("\\").join("/");
 }
@@ -65,8 +66,10 @@ describe("test files are type-checked", () => {
         .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error);
 
       const inProbe = errors.filter(
-        (diagnostic) => diagnostic.file && reportedPath(diagnostic.file) === probe,
-      );      assert.ok(inProbe.length > 0, "the probe's type error is reported");
+        (diagnostic) =>
+          diagnostic.file && comparablePath(diagnostic.file.fileName) === probe,
+      );
+      assert.ok(inProbe.length > 0, "the probe's type error is reported");
       assert.match(
         ts.flattenDiagnosticMessageText(inProbe[0]!.messageText, " "),
         /not assignable to type 'number'/,
@@ -76,10 +79,15 @@ describe("test files are type-checked", () => {
       // Every other file is clean, so the failure above is the probe's and
       // not a pre-existing one: the repository's own tests type-check.
       const elsewhere = errors.filter(
-        (diagnostic) => diagnostic.file && reportedPath(diagnostic.file) !== probe,
+        (diagnostic) =>
+          diagnostic.file && comparablePath(diagnostic.file.fileName) !== probe,
       );
       assert.deepEqual(
-        elsewhere.map((diagnostic) => `${reportedPath(diagnostic.file!)}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, " ")}`),
+        elsewhere.map((diagnostic) => {
+          const where = comparablePath(diagnostic.file!.fileName);
+          const what = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");
+          return `${where}: ${what}`;
+        }),
         [],
         "only the probe fails",
       );
