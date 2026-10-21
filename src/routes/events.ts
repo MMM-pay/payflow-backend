@@ -2,17 +2,9 @@ import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import { sendApiError } from "./errors.ts";
+import { listRawContractEvents, type RawContractEventRow } from "../lib/queries.ts";
 
-interface EventRow {
-  event_id: string;
-  contract_id: string;
-  ledger: number;
-  tx_hash: string;
-  event_index: string;
-  topics: string;
-  data: string;
-  close_time: number | null;
-}
+type EventRow = RawContractEventRow;
 
 const PAGE_SIZE = 50;
 const SCAN_SIZE = 200;
@@ -28,10 +20,6 @@ function parseAfter(value: string): [number, string] | null {
   } catch {
     return null;
   }
-}
-
-function cursorFor(row: EventRow): string {
-  return Buffer.from(JSON.stringify([row.ledger, row.event_id])).toString("base64url");
 }
 
 /**
@@ -69,12 +57,7 @@ export function rawEventsRouter(db: DatabaseSync): Router {
     let id = start[1];
     let exhausted = false;
     while (items.length <= PAGE_SIZE && !exhausted) {
-      const rows = db.prepare(
-        `SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time
-         FROM events WHERE (ledger, event_id) > (?, ?)
-         ${contract === undefined ? "" : "AND contract_id = ?"}
-         ORDER BY ledger, event_id LIMIT ?`,
-      ).all(...(contract === undefined ? [ledger, id, SCAN_SIZE] : [ledger, id, contract, SCAN_SIZE])) as unknown as EventRow[];
+      const rows = listRawContractEvents(db, ledger, id, contract as string | undefined, SCAN_SIZE);
       if (rows.length < SCAN_SIZE) exhausted = true;
       for (const row of rows) {
         ledger = row.ledger;
