@@ -55,6 +55,26 @@ replays that range on restart. Every write is designed for that:
   event can never move a mandate backwards.
 
 
+### Mandate lifecycle timeline
+
+`GET /api/mandates/:id/timeline` returns `{ "events": [...] }` in ascending
+ledger order (ties ordered by transaction hash and event kind). A missing
+mandate returns 404; an invalid ID returns 400. Each entry contains
+`mandateId`, `txHash`, `kind`, `ledger`, `at` (ledger close time in
+Unix seconds, or null if unavailable), and `details`.
+
+The timeline records every `subscribed`, `charged`, `pause_changed`
+(including both pause and resume), `cancelled`, `mandate_ended`, and
+`mandate_completed` event. Charged amounts and fees in `details` are
+decimal strings in the token's smallest unit, never JavaScript floats.
+History is stored idempotently by mandate, transaction and event kind;
+replaying an indexed range does not duplicate entries. The existing
+`mandate_events` churn aggregation remains unchanged.
+
+```bash
+curl 'http://localhost:8080/api/mandates/1/timeline'
+```
+
 ### Raw contract event feed
 
 `GET /api/events` exposes the original contract events saved by the indexer.
