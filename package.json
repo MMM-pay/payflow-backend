@@ -26,7 +26,8 @@
     "typecheck": "npm run typecheck:src && npm run typecheck:test",
     "typecheck:src": "tsc --noEmit -p tsconfig.json",
     "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
-    "lint": "eslint src test"
+    "lint": "eslint src test",
+    "rebuild:projections": "node --experimental-strip-types src/cmd/rebuild-projections.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^17.2.1",
