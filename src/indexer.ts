@@ -440,11 +440,11 @@ export class Indexer {
   /** Preserve every event before decoding, including unknown contract events. */
   private retain(raw: rpc.Api.EventResponse): void {
     saveContractEvent(this.db, {
-      eventId: raw.id,
+      eventId: raw.id ?? `${raw.ledger}:${raw.txHash}:${raw.topic.map((t) => t.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`,
       contractId: raw.contractId?.toString() ?? "",
       ledger: raw.ledger,
       txHash: raw.txHash,
-      eventIndex: raw.id,
+      eventIndex: raw.id ?? "",
       topics: JSON.stringify(raw.topic.map((topic) => topic.toXDR("base64"))),
       data: raw.value.toXDR("base64"),
       closeTime: parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
