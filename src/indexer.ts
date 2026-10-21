@@ -4,7 +4,7 @@ import { rpc, xdr } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
 
 export type IndexerConfig = Config | NetworkConfig;
-import { clearProjections, readCursor, saveContractEvent, writeCursor } from "./lib/db.ts";
+import { clearProjections, readCursor, saveContractEvent, writeCursor, saveContractUpgrade } from "./lib/db.ts";
 import {
   big,
   decodeEvent,
@@ -844,5 +844,28 @@ export class Indexer {
         num(e.data.new_fee_bps),
         e.ledger,
       );
+  }
+
+  /**
+   * Record a contract upgrade when detected through contract events.
+   * This tracks when a contract's code is upgraded with metadata about the change.
+   */
+  private recordContractUpgrade(
+    contractId: string,
+    txHash: string,
+    ledger: number,
+    closeTime: number | null,
+    newHash: string,
+    oldHash?: string,
+  ): void {
+    if (!closeTime) return;
+    saveContractUpgrade(this.db, {
+      contractId,
+      txHash,
+      ledger,
+      closeTime,
+      newHash,
+      oldHash,
+    });
   }
 }
