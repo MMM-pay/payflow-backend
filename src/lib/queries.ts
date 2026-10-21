@@ -915,3 +915,19 @@ export function listRawContractEvents(
     "SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time FROM events WHERE (ledger, event_id) > (?, ?) AND contract_id = ? ORDER BY ledger, event_id LIMIT ?",
   ).all(ledger, eventId, contract, limit) as unknown as RawContractEventRow[];
 }
+
+/** Full event history, independent of the aggregate mandate_events churn log. */
+export interface MandateTimelineRow {
+  mandate_id: number;
+  tx_hash: string;
+  kind: string;
+  ledger: number;
+  at: number | null;
+  details: string;
+}
+
+export function listMandateTimeline(db: DatabaseSync, mandateId: number): MandateTimelineRow[] {
+  return db.prepare(
+    "SELECT mandate_id, tx_hash, kind, ledger, at, details FROM mandate_timeline WHERE mandate_id = ? ORDER BY ledger ASC, tx_hash ASC, kind ASC",
+  ).all(mandateId) as unknown as MandateTimelineRow[];
+}
