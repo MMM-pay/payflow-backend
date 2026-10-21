@@ -250,6 +250,31 @@ CREATE TABLE IF NOT EXISTS contract_upgrades (
 );
 CREATE INDEX IF NOT EXISTS contract_upgrades_contract ON contract_upgrades(contract_id, ledger DESC);
 CREATE INDEX IF NOT EXISTS contract_upgrades_ledger ON contract_upgrades(ledger DESC);
+
+-- Audit log for admin actions: tracks who did what and when.
+-- The subject field identifies the entity being acted on (e.g. mandate ID, webhook ID).
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id          INTEGER PRIMARY KEY,
+  action      TEXT    NOT NULL,
+  subject     TEXT,
+  details     TEXT    NOT NULL DEFAULT '{}',
+  success     INTEGER NOT NULL,
+  error_msg   TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_logs_action ON audit_logs(action, created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_logs_created_at ON audit_logs(created_at DESC);
+
+-- Track past-due mandates: mandates that were due but not yet charged.
+-- The is_past_due flag marks a mandate as past its due date.
+-- This is updated by the indexer and keeper to track mandates that should have been charged.
+CREATE TABLE IF NOT EXISTS past_due_mandates (
+  mandate_id INTEGER PRIMARY KEY,
+  first_past_due_at INTEGER NOT NULL,
+  last_checked_at INTEGER NOT NULL,
+  still_past_due INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS past_due_mandates_first_past_due ON past_due_mandates(first_past_due_at DESC);
 `;
 
 /**
@@ -381,11 +406,55 @@ export function saveContractUpgrade(db: DatabaseSync, upgrade: ContractUpgrade):
 }
 
 export function clearProjections(db: DatabaseSync): void {
-  // Do not remove cursor, raw events, or operational webhook configuration.
+  // Do not remove cursor, raw events, operational webhook configuration, or audit logs.
   for (const table of [
     "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline", "contract_upgrades",
-    "merchant_profiles",
+    "merchant_profiles", "past_due_mandates",
   ]) {
     db.exec(`DELETE FROM ${table}`);
   }
+}
+
+export interface AuditLogEntry {
+  action: string;
+  subject?: string | undefined;
+  details?: Record<string, unknown> | undefined;
+  success: boolean;
+  errorMsg?: string | undefined;
+}
+
+export function logAuditEvent(db: DatabaseSync, entry: AuditLogEntry): void {
+  db.prepare(`INSERT INTO audit_logs
+    (action, subject, details, success, error_msg, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(
+    entry.action,
+    entry.subject,
+    JSON.stringify(entry.details ?? {}),
+    entry.success ? 1 : 0,
+    entry.errorMsg,
+    Math.floor(Date.now() / 1000),
+  );
+}
+
+export function pruneOldEvents(db: DatabaseSync, daysToKeep: number = 30): number {
+  const cutoffTime = Math.floor((Date.now() - daysToKeep * 24 * 60 * 60 * 1000) / 1000);
+  const result = db.prepare("DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ?").run(cutoffTime);
+  return result.changes;
+}
+
+export function markMandateAsPastDue(db: DatabaseSync, mandateId: number): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(`INSERT INTO past_due_mandates (mandate_id, first_past_due_at, last_checked_at, still_past_due)
+    VALUES (?, ?, ?, 1)
+    ON CONFLICT(mandate_id) DO UPDATE SET
+      last_checked_at = excluded.last_checked_at,
+      still_past_due = 1`).run(mandateId, now, now);
+}
+
+export function clearMandateAsPastDue(db: DatabaseSync, mandateId: number): void {
+  db.prepare(`UPDATE past_due_mandates SET still_past_due = 0 WHERE mandate_id = ?`).run(mandateId);
+}
+
+export function getPastDueMandates(db: DatabaseSync): Array<{ mandate_id: number; first_past_due_at: number }> {
+  return db.prepare("SELECT mandate_id, first_past_due_at FROM past_due_mandates WHERE still_past_due = 1 ORDER BY first_past_due_at ASC").all() as Array<{ mandate_id: number; first_past_due_at: number }>;
 }

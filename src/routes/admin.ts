@@ -18,6 +18,9 @@ export interface AdminHooks {
   keeperHistory?: () => unknown;
   pauseIndexer?: () => unknown;
   resumeIndexer?: () => unknown;
+  pruneData?: (daysToKeep: number) => Promise<unknown>;
+  getAuditLogs?: (limit: number) => unknown;
+  getPastDueMandates?: () => unknown;
 }
 
 /** Scoped operation that a token is allowed to perform. */
@@ -184,6 +187,35 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
       return;
     }
     res.json({ status: "ok", paused: false, result: resume() ?? null });
+  });
+
+  r.post("/data/prune", async (req, res) => {
+    const prune = hooks.pruneData;
+    if (!prune) {
+      sendApiError(res, req, 503, "prune_unavailable");
+      return;
+    }
+    const daysToKeep = Math.max(0, Number(req.query.days ?? 30));
+    await respond(req, res, "prune_failed", () => prune(daysToKeep));
+  });
+
+  r.get("/audit-logs", (req, res) => {
+    const read = hooks.getAuditLogs;
+    if (!read) {
+      sendApiError(res, req, 503, "audit_unavailable");
+      return;
+    }
+    const limit = Math.min(1000, Math.max(1, Number(req.query.limit ?? 100)));
+    res.json({ status: "ok", logs: read(limit) ?? [] });
+  });
+
+  r.get("/past-due", (req, res) => {
+    const read = hooks.getPastDueMandates;
+    if (!read) {
+      sendApiError(res, req, 503, "indexer_unavailable");
+      return;
+    }
+    res.json({ status: "ok", past_due: read() ?? [] });
   });
 
   return r;
