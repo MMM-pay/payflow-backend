@@ -7,14 +7,6 @@ import { rawEventsRouter } from "../src/routes/events.ts";
 
 test("raw event feed filters, pages without duplicates, and validates cursors", async () => {
   const db = openDatabase(":memory:");
-  // Issue #34 introduces this schema. Keep the endpoint test independent of
-  // whether the raw storage PR has merged into upstream main.
-  db.exec(`CREATE TABLE events (
-    event_id TEXT PRIMARY KEY, contract_id TEXT NOT NULL, ledger INTEGER NOT NULL,
-    tx_hash TEXT NOT NULL, event_index TEXT NOT NULL, topics TEXT NOT NULL,
-    data TEXT NOT NULL, close_time INTEGER
-  );
-  CREATE INDEX events_ledger ON events(ledger, event_id);`);
   const insert = db.prepare(`INSERT INTO events
     (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
