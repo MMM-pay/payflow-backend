@@ -218,7 +218,7 @@ describe("indexer sync", () => {
     writeCursor(db, 100);
     const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
     const ix = new Indexer(db, fakeRpc(chain) as never, net() as never);
-    const warnings: unknown[] = [];
+    const warnings: unknown[][] = [];
     mock.method(logger, "warn", (...args: unknown[]): void => {
       warnings.push(args);
     });
@@ -402,7 +402,7 @@ describe("indexer sync", () => {
     const r = await ix.tick();
     assert.equal(r.cursor, 1_100);
     assert.equal(ix.status.lastLedgerCloseTime, nowSec - 15);
-    assert.ok(ix.status.freshnessSeconds !== null && ix.status.freshnessSeconds >= 15);
+    assert.ok(ix.status.freshnessSeconds != null && ix.status.freshnessSeconds >= 15);
   });
 });
 

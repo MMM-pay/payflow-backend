@@ -24,6 +24,7 @@ permissions:
   statuses: write # set payflow/malware-scan on the PR's head commit
   pull-requests: write # comment the findings on the PR
   issues: write # add or remove the security-review label
+  actions: write # start auto-merge once the scan passes
 
 concurrency:
   group: security-${{ github.event.pull_request.number || inputs.pr }}
@@ -36,10 +37,11 @@ jobs:
       statuses: write
       pull-requests: write
       issues: write
+      actions: write
     # Pinned to a reviewed commit of the shared repository, and the scanner
     # script is taken from the same commit.
-    uses: MMM-pay/.github/.github/workflows/malware-scan.yml@2d7d68fd8e246075e4ac4c1689aeab66d7554702 # main
+    uses: MMM-pay/.github/.github/workflows/malware-scan.yml@3c9de7c464f7d199f4c2dc6d3738a38934df7bec # main
     with:
       # workflow_dispatch passes the number as text; the shared workflow takes a number.
       pr: ${{ fromJSON(format('{0}', github.event.pull_request.number || inputs.pr)) }}
-      scanner_ref: 2d7d68fd8e246075e4ac4c1689aeab66d7554702
+      scanner_ref: 3c9de7c464f7d199f4c2dc6d3738a38934df7bec

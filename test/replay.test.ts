@@ -25,6 +25,16 @@ function loadFixture(): Fixture {
 }
 
 /**
+ * A 64-bit or 128-bit value from the fixture.
+ *
+ * JSON has no bigint, so the fixture carries these as numbers or strings;
+ * both are read as text so no precision is lost on the way in.
+ */
+function asBigInt(value: unknown): bigint {
+  return BigInt(typeof value === "string" ? value : String(value));
+}
+
+/**
  * Hydrate a recorded ScVal JSON blob into a real xdr.ScVal, the shape the SDK
  * returns from RPC and that `decodeEvent` consumes.
  */
@@ -36,29 +46,28 @@ function toScVal(value: unknown): xdr.ScVal {
   if ("symbol" in obj) return xdr.ScVal.scvSymbol(String(obj.symbol));
   if ("string" in obj) return xdr.ScVal.scvString(String(obj.string));
   if ("address" in obj) {
-    return xdr.ScVal.scvAddress(
-      Address.fromString(String(obj.address)).toScVal().address,
-    );
+    // `toScVal()` builds the address ScVal; the raw key is what `scvAddress`
+    // takes.
+    const address = Address.fromString(String(obj.address)).toScVal() as xdr.ScValAddress;
+    return xdr.ScVal.scvAddress(address.address);
   }
   if ("u32" in obj) return xdr.ScVal.scvU32(Number(obj.u32));
   if ("i32" in obj) return xdr.ScVal.scvI32(Number(obj.i32));
-  if ("u64" in obj) return xdr.ScVal.scvU64(BigInt(obj.u64));
-  if ("i64" in obj) return xdr.ScVal.scvI64(BigInt(obj.i64));
-  if ("timepoint" in obj) return xdr.ScVal.scvTimepoint(BigInt(obj.timepoint));
+  if ("u64" in obj) return xdr.ScVal.scvU64(asBigInt(obj.u64));
+  if ("i64" in obj) return xdr.ScVal.scvI64(asBigInt(obj.i64));
+  if ("timepoint" in obj) return xdr.ScVal.scvTimepoint(asBigInt(obj.timepoint));
   if ("bool" in obj) return xdr.ScVal.scvBool(Boolean(obj.bool));
   if ("i128" in obj) {
-    const n = BigInt(obj.i128);
+    const n = asBigInt(obj.i128);
     return xdr.ScVal.scvI128(new xdr.Int128Parts({ hi: n < 0n ? -1n : 0n, lo: n }));
   }
   if ("u128" in obj) {
-    return xdr.ScVal.scvU128(new xdr.Uint128Parts({ hi: 0n, lo: BigInt(obj.u128) }));
+    return xdr.ScVal.scvU128(new xdr.Uint128Parts({ hi: 0n, lo: asBigInt(obj.u128) }));
   }
   if ("map" in obj) {
+    const entries = obj.map as { key: unknown; val: unknown }[];
     return xdr.ScVal.scvMap(
-      obj.map.map((e: { key: unknown; val: unknown }) => ({
-        key: toScVal(e.key),
-        val: toScVal(e.val),
-      })),
+      entries.map((e) => new xdr.ScMapEntry({ key: toScVal(e.key), val: toScVal(e.val) })),
     );
   }
   throw new Error("unknown ScVal: " + JSON.stringify(value));

@@ -343,6 +343,26 @@ export function listDueMandates(
 }
 
 /**
+ * How many active mandates are eligible for settlement right now.
+ *
+ * The same predicate `listDueMandates` uses, counted instead of listed: an
+ * operator wants the number ("are any mandates waiting?") without pulling
+ * every row of the due list into memory.
+ */
+export function countDueMandates(db: DatabaseSync, now: number): number {
+  return (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n
+           FROM mandates
+          WHERE status = 'Active' AND next_charge <= ?
+            AND (max_charges = 0 OR charges_made < max_charges)`,
+      )
+      .get(now) as { n: number } | undefined
+  )?.n ?? 0;
+}
+
+/**
  * The last known vault balance of every listed address, per token.
  *
  * `vault_events` records the balance after each deposit, withdrawal and

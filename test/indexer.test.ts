@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test, describe, beforeEach } from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { migrate, openDatabase } from "../src/lib/db.ts";
 import { Indexer } from "../src/indexer.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
@@ -479,5 +481,568 @@ describe("runtime pause and resume", () => {
     await ix.tick();
     assert.ok(calls.latest >= 1, "the network is read again after resume");
     d.close();
+  });
+});
+
+/**
+ * The projection under random orderings.
+ *
+ * The indexer consumes events in ledger order and the cursor only moves
+ * after a whole window has been applied, so a pass that dies replays the
+ * window it was applying: the same events arrive again, and a range that
+ * overlaps the previous one delivers some of them a third time. None of
+ * that may change the projection.
+ *
+ * These tests generate a random history, apply it in ledger order, and
+ * then apply the same history again as a shuffled, repeated replay. The
+ * projection has to come out the same either way.
+ *
+ * ### What the shuffle keeps, and why
+ *
+ * The chain orders events by ledger, and an event that updates a row is
+ * always in a later ledger than the event that created that row. A replay
+ * therefore keeps two things: the order of the events that touch one row,
+ * and a row's creation ahead of its updates. Everything else is free —
+ * the events of different mandates, plans and vault rows interleave
+ * however the RPC pages them.
+ *
+ * A permutation that breaks those rules is not one the chain can produce,
+ * and the projection is not built to survive it: an update that arrives
+ * before the row it updates finds nothing to update, and a pause that
+ * arrives after the unpause that followed it wins. Both are pinned down by
+ * their own tests below, so what this file relies on is written down
+ * rather than assumed.
+ * ### Why the events are hand-built
+ *
+ * `apply` is the whole projection: it takes a decoded event and writes the
+ * database. Building the events here — rather than driving the indexer
+ * through a fake RPC — keeps the test off the network, keeps the event
+ * sequence exactly under the test's control, and keeps the seeds
+ * reproducible. The decoder and the RPC windowing are covered elsewhere
+ * (`test/replay.test.ts` replays recorded events, `test/sync.test.ts` drives
+ * the fetch loop).
+ */
+
+/**
+ * A small deterministic pseudo-random generator.
+ *
+ * `Math.random` cannot be used here: a failing run has to be
+ * reproducible, so the seed is part of the test and the whole sequence is
+ * derived from it alone.
+ */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** A deterministic account address for a role, so a seed reproduces exactly. */
+function accountFor(seed: number, role: string, n: number): string {
+  return Keypair.fromRawEd25519Seed(
+    createHash("sha256").update(`${seed}:${role}:${n}`).digest(),
+  ).publicKey();
+}
+
+/** A deterministic contract address for a role. */
+function contractFor(role: string, n: number): string {
+  return StrKey.encodeContract(createHash("sha256").update(`contract:${role}:${n}`).digest());
+}
+
+/** A generated event, and the row it belongs to. */
+interface Generated {
+  event: DecodedEvent;
+  /**
+   * The row the event creates or updates. The events of one row keep their
+   * order in a replay; the events of different rows interleave freely.
+   */
+  entity: string;
+}
+
+/**
+ * A random history of the protocol's events.
+ *
+ * The sequence comes from the seed alone: the same seed always produces
+ * the same history, the same addresses and the same amounts.
+ */
+function generateHistory(seed: number): Generated[] {
+  const rnd = mulberry32(seed);
+  const int = (max: number): number => Math.floor(rnd() * max);
+  const events: Generated[] = [];
+  let ledger = 1_000;
+  let clock = 1_700_000_000;
+
+  /** The next ledger and its close time, advancing both. */
+  const next = (): { ledger: number; closeTime: number } => {
+    ledger += 1 + int(4);
+    clock += 60 + int(900);
+    return { ledger, closeTime: clock };
+  };
+
+  const token = contractFor("token", 0);
+  const registry = contractFor("plan_registry", 0);
+  const subscription = contractFor("subscription", 0);
+  const vault = contractFor("vault", 0);
+
+  // Plans, and the merchants who own them.
+  const plans: Array<{ id: number; merchant: string }> = [];
+  const merchantCount = 2 + int(3);
+  for (let mi = 0; mi < merchantCount; mi += 1) {
+    const merchant = accountFor(seed, "merchant", mi);
+    const planCount = 1 + int(2);
+    for (let pi = 0; pi < planCount; pi += 1) {
+      const id = plans.length + 1;
+      plans.push({ id, merchant });
+      const entity = `plan:${id}`;
+      const created = next();
+      events.push({
+        entity,
+        event: {
+          name: "plan_created",
+          contractId: registry,
+          ledger: created.ledger,
+          txHash: `tx-plan-${id}`,
+          // The chain's clock, not the indexer's: a charge stamped with the
+          // moment it was indexed would differ between the two runs and the
+          // projections could never be equal.
+          closeTime: created.closeTime,
+          topics: [merchant, BigInt(id)],
+          data: {
+            token,
+            amount: 1_000_000n + BigInt(int(1_000_000)),
+            period: 2_592_000n,
+            name: `Plan ${id}`,
+          },
+        },
+      });
+      // A merchant may deactivate a plan and reactivate it later.
+      for (let s = 0; s < int(3); s += 1) {
+        const when = next();
+        events.push({
+          entity,
+          event: {
+            name: "plan_status_changed",
+            contractId: registry,
+            ledger: when.ledger,
+            txHash: `tx-plan-status-${id}-${s}`,
+            closeTime: when.closeTime,
+            topics: [merchant, BigInt(id)],
+            data: { active: s % 2 === 0 },
+          },
+        });
+      }
+    }
+  }
+
+  // Mandates: a subscriber takes a plan, and the contract charges it every
+  // period until the cap.
+  let mandateId = 0;
+  for (const plan of plans) {
+    for (let k = 0; k < 1 + int(3); k += 1) {
+      mandateId += 1;
+      const id = mandateId;
+      const entity = `mandate:${id}`;
+      const subscriber = accountFor(seed, "subscriber", id);
+      const amount = 1_000_000n + BigInt(int(5_000_000));
+      const period = 2_592_000n;
+      const maxCharges = int(4) === 0 ? 0 : 1 + int(5);
+      const feeBps = int(4) * 25;
+
+      const started = next();
+      events.push({
+        entity,
+        event: {
+          name: "subscribed",
+          contractId: subscription,
+          ledger: started.ledger,
+          txHash: `tx-subscribed-${id}`,
+          closeTime: started.closeTime,
+          topics: [BigInt(id), subscriber, plan.merchant],
+          data: {
+            plan_id: BigInt(plan.id),
+            amount,
+            period,
+            next_charge: BigInt(started.closeTime),
+            max_charges: maxCharges,
+            fee_bps: feeBps,
+          },
+        },
+      });
+
+      const chargeCount =
+        maxCharges > 0 ? int(maxCharges + 1) : int(4);
+      let chargesMade = 0;
+      let nextCharge = BigInt(started.closeTime);
+      for (let c = 0; c < chargeCount; c += 1) {
+        chargesMade += 1;
+        nextCharge += period;
+        const when = next();
+        events.push({
+          entity,
+          event: {
+            name: "charged",
+            contractId: subscription,
+            ledger: when.ledger,
+            txHash: `tx-charged-${id}-${c}`,
+            closeTime: when.closeTime,
+            topics: [BigInt(id), subscriber, plan.merchant],
+            data: {
+              amount,
+              // Money is a bigint all the way: a fee computed in floating
+              // point would round.
+              fee: (amount * BigInt(feeBps)) / 10_000n,
+              charges_made: BigInt(chargesMade),
+              next_charge: nextCharge,
+            },
+          },
+        });
+      }
+
+      // A subscriber may pause a mandate and resume it.
+      for (let p = 0; p < int(3); p += 1) {
+        const when = next();
+        events.push({
+          entity,
+          event: {
+            name: "pause_changed",
+            contractId: subscription,
+            ledger: when.ledger,
+            txHash: `tx-pause-${id}-${p}`,
+            closeTime: when.closeTime,
+            topics: [BigInt(id), subscriber],
+            data: { paused: p % 2 === 0 },
+          },
+        });
+      }
+
+      // A mandate ends one way: the subscriber cancels, the merchant ends
+      // it, or it completes itself once the cap is reached.
+      const endings = ["cancelled", "mandate_ended"];
+      if (maxCharges > 0 && chargesMade === maxCharges) endings.push("mandate_completed");
+      if (int(3) === 0) {
+        const kind = endings[int(endings.length)]!;
+        const when = next();
+        const endedByMerchant = kind === "mandate_ended";
+        events.push({
+          entity,
+          event: {
+            name: kind,
+            contractId: subscription,
+            ledger: when.ledger,
+            txHash: `tx-${kind}-${id}`,
+            closeTime: when.closeTime,
+            topics: endedByMerchant
+              ? [BigInt(id), plan.merchant]
+              : [BigInt(id), subscriber],
+            data: endedByMerchant
+              ? { subscriber, charges_made: BigInt(chargesMade) }
+              : { charges_made: BigInt(chargesMade) },
+          },
+        });
+      }
+    }
+  }
+
+  // The vault's own events: one row each.
+  for (let v = 0; v < 2 + int(4); v += 1) {
+    const kind = ["deposit", "withdraw", "debit"][int(3)]!;
+    const when = next();
+    events.push({
+      entity: `vault:${v}`,
+      event: {
+        name: kind,
+        contractId: vault,
+        ledger: when.ledger,
+        txHash: `tx-vault-${v}`,
+        closeTime: when.closeTime,
+        topics: [accountFor(seed, "subscriber", 1 + int(mandateId)), token, plans[0]!.merchant],
+        data: {
+          amount: 1_000n + BigInt(int(1_000_000)),
+          balance: BigInt(int(1_000_000)),
+        },
+      },
+    });
+  }
+
+  // The protocol's fee changes.
+  for (let f = 0; f < int(3); f += 1) {
+    const when = next();
+    events.push({
+      entity: `fee:${f}`,
+      event: {
+        name: "fee_changed",
+        contractId: subscription,
+        ledger: when.ledger,
+        txHash: `tx-fee-${f}`,
+        closeTime: when.closeTime,
+        topics: [accountFor(seed, "merchant", int(merchantCount))],
+        data: { old_fee_bps: BigInt(50 * f), new_fee_bps: BigInt(50 * f + 25) },
+      },
+    });
+  }
+
+  return events;
+}
+
+/**
+ * A replay of the history: the same events, delivered again, in a random
+ * order and with some of them repeated.
+ *
+ * The order of the events that touch one row is kept, because that is the
+ * order the chain produced them in and the order a replay delivers them
+ * in. A repeat of an event lands with that row's own history, which is
+ * where an overlapping ledger range puts it.
+ */
+function replayOrder(events: Generated[], seed: number): DecodedEvent[] {
+  const rnd = mulberry32(seed);
+  const int = (max: number): number => Math.floor(rnd() * max);
+
+  const queues = new Map<string, DecodedEvent[]>();
+  for (const { event, entity } of events) {
+    const queue = queues.get(entity);
+    if (queue) queue.push(event);
+    else queues.set(entity, [event]);
+  }
+
+  // Each event is delivered once, twice or three times.
+  const ready: DecodedEvent[][] = [];
+  for (const queue of queues.values()) {
+    const repeated: DecodedEvent[] = [];
+    for (const event of queue) {
+      const original = repeated.length;
+      repeated.push(event);
+      for (let r = 0; r < int(3); r += 1) {
+        // The repeat lands after the original and before the row's next
+        // event: an overlapping range delivers the same event again a
+        // moment later, and nothing else happened to that row in between.
+        const spot = original + 1 + int(repeated.length - original);
+        repeated.splice(spot, 0, event);
+      }
+    }
+    ready.push(repeated);
+  }
+
+  // The rows interleave: the events of different mandates, plans and
+  // vault rows arrive in whatever order the RPC pages them.
+  const order: DecodedEvent[] = [];
+  while (ready.length > 0) {
+    const i = int(ready.length);
+    const queue = ready[i]!;
+    order.push(queue.shift()!);
+    if (queue.length === 0) ready.splice(i, 1);
+  }
+  return order;
+}
+
+/** The tables the projection is made of. */
+const PROJECTION_TABLES = [
+  "cursor",
+  "plans",
+  "mandates",
+  "charges",
+  "vault_events",
+  "fee_history",
+  "mandate_events",
+] as const;
+
+/** A row as text, with its columns in a fixed order. */
+function canonicalRow(row: Record<string, unknown>): string {
+  return JSON.stringify(
+    Object.keys(row)
+      .sort()
+      .map((key) => [key, row[key]]),
+  );
+}
+
+/**
+ * The whole projection, as a snapshot that can be compared.
+ *
+ * The rows are sorted, because the order they were written in is not part
+ * of the projection: a replay writes them in a different order.
+ */
+function snapshot(database: DatabaseSync): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const table of PROJECTION_TABLES) {
+    out[table] = database
+      // The table name comes from the fixed list above, not from anything a
+      // caller supplies, and the query binds no values at all.
+      // eslint-disable-next-line no-restricted-syntax
+      .prepare(`SELECT * FROM ${table}`)
+      .all()
+      .map((row) => canonicalRow(row as Record<string, unknown>))
+      .sort();
+  }
+  return out;
+}
+
+describe("indexer idempotency under random orderings", () => {
+  /**
+   * The seeds the property is checked over.
+   *
+   * Fibonacci numbers, so the list reads as a deliberate spread rather than
+   * a range, and a failing seed names the history it produced.
+   */
+  const SEEDS = [
+    1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765, 10946,
+    17711, 28657, 46368, 75025,
+  ];
+
+  test("a shuffled, repeated replay leaves the projection identical", () => {
+    for (const seed of SEEDS) {
+      const history = generateHistory(seed);
+      const ordered = db();
+      const replayed = db();
+      try {
+        const orderedIndexer = indexer(ordered);
+        const replayIndexer = indexer(replayed);
+
+        for (const { event } of history) {
+          assert.equal(
+            orderedIndexer.apply(event),
+            "applied",
+            `seed ${seed}: ${event.name} does not match the contract spec`,
+          );
+        }
+        const replay = replayOrder(history, seed);
+        assert.ok(
+          replay.length > history.length,
+          `seed ${seed}: the replay repeats at least one event`,
+        );
+        for (const event of replay) {
+          assert.equal(
+            replayIndexer.apply(event),
+            "applied",
+            `seed ${seed}: ${event.name} does not match the contract spec`,
+          );
+        }
+
+        assert.deepEqual(
+          snapshot(replayed),
+          snapshot(ordered),
+          `seed ${seed}: the replay left a different projection`,
+        );
+      } finally {
+        ordered.close();
+        replayed.close();
+      }
+    }
+  });
+
+  test("the history tables hold the same rows whatever order the events arrive in", () => {
+    // The tables that record what happened are keyed on the event that
+    // happened, so even a permutation the chain cannot produce leaves them
+    // with the same rows.
+    for (const seed of SEEDS) {
+      const history = generateHistory(seed);
+      const ordered = db();
+      const shuffled = db();
+      try {
+        const orderedIndexer = indexer(ordered);
+        const shuffledIndexer = indexer(shuffled);
+
+        for (const { event } of history) orderedIndexer.apply(event);
+        // Every event, in an order that shares nothing with the original.
+        const permutation = history.map(({ event }) => event);
+        const rnd = mulberry32(seed * 31 + 7);
+        for (let i = permutation.length - 1; i > 0; i -= 1) {
+          const j = Math.floor(rnd() * (i + 1));
+          [permutation[i], permutation[j]] = [permutation[j]!, permutation[i]!];
+        }
+        for (const event of permutation) shuffledIndexer.apply(event);
+
+        for (const table of ["charges", "vault_events", "fee_history"]) {
+          assert.deepEqual(
+            snapshot(shuffled)[table],
+            snapshot(ordered)[table],
+            `seed ${seed}: ${table} differs after a permutation`,
+          );
+        }
+        // The churn log is not in that list: a departure is attributed to the
+        // merchant the mandate row holds, so a permutation that delivers it
+        // before the subscription leaves it unattributed. That is the same
+        // dependency the test above pins down.
+      } finally {
+        ordered.close();
+        shuffled.close();
+      }
+    }
+  });
+
+  test("the same seed always generates the same history", () => {
+    // The property above is only worth anything if a failure can be
+    // reproduced: the same seed has to give the same events, the same
+    // addresses and the same amounts.
+    for (const seed of SEEDS) {
+      const first = generateHistory(seed);
+      const second = generateHistory(seed);
+      assert.deepEqual(
+        second.map(({ event }) => event),
+        first.map(({ event }) => event),
+        `seed ${seed} generated a different history the second time`,
+      );
+    }
+    // And a different seed has to give a different history, or the seeds
+    // would not be covering anything.
+    assert.notDeepEqual(
+      generateHistory(1).map(({ event }) => event.txHash),
+      generateHistory(2).map(({ event }) => event.txHash),
+    );
+  });
+
+  test("an update that arrives before the row it updates is dropped", () => {
+    // The one ordering the projection does not survive, written down so
+    // the shuffle above is not quietly relying on it. The chain orders
+    // events by ledger, so a charge never reaches the projection before
+    // the subscription that created its mandate; the update simply finds
+    // no row to update, and the charge's own row is still recorded.
+    const d = db();
+    try {
+      const ix = indexer(d);
+      const charge = charged(1, 1_700_060_000, "tx-early");
+      ix.apply(charge);
+      ix.apply(subscribed);
+
+      const mandate = d.prepare("SELECT * FROM mandates WHERE id = 1").get() as Record<
+        string,
+        unknown
+      >;
+      assert.equal(mandate.charges_made, 0, "the charge did not advance the mandate");
+      const charges = d.prepare("SELECT COUNT(*) AS n FROM charges").get() as { n: number };
+      assert.equal(charges.n, 1, "the charge itself is still recorded");
+    } finally {
+      d.close();
+    }
+  });
+
+  test("a pause that arrives after the unpause that followed it wins", () => {
+    // The other ordering the projection does not survive: the pause is
+    // guarded on the mandate being active or paused, so a late repeat of
+    // an old pause flips the state back. The chain cannot deliver it —
+    // the repeat of an event always follows the events that came after it
+    // in the same ledger order — but it is worth writing down.
+    const d = db();
+    try {
+      const ix = indexer(d);
+      ix.apply(subscribed);
+      ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: true }));
+      ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: false }));
+      assert.equal(
+        (d.prepare("SELECT status FROM mandates WHERE id = 1").get() as { status: string }).status,
+        "Active",
+      );
+
+      // The late repeat of the first pause.
+      ix.apply(event("pause_changed", [1n, SUBSCRIBER], { paused: true }));
+      assert.equal(
+        (d.prepare("SELECT status FROM mandates WHERE id = 1").get() as { status: string }).status,
+        "Paused",
+        "the late pause wins, because the guard accepts an active mandate",
+      );
+    } finally {
+      d.close();
+    }
   });
 });

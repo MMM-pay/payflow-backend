@@ -20,8 +20,12 @@
     "dev": "node --watch --experimental-strip-types src/index.ts",
     "indexer": "node --experimental-strip-types src/cmd/indexer.ts",
     "keeper": "node --experimental-strip-types src/cmd/keeper.ts",
+    "cli": "node --experimental-strip-types src/cmd/cli.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:coverage": "node --experimental-strip-types --experimental-test-coverage --test-coverage-include=src/** --test-coverage-lines=94 --test-reporter=tap --test-reporter=lcov --test-reporter-destination=stdout --test-reporter-destination=lcov.info --test test/*.test.ts",
+    "typecheck": "npm run typecheck:src && npm run typecheck:test",
+    "typecheck:src": "tsc --noEmit -p tsconfig.json",
+    "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint src test"
   },
   "dependencies": {

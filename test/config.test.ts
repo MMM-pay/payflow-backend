@@ -131,25 +131,14 @@ describe("keeper inclusion fee configuration", () => {
   });
 });
 
-describe("keeper batch configuration", () => {
-  test("KEEPER_BATCH defaults to on, so a supporting contract is used", () => {
-    assert.equal(loadConfig({ ...BASE }).KEEPER_BATCH, true);
-    assert.equal(loadConfig({ ...BASE, KEEPER_BATCH: "true" }).KEEPER_BATCH, true);
+describe("keeper dry-run configuration", () => {
+  test("KEEPER_DRY_RUN defaults to off: a normal pass submits", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_DRY_RUN, false);
+    assert.equal(loadConfig({ ...BASE, KEEPER_DRY_RUN: "false" }).KEEPER_DRY_RUN, false);
   });
 
-  test("KEEPER_BATCH=false turns batching off", () => {
-    assert.equal(loadConfig({ ...BASE, KEEPER_BATCH: "false" }).KEEPER_BATCH, false);
-  });
-
-  test("KEEPER_BATCH_SIZE defaults to the contract's planned cap of 10", () => {
-    assert.equal(loadConfig({ ...BASE }).KEEPER_BATCH_SIZE, 10);
-    assert.equal(loadConfig({ ...BASE, KEEPER_BATCH_SIZE: "5" }).KEEPER_BATCH_SIZE, 5);
-  });
-
-  test("KEEPER_BATCH_SIZE rejects sizes outside 2..25", () => {
-    assert.throws(() => loadConfig({ ...BASE, KEEPER_BATCH_SIZE: "1" }), /KEEPER_BATCH_SIZE/);
-    assert.throws(() => loadConfig({ ...BASE, KEEPER_BATCH_SIZE: "0" }), /KEEPER_BATCH_SIZE/);
-    assert.throws(() => loadConfig({ ...BASE, KEEPER_BATCH_SIZE: "26" }), /KEEPER_BATCH_SIZE/);
+  test("KEEPER_DRY_RUN=true turns the rehearsal on", () => {
+    assert.equal(loadConfig({ ...BASE, KEEPER_DRY_RUN: "true" }).KEEPER_DRY_RUN, true);
   });
 });
 

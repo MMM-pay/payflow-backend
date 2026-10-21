@@ -262,14 +262,15 @@ describe("webhooks", () => {
 
     const row1 = db
       .prepare("SELECT * FROM webhook_deliveries ORDER BY id DESC LIMIT 1")
-      .get() as { attempt: number; status: string; retry_at: number };
+      .get() as { id: number; attempt: number; status: string; retry_at: number };
     assert.equal(row1.attempt, 2, "the failed first attempt is rescheduled");
     assert.equal(row1.status, "pending");
     assert.ok(row1.retry_at >= T + 119 && row1.retry_at <= T + 121, "first retry in one minute");
 
     // Backoff: attempt n schedules its retry at now + 60 * 2^(n-1) seconds,
-    // capped at six hours: 120s, 240s, 480s, 960s for attempts 2..5. All of
-    // this happens within one second, so the offsets are exact.
+    // capped at six hours: 120s, 240s, 480s, 960s for attempts 2..5. The
+    // retry is scheduled from the wall clock, which may have crossed a
+    // second since `T` was read, so the offset is exact to the second.
     const expectedRetryAt: number[] = [T + 240, T + 480, T + 960]; // attempts 3, 4, 5
     for (const expected of expectedRetryAt) {
       // Make the delivery due right now so retryDue picks it up.
@@ -280,7 +281,11 @@ describe("webhooks", () => {
         .prepare("SELECT * FROM webhook_deliveries ORDER BY id DESC LIMIT 1")
         .get() as { attempt: number; status: string; retry_at: number };
       assert.equal(row.status, "pending");
-      assert.equal(row.retry_at, expected, `retry scheduled ${expected - T}s out`);
+      const offset = row.retry_at - T;
+      assert.ok(
+        Math.abs(offset - (expected - T)) <= 1,
+        `retry scheduled ${offset}s out, expected ${expected - T}s`,
+      );
     }
     assert.equal(calls.length, 4, "attempts 2 through 4 happen at their retry times");
 

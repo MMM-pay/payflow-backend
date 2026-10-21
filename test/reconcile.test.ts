@@ -4,7 +4,7 @@ import { openDatabase } from "../src/lib/db.ts";
 import { Reconciler, type ChainMandate } from "../src/reconcile.ts";
 import type { IndexerStatus } from "../src/indexer.ts";
 import type { rpc } from "@stellar/stellar-sdk";
-import { nativeToScVal } from "@stellar/stellar-sdk";
+import { nativeToScVal, type NativeToScValOpts } from "@stellar/stellar-sdk";
 
 // Keep test output quiet; behaviour, not log lines, is asserted below.
 process.env.LOG_LEVEL = "silent";
@@ -13,12 +13,17 @@ const SUBSCRIPTION = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
 
-/** Field types the `get_mandate` view returns: decoded by `reconcile.ts`. */
-const MANDATE_SPEC = {
-  status: ["symbol", "string"] as const,
-  charges_made: ["symbol", "u32"] as const,
-  next_charge: ["symbol", "u64"] as const,
-  amount: ["symbol", "i128"] as const,
+/**
+ * Field types the `get_mandate` view returns: decoded by `reconcile.ts`.
+ *
+ * The spec is the SDK's own map type spec, so the field types are checked
+ * against the values the SDK knows how to encode.
+ */
+const MANDATE_SPEC: NativeToScValOpts["type"] = {
+  status: ["symbol", "string"],
+  charges_made: ["symbol", "u32"],
+  next_charge: ["symbol", "u64"],
+  amount: ["symbol", "i128"],
 };
 
 function chainMandate(overrides: Partial<ChainMandate>): ChainMandate {

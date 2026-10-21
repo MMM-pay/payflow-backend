@@ -7,19 +7,43 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
-- **Batch settlement with `charge_many` (#37).** When the subscription contract
-  exposes `charge_many(mandate_ids: Vec<u64>) -> Vec<bool>`
-  (MMM-pay/payflow-contract#8), the keeper groups up to `KEEPER_BATCH_SIZE`
-  (default 10) due mandates into one transaction — one fee, one signature and
-  one confirmation for the whole group instead of each mandate's own — and
-  reads the per-id results so a mandate the contract skipped still fails and
-  backs off individually. Support is detected from the contract: the first
-  simulation that reports the entry point missing (and any batch that is
-  rejected or fails on chain) falls back to single `charge` transactions for
-  that group, with the missing entry point remembered until a config reload,
-  so an unsupported contract costs at most one extra simulation and never a
-  settlement. `KEEPER_BATCH=false` disables batching; both new variables are
-  documented in the README's configuration table.
+- **A coverage report with a minimum threshold (#49).** `npm run test:coverage`
+  runs the tests with Node's own coverage and writes an lcov report to
+  `lcov.info`, which CI uploads as an artifact. The `coverage` job
+  fails when the line coverage of `src/` falls below the threshold
+  `--test-coverage-lines` sets: 94%, the measured baseline of 96.63% minus
+  two percentage points. No coverage tool is added as a dependency — the test
+  runner already knows how to measure itself.
+- **An operator CLI (#41).** `npm run cli -- <command>` answers the questions an
+  incident asks — is the projection current, what does mandate 42 look like,
+  what is due, settle this mandate, rebuild the projection — without an ad-hoc
+  script or a hand-written SQL query. `status`, `mandate` and `due` read the
+  projection only and need no network; `charge` and `reindex` use the keeper and
+  the indexer themselves, so the CLI cannot drift from what the service does.
+  Every command has its own `--help`. The two commands that change something
+  refuse to run until `--yes` says so, amounts are printed as the decimal
+  strings the projection stores, and no secret is ever printed. `status --api`
+  adds the running instance's verdict and the live indexer's health — whether
+  it is paused, what it last failed on, how many events it rejected — which the
+  projection file on its own does not hold. `reindex --from` refuses to move
+  the cursor *forwards*, because the ledgers in between would never be applied;
+  `--skip-ahead` is how an operator accepts that gap on purpose.
+- **An API changelog and a deprecation policy (#172).** `API_CHANGELOG.md`
+  records what changed in the HTTP API apart from the service's own changelog,
+  and states how long a deprecated field or route keeps working: one minor
+  release of notice, announced in the response with `Deprecation` and `Sunset`
+  headers and in the OpenAPI document with `deprecated: true`. The document's
+  `externalDocs` links the file, and a test reads it to prove the link and the
+  policy are both there.
+- **Keeper dry-run mode (#38).** `KEEPER_DRY_RUN=true` makes a settlement pass
+  rehearse instead of settle: every due charge is built and simulated against
+  the RPC exactly as a real pass would — account lookup, inclusion fee,
+  vault-balance skips and key rotation included — but the keeper stops after
+  the simulation: nothing is signed, `sendTransaction` is never called, and
+  backoff, pass history and metrics are left untouched. Each mandate answers
+  `simulated`, carrying the simulation's error when the charge would fail, so
+  an operator can exercise a first run on a new deployment before it costs a
+  fee. The new variable is in the README's configuration table.
 - **An OpenAPI description of the API (#7).** `GET /api/openapi.json` serves an
   OpenAPI 3.1 document covering every route and `/health`, with the parameters
   each route takes, the responses it answers and the schema of each body.
@@ -191,6 +215,22 @@ All notable changes to payflow-backend. The format follows
 
 ### Changed
 
+- **The indexer's idempotency is tested under random orderings (#48).** The
+  projection was checked against a handful of hand-written replays. A seeded
+  generator now builds a random history across several mandates, plans and
+  vault rows, applies it in ledger order, and applies the same history again
+  as a shuffled, repeated replay; the two projections have to be identical.
+  The seed is part of the test, so a failure is reproducible. The two orderings
+  the projection does not survive — an update that arrives before the row it
+  updates, and a pause that arrives after the unpause that followed it — are
+  pinned down by their own tests, so what the property relies on is written
+  down rather than assumed.
+
+- **The test files are type-checked (#50).** `tsconfig.json` only covered
+  `src/`, so a type error in a test was never reported: it surfaced as a
+  confusing runtime failure, or not at all. A `tsconfig.test.json` now covers
+  `test/` as well, the CI typecheck job runs it, and `npm run typecheck` runs
+  both. The types that were wrong are fixed, not worked around.
 - **A mandate that does not exist has no charges (#10).**
   `GET /api/mandates/:id/charges` used to answer `200` with an empty list for
   an unknown id, so "no such mandate" and "no charges yet" looked the same. It

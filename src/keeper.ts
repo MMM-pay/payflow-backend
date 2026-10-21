@@ -27,7 +27,13 @@ export interface DueMandate {
   plan_id: number;
 }
 
-/** The RPC calls the keeper makes. Narrow so tests can supply a fake. */
+/**
+ * The RPC calls the keeper makes. Narrow so tests can supply a fake.
+ *
+ * `simulateTransaction` is optional: the vault-balance read is an
+ * optimisation, not a requirement, so an RPC that cannot simulate settles
+ * exactly as it did before the check was added.
+ */
 export type KeeperRpc = Pick<
   rpc.Server,
   | "getAccount"
@@ -35,18 +41,8 @@ export type KeeperRpc = Pick<
   | "prepareTransaction"
   | "sendTransaction"
   | "getTransaction"
-  /** Read-only contract calls; the vault balance check uses them. */
-  | "simulateTransaction"
->;
-
-/**
- * The part of the RPC the vault-balance read needs.
- *
- * A fake RPC in a test may not implement it, and the read is an optimisation
- * rather than a requirement: without it the keeper settles exactly as it did
- * before.
- */
-type VaultBalanceRpc = Partial<Pick<KeeperRpc, "simulateTransaction">>;
+> &
+  Partial<Pick<rpc.Server, "simulateTransaction">>;
 
 /** First retry delay after a failed charge; doubles per failure. */
 const BACKOFF_BASE_S = 60;
@@ -104,7 +100,13 @@ function isMissingBatchEntryError(err: unknown): boolean {
 
 export interface SettleResult {
   mandateId: number;
-  status: "settled" | "failed";
+  /**
+   * `settled` and `failed` are real, on-chain outcomes. `simulated` is a
+   * dry run (`KEEPER_DRY_RUN=true`): the charge was simulated against the
+   * RPC and nothing was submitted — an `error` on a `simulated` result is
+   * the simulation's refusal, i.e. the charge would have failed.
+   */
+  status: "settled" | "failed" | "simulated";
   txHash?: string;
   error?: string;
 }
@@ -198,26 +200,16 @@ export interface Channel {
  * channel is dropped for the pass, logged by public key, so its mandates
  * settle through the live channels instead of backing off against a dead key.
  *
- * ### Batch settlement with `charge_many` (#37)
+ * ### Dry run (#38)
  *
- * When the subscription contract exposes `charge_many(mandate_ids: Vec<u64>)
- * -> Vec<bool>` (MMM-pay/payflow-contract#8), a pass groups up to
- * `KEEPER_BATCH_SIZE` due mandates into one transaction: one fee, one
- * signature and one confirmation for the whole group instead of each
- * mandate's own. The returned `Vec<bool>` says per id whether it was
- * charged, so a mandate the contract skipped (not due, not active, unknown
- * or unfunded) fails and backs off individually, exactly like a failed
- * `charge`.
- *
- * Support is detected from the contract itself, so no deployment has to
- * know which contract it points at: the first simulation that reports the
- * entry point missing switches the keeper to single `charge` transactions
- * for the rest of the process (a config reload on SIGHUP re-detects, for a
- * redeployed contract that does support it), and any batch that cannot run
- * — simulation refusal, node rejection or a failed transaction — falls back
- * to single charges for that group in that pass. An unsupported contract
- * therefore costs at most one extra simulation, never a settlement. Set
- * `KEEPER_BATCH=false` to never batch at all.
+ * With `KEEPER_DRY_RUN=true` a pass rehearses settlement: it builds and
+ * simulates every charge exactly as a real pass would — account lookup,
+ * inclusion fee, vault-balance skips and key rotation included — but stops
+ * after `prepareTransaction`. Nothing is signed, `sendTransaction` is never
+ * called, and the keeper's bookkeeping is untouched: no backoff, no pass
+ * history, no metrics. Each mandate answers `simulated`, carrying the
+ * simulation's error when the charge would fail, so an operator can
+ * rehearse a first run on a new deployment before it costs a fee.
  */
 export class Keeper {
   private readonly db: DatabaseSync;
@@ -418,6 +410,17 @@ export class Keeper {
     const { chargeable, skipped } = await this.withoutShortfalls(due);
     const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
     const channels = chargeable.length > 0 ? await this.distributableChannels() : [];
+    // Read once per pass: the banner, pass history and metrics for one
+    // pass all reflect the same mode even if a SIGHUP reload lands mid-pass.
+    // Backoff follows each result's own status (see `record`), so a
+    // simulation is never recorded as a real failure from either direction.
+    const dryRun = this.config.KEEPER_DRY_RUN;
+    if (dryRun && chargeable.length > 0) {
+      logger.info(
+        { mandates: chargeable.length },
+        "keeper dry run: simulating each charge; nothing will be submitted",
+      );
+    }
     // One worker per channel pulls from the shared queue: within a channel
     // mandates settle strictly one after the other (one account, one sequence
     // stream), across channels they run in parallel. The cursor and the
@@ -448,12 +451,16 @@ export class Keeper {
     );
     ordered.sort((a, b) => a.slot - b.slot);
     const results = ordered.map((entry) => entry.result);
+    // A dry run only reports: pass history and metrics describe work that
+    // actually happened on chain, and there was none. A pending retirement
+    // stays armed for the first pass that really settles.
+    if (dryRun) return results;
     this.announceRetirement(results);
     this.recordPass(now, results, skipped);
     metrics.increment("keeper_passes");
     for (const result of results) {
       if (result.status === "settled") metrics.increment("charges_settled");
-      else metrics.increment("charges_failed");
+      else if (result.status === "failed") metrics.increment("charges_failed");
     }
     return results;
   }
@@ -543,8 +550,7 @@ export class Keeper {
    * caller's loop must not crash over it.
    */
   private async vaultBalance(subscriber: string, token: string): Promise<bigint | null> {
-    const simulator = this.server as VaultBalanceRpc;
-    if (typeof simulator.simulateTransaction !== "function") return null;
+    if (typeof this.server.simulateTransaction !== "function") return null;
     const vaultId = this.config.VAULT_ID;
     if (!vaultId) return null;
     try {
@@ -561,7 +567,7 @@ export class Keeper {
         )
         .setTimeout(0)
         .build();
-      const res = await simulator.simulateTransaction(tx);
+      const res = await this.server.simulateTransaction(tx);
       if ("error" in res && res.error) {
         logger.warn(
           { subscriber, token, reason: res.error.slice(0, 200).replace(/\s+/g, " ") },
@@ -752,6 +758,9 @@ export class Keeper {
   }
 
   private record(result: SettleResult, now: number): void {
+    // A simulated result is neither a settlement nor a failure: a dry run
+    // must leave the backoff exactly as it was.
+    if (result.status === "simulated") return;
     if (result.status === "settled") {
       this.backoff.delete(result.mandateId);
       return;
@@ -809,130 +818,23 @@ export class Keeper {
         if (isKeyFailure(err) && this.rotateToStandby(lane, mandateId)) {
           continue;
         }
-        logger.warn({ mandateId, fee: fee.toString(), error }, "charge skipped");
-        return { mandateId, status: "failed", error };
-      }
-    }
-  }
-
-  /**
-   * Settles one worker's slice of the due queue and always answers with one
-   * result per mandate, in order.
-   *
-   * With batching on and two or more mandates in the group this is one
-   * `charge_many` transaction; otherwise it is one `charge` per mandate,
-   * sequential inside the channel exactly as before. A batch that cannot be
-   * used at all (`settleBatch` answers `null`) falls back to single charges
-   * for just this group, so an unsupported or misbehaving contract costs at
-   * most one extra simulation and every mandate still gets its own result
-   * and its own backoff.
-   */
-  private async settleGroup(
-    group: DueMandate[],
-    inclusionFee: bigint | undefined,
-    channel: Channel,
-  ): Promise<SettleResult[]> {
-    if (this.batchEnabled() && group.length > 1) {
-      const results = await this.settleBatch(
-        group.map((mandate) => mandate.id),
-        inclusionFee,
-        channel,
-      );
-      if (results) return results;
-      logger.warn(
-        { mandates: group.map((mandate) => mandate.id) },
-        "charge_many unavailable; settling the group with single charges",
-      );
-    }
-    const results: SettleResult[] = [];
-    for (const mandate of group) {
-      results.push(await this.settle(mandate.id, inclusionFee, channel));
-    }
-    return results;
-  }
-
-  /**
-   * Submits one `charge_many` for `mandateIds` and maps the contract's
-   * per-id `Vec<bool>` back onto the mandates: `false` means the contract
-   * skipped that id (not due, not active, unknown or unfunded), which fails
-   * that mandate and backs it off individually, exactly like a failed
-   * `charge`.
-   *
-   * Answers `null` when the batch transaction could not decide anything —
-   * the simulation refused, the node rejected the transaction, or it failed
-   * on chain — and the caller settles the same mandates with single charges
-   * instead. A transaction still pending after the polling window is *not*
-   * `null`: it produces one failed result per id, the single-charge
-   * behaviour, because re-sending mandates whose batch may still land would
-   * risk paying twice for an unknown outcome. Congestion retries once with
-   * a doubled fee up to `KEEPER_MAX_FEE`, and a signing key that cannot pay
-   * rotates the channel to its standby and retries — mirroring `settle`.
-   * Errors are scrubbed like every other result; secrets never escape.
-   */
-  private async settleBatch(
-    mandateIds: number[],
-    inclusionFee: bigint = BigInt(BASE_FEE),
-    channel: Channel,
-  ): Promise<SettleResult[] | null> {
-    const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
-    let fee = inclusionFee < maxFee ? inclusionFee : maxFee;
-    let congestionRetries = 0;
-    for (;;) {
-      try {
-        const attempt = await this.submitBatch(mandateIds, fee, channel);
-        if (attempt.kind === "unavailable") return null;
-        if (attempt.kind === "congestion") {
-          const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
-          if (congestionRetries === 0 && retryFee > fee) {
-            congestionRetries += 1;
-            fee = retryFee;
-            logger.warn(
-              { mandates: mandateIds.length, fee: fee.toString() },
-              "retrying charge_many with a higher fee",
-            );
-            continue;
-          }
-          return null;
-        }
-        return attempt.results.map((result) =>
-          result.error ? { ...result, error: this.scrubError(result.error) } : result,
+        logger.warn(
+          { mandateId, fee: fee.toString(), error },
+          this.config.KEEPER_DRY_RUN ? "dry run: charge simulation failed" : "charge skipped",
         );
-      } catch (err) {
-        if (isCongestionFailure(err)) {
-          const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
-          if (congestionRetries === 0 && retryFee > fee) {
-            congestionRetries += 1;
-            fee = retryFee;
-            logger.warn(
-              { mandates: mandateIds.length, fee: fee.toString() },
-              "retrying charge_many with a higher fee",
-            );
-            continue;
-          }
-          return null;
-        }
-        const error = this.scrubError(err instanceof Error ? err.message : String(err));
-        if (isKeyFailure(err) && this.rotateToStandby(channel, mandateIds[0])) {
-          continue;
-        }
-        if (isMissingBatchEntryError(err)) {
-          this.batchEntryMissing = true;
-          logger.warn(
-            { error },
-            "subscription contract has no charge_many; settling with single charges",
-          );
-        } else {
-          logger.warn(
-            { mandates: mandateIds.length, fee: fee.toString(), error },
-            "charge_many skipped",
-          );
-        }
-        return null;
+        return this.config.KEEPER_DRY_RUN
+          ? { mandateId, status: "simulated", error }
+          : { mandateId, status: "failed", error };
       }
     }
   }
 
-  /** Builds, simulates, signs and submits one `charge` with the channel's active key. */
+  /**
+   * Builds and simulates one `charge` with the channel's active key, then
+   * signs and submits it — unless `KEEPER_DRY_RUN` stops it after the
+   * simulation, answering `simulated` without ever touching a secret or the
+   * network's submit path.
+   */
   private async submit(mandateId: number, fee: bigint, channel: Channel): Promise<SettleResult> {
     const key = channel.keys[channel.active]!;
     const account = await this.server.getAccount(key.publicKey());
@@ -949,6 +851,15 @@ export class Keeper {
       .build();
 
     const prepared = await this.server.prepareTransaction(tx);
+    if (this.config.KEEPER_DRY_RUN) {
+      // Dry run: the simulation above is the whole exercise. The
+      // transaction is never signed or sent, so nothing reaches the chain.
+      logger.info(
+        { mandateId, fee: fee.toString() },
+        "dry run: charge simulated; not submitting",
+      );
+      return { mandateId, status: "simulated" };
+    }
     prepared.sign(key);
 
     const sent = await this.server.sendTransaction(prepared);

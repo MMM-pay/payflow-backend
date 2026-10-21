@@ -32,7 +32,7 @@ function keeperConfig(
   },
   order?: "oldest" | "largest",
   fees: { KEEPER_FEE_PERCENTILE?: string; KEEPER_MAX_FEE?: string } = {},
-  batch: { KEEPER_BATCH?: boolean; KEEPER_BATCH_SIZE?: number } = {},
+  toggles: { KEEPER_DRY_RUN?: boolean } = {},
 ): Config {
   return {
     PLAN_REGISTRY_ID: CONTRACT,
@@ -43,7 +43,7 @@ function keeperConfig(
     KEEPER_FEE_PERCENTILE: "90",
     KEEPER_MAX_FEE: "100000",
     ...fees,
-    ...batch,
+    ...toggles,
     ...secrets,
   } as unknown as Config;
 }
@@ -64,7 +64,7 @@ function fakeRpc(funded: Set<string>, submitted: string[] = []): KeeperRpc {
       }
       return new Account(address, "1") as never;
     },
-    prepareTransaction: async (tx) => tx,
+    prepareTransaction: async (tx) => tx as Transaction,
     sendTransaction: async (tx) => {
       const hash = Buffer.from((tx as Transaction).hash()).toString("hex");
       submitted.push(hash);
@@ -256,18 +256,59 @@ async function captureWarnLog(fn: () => Promise<void>): Promise<string[]> {
   return messages;
 }
 
-/**
- * A fake node that models account sequence numbers the way the real one
- * does: `getAccount` reports the last consumed sequence, `sendTransaction`
- * accepts only `last + 1` for the submitting account — anything else is
- * recorded as a collision — and accepting consumes the sequence.
- * `getTransaction` resolves after `confirmMs`, so channels that submit
- * inside the same window are in flight together; `state.maxInFlight`
- * records the peak.
- */
-function sequencingRpc(
-  funded: Set<string>,
-  state: {
+describe("keeper channel accounts", () => {
+  /**
+   * A fake node that models account sequence numbers the way the real one
+   * does: `getAccount` reports the last consumed sequence, `sendTransaction`
+   * accepts only `last + 1` for the submitting account — anything else is
+   * recorded as a collision — and accepting consumes the sequence.
+   * `getTransaction` resolves after `confirmMs`, so channels that submit
+   * inside the same window are in flight together; `state.maxInFlight`
+   * records the peak.
+   */
+  function sequencingRpc(
+    funded: Set<string>,
+    state: {
+      collisions: string[];
+      submitted: { source: string; sequence: string }[];
+      maxInFlight: number;
+    },
+    confirmMs = 50,
+  ): KeeperRpc {
+    const consumed = new Map<string, bigint>();
+    let inFlight = 0;
+    return {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
+      getAccount: async (address: string) => {
+        if (!funded.has(address)) {
+          throw new Error(`The source account ${address} was not found`);
+        }
+        return new Account(address, (consumed.get(address) ?? 0n).toString()) as never;
+      },
+      prepareTransaction: async (tx) => tx as Transaction,
+      sendTransaction: async (tx) => {
+        const t = tx as Transaction;
+        const expected = (consumed.get(t.source) ?? 0n) + 1n;
+        state.submitted.push({ source: t.source, sequence: t.sequence });
+        if (BigInt(t.sequence) !== expected) {
+          state.collisions.push(
+            `${t.source} submitted sequence ${t.sequence}, expected ${expected}`,
+          );
+        }
+        consumed.set(t.source, BigInt(t.sequence));
+        inFlight += 1;
+        if (inFlight > state.maxInFlight) state.maxInFlight = inFlight;
+        return { status: "PENDING", hash: Buffer.from(t.hash()).toString("hex") } as never;
+      },
+      getTransaction: async () => {
+        await new Promise((resolve) => setTimeout(resolve, confirmMs));
+        inFlight -= 1;
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS } as never;
+      },
+    };
+  }
+
+  function channelState(): {
     collisions: string[];
     submitted: { source: string; sequence: string }[];
     maxInFlight: number;
@@ -622,7 +663,7 @@ describe("keeper congestion fee retry", () => {
         fees.push((tx as Transaction & { fee: string }).fee);
         attempts += 1;
         if (attempts === 1) return { status: "TRY_AGAIN_LATER" };
-        return { status: "PENDING", hash: tx.hash().toString("hex") };
+        return { status: "PENDING", hash: Buffer.from(tx.hash()).toString("hex") };
       },
     } as unknown as KeeperRpc;
     const keeper = new Keeper(
@@ -915,379 +956,131 @@ describe("keeper vault balance check", () => {
 });
 
 /**
- * Batch settlement through the contract's `charge_many` entry point
- * (MMM-pay/payflow-contract#8: `charge_many(Vec<u64>) -> Vec<bool>`,
- * failures skipped, ids capped per call).
- *
- * The fake node understands both entry points: it records every prepared and
- * submitted call as `{ fn, ids }`, refuses `charge_many` with the host's
- * missing-export error when `supportsBatch` is off, and confirms a batch
- * with the `Vec<bool>` the test configured — one flag per id, in order.
+ * `KEEPER_DRY_RUN=true`: a pass builds and simulates every charge exactly as
+ * a real one would, then stops — no signing, no `sendTransaction`, and no
+ * bookkeeping changes (backoff, pass history, metrics). The acceptance
+ * criterion for the issue is the first test: zero sendTransaction calls.
  */
-describe("keeper batch settlement", () => {
-  /** One call the keeper built: which entry point and which mandate ids. */
-  interface RecordedCall {
-    fn: string;
-    ids: number[];
-  }
-
-  /** Decodes the first invoke-contract operation of a built transaction. */
-  function decodeCall(tx: Transaction): RecordedCall {
-    const { func } = tx.operations[0] as unknown as {
-      func: { invokeContract: { functionName: unknown; args: unknown[] } };
-    };
-    const invoke = func.invokeContract;
-    const fn = String(invoke.functionName);
-    const ids =
-      fn === "charge_many"
-        ? (scValToNative(invoke.args[0] as never) as bigint[]).map(Number)
-        : [Number(scValToNative(invoke.args[0] as never))];
-    return { fn, ids };
-  }
-
-  function batchRpc(
-    options: {
-      /** When false, simulating `charge_many` fails as on a contract without it. */
-      supportsBatch?: boolean;
-      /** `Vec<bool>` the next batch confirms with; defaults to all charged. */
-      outcomes?: boolean[];
-      /** Answer `sendTransaction` with ERROR for the batch call. */
-      rejectBatchSend?: boolean;
-      funded?: Set<string>;
-    } = {},
-  ): KeeperRpc & { prepared: RecordedCall[]; submitted: RecordedCall[] } {
-    const supportsBatch = options.supportsBatch ?? true;
-    const funded = options.funded ?? new Set([keyA.publicKey()]);
-    const prepared: RecordedCall[] = [];
-    const submitted: RecordedCall[] = [];
-    let lastBatch: { ids: number[]; outcomes?: boolean[] } | null = null;
-    return {
-      prepared,
-      submitted,
-      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
-      getAccount: async (address: string) => {
-        if (!funded.has(address)) {
-          throw new Error(`The source account ${address} was not found`);
-        }
-        return new Account(address, "1") as never;
-      },
-      prepareTransaction: async (tx: Transaction) => {
-        const call = decodeCall(tx);
-        prepared.push(call);
-        if (call.fn === "charge_many" && !supportsBatch) {
-          // The host's answer for a function the contract does not export.
-          throw new Error(
-            "HostError: Error(WasmVm, MissingValue): trying to invoke non-existent contract function 'charge_many'",
-          );
-        }
-        return tx;
-      },
-      sendTransaction: async (tx: Transaction) => {
-        const call = decodeCall(tx);
-        submitted.push(call);
-        if (call.fn === "charge_many") {
-          if (options.rejectBatchSend) {
-            return { status: "ERROR", errorResult: "contract rejected" } as never;
-          }
-          lastBatch = { ids: call.ids, outcomes: options.outcomes };
-        } else {
-          lastBatch = null;
-        }
-        return {
-          status: "PENDING",
-          hash: Buffer.from(tx.hash()).toString("hex"),
-        } as never;
-      },
-      getTransaction: async () => {
-        const batch = lastBatch;
-        const charged = batch ? (batch.outcomes ?? batch.ids.map(() => true)) : [];
-        const returnValue = batch
-          ? xdr.ScVal.scvVec(charged.map((value) => xdr.ScVal.scvBool(value)))
-          : undefined;
-        return {
-          status: rpc.Api.GetTransactionStatus.SUCCESS,
-          ...(returnValue ? { returnValue } : {}),
-        } as never;
-      },
-    } as KeeperRpc & { prepared: RecordedCall[]; submitted: RecordedCall[] };
-  }
-
-  test("due mandates are grouped into one charge_many transaction", async () => {
+describe("keeper dry run", () => {
+  test("simulates every due charge and never calls sendTransaction", async () => {
     const db = openDatabase(":memory:");
     for (let id = 1; id <= 3; id += 1) insertDue(db, id, 1_000 + id);
-    const server = batchRpc();
+    // fakeRpc records a submission only from its sendTransaction, so an
+    // empty list is direct evidence the submit path was never reached.
+    const submitted: string[] = [];
+    const server = fakeRpc(new Set([keyA.publicKey()]), submitted);
     const keeper = new Keeper(
       db,
       server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_DRY_RUN: true }),
     );
 
-    const results = await keeper.tick(10_000);
+    const messages = await captureInfoLog(async () => {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(
+        results.map((r) => [r.mandateId, r.status]),
+        [
+          [1, "simulated"],
+          [2, "simulated"],
+          [3, "simulated"],
+        ],
+        "each due mandate reports its simulation outcome, in due order",
+      );
+      assert.ok(
+        results.every((r) => r.txHash === undefined),
+        "a simulated result carries no transaction hash: nothing landed",
+      );
+    });
 
-    assert.deepEqual(
-      results.map((r) => [r.mandateId, r.status]),
-      [
-        [1, "settled"],
-        [2, "settled"],
-        [3, "settled"],
-      ],
-      "one batch answers for every mandate, in due order",
+    assert.equal(submitted.length, 0, "no sendTransaction call in dry run");
+    assert.ok(
+      messages.some((m) => m.includes("dry run")),
+      "the mode and the outcomes are logged for the operator",
     );
-    assert.equal(server.submitted.length, 1, "one transaction instead of three");
-    assert.equal(server.submitted[0]!.fn, "charge_many");
-    assert.deepEqual(server.submitted[0]!.ids, [1, 2, 3]);
-    assert.equal(keeper.passHistory()[0]!.settled, 3);
+    assert.equal(keeper.passHistory().length, 0, "a dry run records no pass history");
+    assert.equal(keeper.retryIn(1, 10_000), 0, "no backoff comes from a dry run");
     assert.equal(keeper.backoffList(10_000).length, 0);
     db.close();
   });
 
-  test("a lone due mandate still settles with a single charge", async () => {
-    const db = openDatabase(":memory:");
-    insertDue(db, 1, 1_000);
-    const server = batchRpc();
-    const keeper = new Keeper(
-      db,
-      server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
-    );
-
-    const results = await keeper.tick(10_000);
-
-    assert.equal(results[0]!.status, "settled");
-    assert.deepEqual(server.submitted, [{ fn: "charge", ids: [1] }], "no empty batch");
-    db.close();
-  });
-
-  test("the Vec<bool> results fail and back off the skipped mandate only", async () => {
-    const db = openDatabase(":memory:");
-    for (let id = 1; id <= 3; id += 1) insertDue(db, id, 1_000 + id);
-    // The contract charged 1 and 3 but skipped 2 (unfunded, cancelled, ...).
-    const server = batchRpc({ outcomes: [true, false, true] });
-    const keeper = new Keeper(
-      db,
-      server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
-    );
-
-    const results = await keeper.tick(10_000);
-
-    assert.deepEqual(
-      results.map((r) => [r.mandateId, r.status]),
-      [
-        [1, "settled"],
-        [2, "failed"],
-        [3, "settled"],
-      ],
-      "per-mandate results are read from the batch's return value",
-    );
-    assert.match(results[1]!.error ?? "", /charge_many skipped this mandate/);
-    assert.equal(keeper.retryIn(1, 10_000), 0, "charged mandates clear any backoff");
-    assert.equal(keeper.retryIn(2, 10_000), 60, "the skipped mandate backs off like any failure");
-    assert.equal(keeper.retryIn(3, 10_000), 0);
-    db.close();
-  });
-
-  test("an unsupported contract falls back to single charges", async () => {
-    const db = openDatabase(":memory:");
-    for (let id = 1; id <= 3; id += 1) insertDue(db, id, 1_000 + id);
-    const server = batchRpc({ supportsBatch: false });
-    const keeper = new Keeper(
-      db,
-      server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
-    );
-
-    const results = await keeper.tick(10_000);
-
-    assert.ok(
-      results.every((r) => r.status === "settled"),
-      `every mandate settles anyway: ${results.map((r) => r.error ?? r.status).join(", ")}`,
-    );
-    assert.deepEqual(
-      server.prepared.map((call) => call.fn),
-      ["charge_many", "charge", "charge", "charge"],
-      "the failed batch simulation is the only one; the group is settled one charge at a time",
-    );
-    assert.deepEqual(
-      server.submitted.map((call) => call.fn),
-      ["charge", "charge", "charge"],
-      "nothing was submitted for the unsupported batch",
-    );
-    db.close();
-  });
-
-  test("a missing charge_many is detected once; later passes go straight to singles", async () => {
+  test("a failed simulation is reported per mandate and retried next pass", async () => {
     const db = openDatabase(":memory:");
     insertDue(db, 1, 1_000);
     insertDue(db, 2, 1_001);
-    const server = batchRpc({ supportsBatch: false });
+    insertDue(db, 3, 1_002);
+    const submitted: string[] = [];
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()]), submitted),
+      prepareTransaction: async (tx: Transaction) => {
+        const { func } = tx.operations[0] as unknown as {
+          func: { invokeContract: { args: Parameters<typeof scValToNative>[0][] } };
+        };
+        const mandateId = Number(scValToNative(func.invokeContract.args[0]!));
+        if (mandateId === 2) throw new Error("Simulation failed: InsufficientBalance");
+        return tx;
+      },
+    } as unknown as KeeperRpc;
     const keeper = new Keeper(
       db,
       server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_DRY_RUN: true }),
     );
 
     const warnings = await captureWarnLog(async () => {
       const first = await keeper.tick(10_000);
-      assert.ok(first.every((r) => r.status === "settled"));
-      // The mandates are still due in the projection, so the second pass
-      // would try to batch them again if detection were not sticky.
+      assert.deepEqual(
+        first.map((r) => r.status),
+        ["simulated", "simulated", "simulated"],
+        "a dry run reports simulations, never real outcomes",
+      );
+      assert.match(
+        first[1]!.error ?? "",
+        /InsufficientBalance/,
+        "the simulation's refusal rides along on the result",
+      );
+      assert.equal(first[0]!.error, undefined, "a charge that would succeed carries no error");
+
+      // Nothing entered backoff, so the next dry pass rehearses everything.
       const second = await keeper.tick(10_001);
-      assert.ok(second.every((r) => r.status === "settled"));
+      assert.deepEqual(
+        second.map((r) => r.mandateId),
+        [1, 2, 3],
+        "a dry-run failure does not back its mandate off",
+      );
     });
 
-    assert.equal(
-      server.prepared.filter((call) => call.fn === "charge_many").length,
-      1,
-      "the contract is probed for charge_many exactly once",
-    );
     assert.ok(
-      warnings.some((m) => m.includes("no charge_many")),
-      "the fallback to single charges is logged for the operator",
+      warnings.some((m) => m.includes("dry run: charge simulation failed")),
+      "the would-fail charge is logged as a simulation failure",
     );
+    assert.equal(keeper.retryIn(2, 10_001), 0);
+    assert.equal(keeper.passHistory().length, 0, "still no pass history from dry runs");
+    assert.equal(submitted.length, 0, "no sendTransaction call in either pass");
     db.close();
   });
 
-  test("a simulation failure that is not a missing function only skips its own pass", async () => {
+  test("KEEPER_DRY_RUN=false submits and records exactly as before", async () => {
     const db = openDatabase(":memory:");
     insertDue(db, 1, 1_000);
     insertDue(db, 2, 1_001);
-    const prepared: RecordedCall[] = [];
-    const inner = batchRpc();
-    const server: KeeperRpc = {
-      ...inner,
-      prepareTransaction: async (tx: Transaction) => {
-        const call = decodeCall(tx);
-        prepared.push(call);
-        if (call.fn === "charge_many") {
-          throw new Error("Simulation failed: InsufficientBalance");
-        }
-        return inner.prepareTransaction(tx);
-      },
-    };
+    const submitted: string[] = [];
+    const server = fakeRpc(new Set([keyA.publicKey()]), submitted);
     const keeper = new Keeper(
       db,
       server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
-    );
-
-    const first = await keeper.tick(10_000);
-    assert.ok(first.every((r) => r.status === "settled"), "singles settle the group");
-    const second = await keeper.tick(10_001);
-    assert.ok(second.every((r) => r.status === "settled"));
-
-    assert.equal(
-      prepared.filter((call) => call.fn === "charge_many").length,
-      2,
-      "a data failure is not " +
-        "remembered as a missing entry point: the next pass tries the batch again",
-    );
-    db.close();
-  });
-
-  test("a batch the node rejects falls back to single charges in the same pass", async () => {
-    const db = openDatabase(":memory:");
-    insertDue(db, 1, 1_000);
-    insertDue(db, 2, 1_001);
-    const server = batchRpc({ rejectBatchSend: true });
-    const keeper = new Keeper(
-      db,
-      server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_DRY_RUN: false }),
     );
 
     const results = await keeper.tick(10_000);
 
-    assert.ok(
-      results.every((r) => r.status === "settled"),
-      `both mandates settle despite the rejected batch: ${results.map((r) => r.error ?? r.status).join(", ")}`,
-    );
     assert.deepEqual(
-      server.submitted.map((call) => call.fn),
-      ["charge_many", "charge", "charge"],
-      "the rejected batch is followed by one charge per mandate",
+      results.map((r) => r.status),
+      ["settled", "settled"],
+      "a real pass still reports on-chain outcomes",
     );
-    db.close();
-  });
-
-  test("KEEPER_BATCH=false never batches, even on a contract that supports it", async () => {
-    const db = openDatabase(":memory:");
-    for (let id = 1; id <= 3; id += 1) insertDue(db, id, 1_000 + id);
-    const server = batchRpc({ supportsBatch: true });
-    const keeper = new Keeper(
-      db,
-      server,
-      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: false }),
-    );
-
-    const results = await keeper.tick(10_000);
-
-    assert.ok(results.every((r) => r.status === "settled"));
-    assert.equal(server.prepared.filter((call) => call.fn === "charge_many").length, 0);
-    assert.deepEqual(
-      server.submitted.map((call) => call.fn),
-      ["charge", "charge", "charge"],
-    );
-    db.close();
-  });
-
-  test("groups never exceed KEEPER_BATCH_SIZE", async () => {
-    const db = openDatabase(":memory:");
-    for (let id = 1; id <= 10; id += 1) insertDue(db, id, 1_000 + id);
-    const server = batchRpc();
-    const keeper = new Keeper(
-      db,
-      server,
-      keeperConfig(
-        { KEEPER_SECRET: keyA.secret() },
-        undefined,
-        {},
-        { KEEPER_BATCH: true, KEEPER_BATCH_SIZE: 4 },
-      ),
-    );
-
-    const results = await keeper.tick(10_000);
-
-    assert.equal(results.length, 10);
-    assert.ok(results.every((r) => r.status === "settled"));
-    assert.deepEqual(
-      server.submitted.map((call) => call.ids),
-      [
-        [1, 2, 3, 4],
-        [5, 6, 7, 8],
-        [9, 10],
-      ],
-      "the queue is chunked at the configured cap, in due order",
-    );
-    db.close();
-  });
-
-  test("a batch keeps the channel's sequence stream: one transaction at a time", async () => {
-    const db = openDatabase(":memory:");
-    for (let id = 1; id <= 6; id += 1) insertDue(db, id, 1_000 + id);
-    const state = channelState();
-    const sequenced = sequencingRpc(new Set([keyA.publicKey()]), state);
-    const keeper = new Keeper(
-      db,
-      sequenced,
-      keeperConfig(
-        { KEEPER_SECRET: keyA.secret() },
-        undefined,
-        {},
-        { KEEPER_BATCH: true, KEEPER_BATCH_SIZE: 3 },
-      ),
-    );
-
-    const results = await keeper.tick(10_000);
-
-    assert.ok(results.every((r) => r.status === "settled"));
-    assert.equal(
-      state.submitted.length,
-      2,
-      "six mandates at three per batch reach the network as two transactions",
-    );
-    assert.deepEqual(state.collisions, [], "batches still advance the sequence by exactly one");
-    assert.equal(state.maxInFlight, 1, "within one channel, batches never overlap");
+    assert.equal(submitted.length, 2, "one transaction per mandate");
+    assert.equal(keeper.passHistory().length, 1, "real passes still record history");
+    assert.match(results[0]!.txHash ?? "", /^[0-9a-f]{64}$/);
     db.close();
   });
 });
