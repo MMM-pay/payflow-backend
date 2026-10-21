@@ -5,6 +5,7 @@ import {
   listDueMandates,
   listLatestVaultBalances,
   listMandateCharges,
+  listMandateTimeline,
   listMandates,
   planTokensByIds,
 } from "../lib/queries.ts";
@@ -137,6 +138,24 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     }
     const tokenId = planTokensByIds(db, [row.plan_id]).get(row.plan_id);
     res.json({ ...row, ...(await tokenFields(tokens, tokenId)) });
+  });
+
+  r.get("/mandates/:id/timeline", (req, res) => {
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+    if (!getMandateById(db, id.value)) {
+      sendApiError(res, req, 404, "mandate_not_found");
+      return;
+    }
+    const events = listMandateTimeline(db, id.value).map((event) => ({
+      mandateId: event.mandate_id,
+      txHash: event.tx_hash,
+      kind: event.kind,
+      ledger: event.ledger,
+      at: event.at,
+      details: JSON.parse(event.details) as Record<string, string | boolean>,
+    }));
+    res.json({ events });
   });
 
   r.get("/mandates/:id/charges", (req, res) => {
