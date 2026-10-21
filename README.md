@@ -54,6 +54,43 @@ replays that range on restart. Every write is designed for that:
 - Mandate updates are guarded by `WHERE charges_made < ?`, so an out-of-order
   event can never move a mandate backwards.
 
+
+### Raw contract event feed
+
+`GET /api/events` exposes the original contract events saved by the indexer.
+This endpoint depends on the `events` table introduced in **#34**; deploy the
+raw event storage migration before enabling this endpoint. No Soroban RPC call
+is made by the feed.
+
+| Parameter | Meaning |
+|---|---|
+| `contract` | Optional exact contract ID filter |
+| `name` | Optional event name (decoded from topic 0) |
+| `after` | Opaque cursor returned in the previous page's `next` |
+
+Each response contains `{ "events": [...], "next": "..." }`, with at most 50
+events per page; `next` is `null` at the end. The ordering is ascending by
+`(ledger, event_id)`, which is stable across re-indexes and handles multiple
+events in the same ledger. Pass the unchanged `next` value as `after` for
+the next page. Invalid parameters return `400 invalid_request`.
+
+An event contains `contract`, `ledger`, `txHash`, `index`, `name`,
+`topics`, `data`, and `closeTime`. `topics` is an array of base64-encoded
+Soroban XDR values and `data` is a base64-encoded Soroban XDR value. Decode
+them using the Stellar SDK; monetary amounts are never coerced to floating
+point. `name` may be `null` for an unknown topic representation. This is a
+lossless feed, not a JSON-native value projection.
+
+Example:
+
+```bash
+curl 'http://localhost:8080/api/events?contract=CONTRACT_ID&name=charged'
+curl 'http://localhost:8080/api/events?after=CURSOR_FROM_NEXT'
+```
+
+On multi-network deployments, the same feed is also available at
+`/api/<network>/events`; each network reads its own SQLite database.
+
 ## Quick start
 
 ```bash
