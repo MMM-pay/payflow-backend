@@ -1,10 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
-import { rpc } from "@stellar/stellar-sdk";
+import { rpc, xdr } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
 
 export type IndexerConfig = Config | NetworkConfig;
-import { readCursor, writeCursor } from "./lib/db.ts";
+import { clearProjections, readCursor, saveContractEvent, writeCursor } from "./lib/db.ts";
 import {
   big,
   decodeEvent,
@@ -265,6 +265,7 @@ export class Indexer {
           pastEnd = true;
           break;
         }
+        this.retain(raw);
         const decoded = decodeEvent(raw);
         if (!decoded) continue;
         if (this.apply(decoded) !== "mismatched") applied += 1;
@@ -416,6 +417,7 @@ export class Indexer {
       for (const raw of result.value) {
         const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
         if (ct !== null) lastSeenCloseTime = ct;
+        this.retain(raw);
         const decoded = decodeEvent(raw);
         if (!decoded) continue;
         if (this.apply(decoded) !== "mismatched") applied += 1;
@@ -432,6 +434,53 @@ export class Indexer {
     this.publishMetrics(applied);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
+  }
+
+
+  /** Preserve every event before decoding, including unknown contract events. */
+  private retain(raw: rpc.Api.EventResponse): void {
+    saveContractEvent(this.db, {
+      eventId: raw.id,
+      contractId: raw.contractId?.toString() ?? "",
+      ledger: raw.ledger,
+      txHash: raw.txHash,
+      eventIndex: raw.id,
+      topics: JSON.stringify(raw.topic.map((topic) => topic.toXDR("base64"))),
+      data: raw.value.toXDR("base64"),
+      closeTime: parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
+    });
+  }
+
+  /** Rebuild event-derived projections locally, without querying RPC. */
+  rebuildProjections(): number {
+    const rows = this.db.prepare(
+      "SELECT contract_id, ledger, tx_hash, topics, data, close_time FROM events ORDER BY ledger, event_id",
+    ).all() as Array<{
+      contract_id: string; ledger: number; tx_hash: string;
+      topics: string; data: string; close_time: number | null;
+    }>;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      clearProjections(this.db);
+      let applied = 0;
+      for (const row of rows) {
+        const raw = {
+          contractId: row.contract_id,
+          ledger: row.ledger,
+          txHash: row.tx_hash,
+          topic: (JSON.parse(row.topics) as string[]).map((topic) => xdr.ScVal.fromXDR(topic, "base64")),
+          value: xdr.ScVal.fromXDR(row.data, "base64"),
+          ledgerClosedAt: row.close_time === null ? undefined : new Date(row.close_time * 1000).toISOString(),
+        } as unknown as rpc.Api.EventResponse;
+        const decoded = decodeEvent(raw);
+        if (decoded && this.apply(decoded) === "applied") applied += 1;
+      }
+      this.db.exec("COMMIT");
+      return applied;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   /** Run passes until the cursor reaches the RPC's latest ledger. */
