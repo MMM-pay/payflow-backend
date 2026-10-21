@@ -47,6 +47,7 @@ export function rawEventsRouter(db: DatabaseSync): Router {
     const name = req.query.name;
     const after = req.query.after;
     if (
+      Object.keys(req.query).some((key) => !["contract", "name", "after"].includes(key)) ||
       (contract !== undefined && (typeof contract !== "string" || contract.length > MAX_FILTER_LENGTH)) ||
       (name !== undefined && (typeof name !== "string" || name.length > MAX_FILTER_LENGTH)) ||
       (after !== undefined && (typeof after !== "string" || after.length > 1024))
