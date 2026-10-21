@@ -32,7 +32,7 @@ function keeperConfig(
   },
   order?: "oldest" | "largest",
   fees: { KEEPER_FEE_PERCENTILE?: string; KEEPER_MAX_FEE?: string } = {},
-  toggles: { KEEPER_DRY_RUN?: boolean } = {},
+  toggles: { KEEPER_DRY_RUN?: boolean; KEEPER_BATCH?: boolean; KEEPER_BATCH_SIZE?: number } = {},
 ): Config {
   return {
     PLAN_REGISTRY_ID: CONTRACT,
@@ -42,6 +42,8 @@ function keeperConfig(
     ...(order ? { KEEPER_ORDER: order } : {}),
     KEEPER_FEE_PERCENTILE: "90",
     KEEPER_MAX_FEE: "100000",
+    KEEPER_BATCH: false,
+    KEEPER_BATCH_SIZE: 10,
     ...fees,
     ...toggles,
     ...secrets,
@@ -307,46 +309,6 @@ describe("keeper channel accounts", () => {
       },
     };
   }
-
-  function channelState(): {
-    collisions: string[];
-    submitted: { source: string; sequence: string }[];
-    maxInFlight: number;
-  },
-  confirmMs = 50,
-): KeeperRpc {
-  const consumed = new Map<string, bigint>();
-  let inFlight = 0;
-  return {
-    getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
-    getAccount: async (address: string) => {
-      if (!funded.has(address)) {
-        throw new Error(`The source account ${address} was not found`);
-      }
-      return new Account(address, (consumed.get(address) ?? 0n).toString()) as never;
-    },
-    prepareTransaction: async (tx) => tx,
-    sendTransaction: async (tx) => {
-      const t = tx as Transaction;
-      const expected = (consumed.get(t.source) ?? 0n) + 1n;
-      state.submitted.push({ source: t.source, sequence: t.sequence });
-      if (BigInt(t.sequence) !== expected) {
-        state.collisions.push(
-          `${t.source} submitted sequence ${t.sequence}, expected ${expected}`,
-        );
-      }
-      consumed.set(t.source, BigInt(t.sequence));
-      inFlight += 1;
-      if (inFlight > state.maxInFlight) state.maxInFlight = inFlight;
-      return { status: "PENDING", hash: Buffer.from(t.hash()).toString("hex") } as never;
-    },
-    getTransaction: async () => {
-      await new Promise((resolve) => setTimeout(resolve, confirmMs));
-      inFlight -= 1;
-      return { status: rpc.Api.GetTransactionStatus.SUCCESS } as never;
-    },
-  };
-}
 
 function channelState(): {
   collisions: string[];
