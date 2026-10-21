@@ -8,7 +8,7 @@ import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
-import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
+import { buildAdminRoutes, type AdminHooks, type AdminToken, type AdminScope } from "./routes/admin.ts";
 import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
 import { buildOpenApiDocument } from "./routes/openapi.ts";
 import { asReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -19,6 +19,7 @@ import type { WebhookDispatcher } from "./lib/webhooks.ts";
 import { logger } from "./lib/logger.ts";
 import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
+import { getVersionInfo } from "./lib/version.ts";
 
 /**
  * The shape of a failure that is safe to put in a log line.
@@ -84,6 +85,37 @@ export function errorHandler(
 
 /** Ledgers the indexer may trail the network by before it is considered behind. */
 const MAX_LAG = 120;
+
+/**
+ * Parse admin token with optional scopes and expiry.
+ * Format: `token` or `token:scope1,scope2:expiry_timestamp`
+ */
+function parseAdminToken(input: string): AdminToken {
+  const parts = input.split(":");
+  const token = parts[0] ?? "";
+  if (parts.length === 1) return { token };
+
+  const scopes: AdminScope[] = [];
+  let expiresAt: number | undefined;
+
+  const scopesStr = parts[1];
+  if (scopesStr) {
+    for (const scope of scopesStr.split(",")) {
+      const trimmed = scope.trim();
+      if (trimmed === "*" || trimmed === "reindex" || trimmed === "keeper" || trimmed === "indexer") {
+        scopes.push(trimmed as AdminScope);
+      }
+    }
+  }
+
+  const expiryStr = parts[2];
+  if (expiryStr) {
+    const expiry = parseInt(expiryStr, 10);
+    if (!isNaN(expiry)) expiresAt = expiry;
+  }
+
+  return { token, ...(scopes.length > 0 ? { scopes } : {}), ...(expiresAt ? { expiresAt } : {}) };
+}
 
 /** Ledgers the projection trails the network by; null until the first pass. */
 function lagOf(indexer: IndexerStatus | undefined): number | null {
@@ -330,10 +362,18 @@ export function createApp(
     });
   });
 
+  // Version and build information endpoint.
+  app.get("/version", (_req, res) => {
+    res.json(getVersionInfo());
+  });
+
   // Operator endpoints are opt-in. Without ADMIN_TOKEN — or without hooks —
   // /admin falls through to the 404 below like any unknown path.
   if (config.ADMIN_TOKEN && admin) {
-    app.use("/admin", buildAdminRoutes(config.ADMIN_TOKEN, admin));
+    const adminToken = config.ADMIN_TOKEN.includes(":")
+      ? [parseAdminToken(config.ADMIN_TOKEN)]
+      : config.ADMIN_TOKEN;
+    app.use("/admin", buildAdminRoutes(adminToken, admin));
   }
 
   if (config.KEEPER_ENABLED && admin?.keeperHistory) {
