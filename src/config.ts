@@ -80,6 +80,10 @@ const schema = z.object({
           .refine(StrKey.isValidEd25519SecretSeed, "must be a valid Stellar secret seed"),
       ),
     ),
+  /** Use charge_many when the deployed contract supports it. */
+  KEEPER_BATCH: z.string().default("true").transform((v) => v === "true"),
+  /** Mandates per batch transaction, bounded by the contract's supported list size. */
+  KEEPER_BATCH_SIZE: z.coerce.number().int().min(2).max(25).default(10),
   KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   /**
    * Which due mandate to settle first: `oldest` (due date ascending, the
