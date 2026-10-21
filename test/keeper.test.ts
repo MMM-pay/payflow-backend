@@ -7,7 +7,6 @@ import {
   Transaction,
   nativeToScVal,
   scValToNative,
-  xdr,
 } from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
