@@ -882,3 +882,36 @@ export function getProtocolStats(
     lastIndexedLedger: readCursor(db, 0),
   };
 }
+
+/** Raw event archive row, as stored by indexer issue #34. */
+export interface RawContractEventRow {
+  event_id: string;
+  contract_id: string;
+  ledger: number;
+  tx_hash: string;
+  event_index: string;
+  topics: string;
+  data: string;
+  close_time: number | null;
+}
+
+/**
+ * Read one bounded archive batch in ledger/event order. Separate static SQL
+ * statements avoid dynamic SQL interpolation and preserve parameter binding.
+ */
+export function listRawContractEvents(
+  db: DatabaseSync,
+  ledger: number,
+  eventId: string,
+  contract: string | undefined,
+  limit: number,
+): RawContractEventRow[] {
+  if (contract === undefined) {
+    return db.prepare(
+      "SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time FROM events WHERE (ledger, event_id) > (?, ?) ORDER BY ledger, event_id LIMIT ?",
+    ).all(ledger, eventId, limit) as unknown as RawContractEventRow[];
+  }
+  return db.prepare(
+    "SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time FROM events WHERE (ledger, event_id) > (?, ?) AND contract_id = ? ORDER BY ledger, event_id LIMIT ?",
+  ).all(ledger, eventId, contract, limit) as unknown as RawContractEventRow[];
+}
