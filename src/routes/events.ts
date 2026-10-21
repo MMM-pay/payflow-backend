@@ -2,9 +2,7 @@ import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import { sendApiError } from "./errors.ts";
-import { listRawContractEvents, type RawContractEventRow } from "../lib/queries.ts";
-
-type EventRow = RawContractEventRow;
+import { listRawContractEvents } from "../lib/queries.ts";
 
 const PAGE_SIZE = 50;
 const SCAN_SIZE = 200;
