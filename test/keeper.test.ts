@@ -256,7 +256,9 @@ async function captureWarnLog(fn: () => Promise<void>): Promise<string[]> {
     (logger as { warn: unknown }).warn = original;
   }
   return messages;
-}{
+}
+
+
   /**
    * A fake node that models account sequence numbers the way the real one
    * does: `getAccount` reports the last consumed sequence, `sendTransaction`
