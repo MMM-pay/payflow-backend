@@ -139,6 +139,19 @@ CREATE TABLE IF NOT EXISTS mandate_events (
 );
 CREATE INDEX IF NOT EXISTS mandate_events_merchant ON mandate_events(merchant, kind, at);
 
+-- Full mandate timeline is separate from mandate_events: that existing table
+-- aggregates churn into one start/departure slot and must retain its semantics.
+CREATE TABLE IF NOT EXISTS mandate_timeline (
+  mandate_id INTEGER NOT NULL,
+  tx_hash TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  ledger INTEGER NOT NULL,
+  at INTEGER,
+  details TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (mandate_id, tx_hash, kind)
+);
+CREATE INDEX IF NOT EXISTS mandate_timeline_order ON mandate_timeline(mandate_id, ledger, tx_hash, kind);
+
 CREATE TABLE IF NOT EXISTS webhooks (
   id          INTEGER PRIMARY KEY,
   merchant    TEXT    NOT NULL,
@@ -267,7 +280,7 @@ export function saveContractEvent(db: DatabaseSync, event: StoredContractEvent):
 export function clearProjections(db: DatabaseSync): void {
   // Do not remove cursor, raw events, or operational webhook configuration.
   for (const table of [
-    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events",
+    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline",
   ]) {
     db.exec(`DELETE FROM ${table}`);
   }
