@@ -532,11 +532,13 @@ export class Indexer {
         const [, , merchant] = e.topics;
         this.onSubscribed(e);
         this.recordChurn(e, "started", str(merchant));
+        this.recordTimeline(e);
         this.events.emit("applied", e);
         return "applied";
       }
       case "charged":
         this.onCharged(e);
+        this.recordTimeline(e);
         this.events.emit("applied", e);
         return "applied";
       case "cancelled": {
@@ -544,6 +546,7 @@ export class Indexer {
         // merchant comes from the mandate row the projection holds.
         const merchant = this.onStatus(e, "Cancelled", "subscriber");
         this.recordChurn(e, "cancelled", merchant);
+        this.recordTimeline(e);
         this.events.emit("applied", e);
         return "applied";
       }
@@ -552,16 +555,19 @@ export class Indexer {
         // row is the fallback when the projection has not seen it yet.
         const merchant = this.onStatus(e, "Cancelled", "merchant") ?? str(e.topics[1]);
         this.recordChurn(e, "ended", merchant);
+        this.recordTimeline(e);
         this.events.emit("applied", e);
         return "applied";
       }
       case "mandate_completed": {
         const merchant = this.onStatus(e, "Completed");
         this.recordChurn(e, "completed", merchant);
+        this.recordTimeline(e);
         return "applied";
       }
       case "pause_changed":
         this.onPauseChanged(e);
+        this.recordTimeline(e);
         return "applied";
       case "fee_changed":
         this.onFeeChanged(e);
@@ -575,6 +581,26 @@ export class Indexer {
         logger.debug({ name: e.name }, "unhandled event");
         return "unknown";
     }
+  }
+
+  /**
+   * Append each on-chain lifecycle event without altering the existing churn
+   * aggregation table. A tx can emit different kinds for the same mandate;
+   * (mandate_id, tx_hash, kind) makes crash replays idempotent.
+   */
+  private recordTimeline(e: DecodedEvent): void {
+    const mandateId = num(e.topics[0]);
+    const details: Record<string, string | boolean> = {};
+    if (e.name === "pause_changed") {
+      details.paused = e.data.paused === true;
+    } else if (e.name === "charged") {
+      details.amount = big(e.data.amount);
+      details.fee = big(e.data.fee);
+      details.chargesMade = String(e.data.charges_made);
+    }
+    this.db.prepare(
+      "INSERT OR IGNORE INTO mandate_timeline (mandate_id, tx_hash, kind, ledger, at, details) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(mandateId, e.txHash, e.name, e.ledger, e.closeTime ?? null, JSON.stringify(details));
   }
 
   private onPlanCreated(e: DecodedEvent): void {
