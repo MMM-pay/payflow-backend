@@ -441,7 +441,7 @@ export class Keeper {
           const size = this.batchEnabled() ? this.batchSize() : 1;
           const group = chargeable.slice(slot, slot + size);
           cursor += group.length;
-          const results = await this.settleGroup(group, fee, channel);
+          const results = await this.settleGroup(group, fee ?? BigInt(BASE_FEE), channel);
           results.forEach((result, offset) => {
             this.record(result, now);
             ordered.push({ slot: slot + offset, result });
