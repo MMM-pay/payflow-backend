@@ -15,7 +15,9 @@ test("mandate timeline covers all six event types and is unchanged by replay", a
   const indexer = new Indexer(db, {} as never, {} as never);
   const make = (name: string, txHash: string, data: Record<string, unknown> = {}): DecodedEvent => ({
     name, contractId: "C", ledger: 100, txHash, closeTime: 1700000000,
-    topics: [1n, SUBSCRIBER, MERCHANT], data,
+    topics: name === "mandate_ended" ? [1n, MERCHANT] :
+      name === "subscribed" || name === "charged" ? [1n, SUBSCRIBER, MERCHANT] :
+      [1n, SUBSCRIBER], data,
   });
   const events = [
     make("subscribed", "tx-1", {
