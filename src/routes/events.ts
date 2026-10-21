@@ -51,12 +51,12 @@ export function rawEventsRouter(db: DatabaseSync): Router {
       (name !== undefined && (typeof name !== "string" || name.length > MAX_FILTER_LENGTH)) ||
       (after !== undefined && (typeof after !== "string" || after.length > 1024))
     ) {
-      sendApiError(res, req, 400, "invalid_query");
+      sendApiError(res, req, 400, "invalid_request");
       return;
     }
     const start = after === undefined ? [0, ""] as [number, string] : parseAfter(after as string);
     if (!start) {
-      sendApiError(res, req, 400, "invalid_query");
+      sendApiError(res, req, 400, "invalid_request");
       return;
     }
 
