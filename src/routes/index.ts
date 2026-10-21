@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { TokenMetadataService } from "../lib/tokens.ts";
 import type { WebhookDispatcher } from "../lib/webhooks.ts";
 import { mandatesRouter } from "./mandates.ts";
+import { rawEventsRouter } from "./events.ts";
 import {
   defaultMerchantSummaryCache,
   merchantsRouter,
@@ -98,6 +99,7 @@ export function buildRoutes(
     res.setHeader("Cache-Control", "public, max-age=5");
     next();
   });
+  r.use(rawEventsRouter(db));
   r.use(plansRouter(db, tokens));
   r.use(protocolRouter(db));
   r.use(mandatesRouter(db, tokens));
