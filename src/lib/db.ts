@@ -20,6 +20,21 @@ import { DatabaseSync } from "node:sqlite";
  * event — or the same departure — twice.
  */
 const SCHEMA = `
+
+-- Keep the original XDR payload even when the current decoder does not
+-- understand it. The RPC event ID is stable across overlapping windows.
+CREATE TABLE IF NOT EXISTS events (
+  event_id    TEXT PRIMARY KEY,
+  contract_id TEXT NOT NULL,
+  ledger      INTEGER NOT NULL,
+  tx_hash     TEXT NOT NULL,
+  event_index TEXT NOT NULL,
+  topics      TEXT NOT NULL,
+  data        TEXT NOT NULL,
+  close_time  INTEGER
+);
+CREATE INDEX IF NOT EXISTS events_ledger ON events(ledger, event_id);
+
 CREATE TABLE IF NOT EXISTS cursor (
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   last_ledger  INTEGER NOT NULL
@@ -226,4 +241,34 @@ export function writeCursor(db: DatabaseSync, ledger: number): void {
     `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
      ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
   ).run(ledger);
+}
+
+/** Store the XDR representation without converting monetary values to JS numbers. */
+export interface StoredContractEvent {
+  eventId: string;
+  contractId: string;
+  ledger: number;
+  txHash: string;
+  eventIndex: string;
+  topics: string;
+  data: string;
+  closeTime: number | null;
+}
+
+export function saveContractEvent(db: DatabaseSync, event: StoredContractEvent): void {
+  db.prepare(`INSERT OR IGNORE INTO events
+    (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    event.eventId, event.contractId, event.ledger, event.txHash,
+    event.eventIndex, event.topics, event.data, event.closeTime,
+  );
+}
+
+export function clearProjections(db: DatabaseSync): void {
+  // Do not remove cursor, raw events, or operational webhook configuration.
+  for (const table of [
+    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events",
+  ]) {
+    db.exec(`DELETE FROM ${table}`);
+  }
 }
