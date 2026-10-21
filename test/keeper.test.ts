@@ -257,7 +257,6 @@ async function captureWarnLog(fn: () => Promise<void>): Promise<string[]> {
   }
   return messages;
 }
-
 describe("keeper channel accounts", () => {
   /**
    * A fake node that models account sequence numbers the way the real one
@@ -319,6 +318,54 @@ function channelState(): {
 }
 
 describe("keeper channel accounts", () => {
+  test("uses one charge_many transaction for multiple due mandates when batching is enabled", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      fakeRpc(new Set([keyA.publicKey()]), submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
+    );
+
+    const results = await keeper.tick(10_000);
+    assert.equal(results.length, 2);
+    assert.ok(results.every((result) => result.status === "settled"));
+    assert.equal(submitted.length, 1, "two mandates should share one transaction");
+    db.close();
+  });
+
+  test("falls back to single charges when charge_many is unsupported", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    const submitted: string[] = [];
+    let prepareCalls = 0;
+    const base = fakeRpc(new Set([keyA.publicKey()]), submitted);
+    const server = {
+      ...base,
+      prepareTransaction: async (tx: Transaction) => {
+        prepareCalls += 1;
+        if (prepareCalls === 1) {
+          throw new Error("trying to invoke non-existent contract function charge_many");
+        }
+        return tx;
+      },
+    } as KeeperRpc;
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
+    );
+
+    const results = await keeper.tick(10_000);
+    assert.equal(results.length, 2);
+    assert.ok(results.every((result) => result.status === "settled"));
+    assert.equal(submitted.length, 2, "unsupported batch must fall back to two charge transactions");
+    db.close();
+  });
+
   test("three channels settle in parallel with no sequence-number collisions", async () => {
     const db = openDatabase(":memory:");
     for (let id = 1; id <= 6; id += 1) insertDue(db, id, 1_000 + id);
