@@ -887,6 +887,45 @@ export class Keeper {
     return { mandateId, status: "failed", txHash: sent.hash, error: confirmed.status };
   }
 
+  /** Settle a group, falling back to individual charges if batching is unavailable. */
+  private async settleGroup(
+    mandates: DueMandate[],
+    inclusionFee: bigint,
+    channel: Channel,
+  ): Promise<SettleResult[]> {
+    if (mandates.length < 2 || !this.batchEnabled() || this.config.KEEPER_DRY_RUN) {
+      return Promise.all(mandates.map((mandate) => this.settle(mandate.id, inclusionFee, channel)));
+    }
+    const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
+    let fee = inclusionFee < maxFee ? inclusionFee : maxFee;
+    let congestionRetries = 0;
+    for (;;) {
+      try {
+        const attempt = await this.submitBatch(mandates.map((mandate) => mandate.id), fee, channel);
+        if (attempt.kind === "results") return attempt.results;
+        if (attempt.kind === "congestion") {
+          const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
+          if (congestionRetries === 0 && retryFee > fee) {
+            congestionRetries += 1;
+            fee = retryFee;
+            logger.warn({ mandates: mandates.length, fee: fee.toString() }, "retrying charge_many with a higher fee");
+            continue;
+          }
+        }
+      } catch (err) {
+        const error = this.scrubError(err instanceof Error ? err.message : String(err));
+        if (isMissingBatchEntryError(err)) {
+          this.batchEntryMissing = true;
+          logger.warn({ error }, "charge_many is unsupported; switching to single charges");
+        } else {
+          logger.warn({ mandates: mandates.length, error }, "charge_many unavailable; falling back to single charges");
+        }
+      }
+      logger.warn({ mandates: mandates.length }, "falling back to single charge transactions");
+      return Promise.all(mandates.map((mandate) => this.settle(mandate.id, inclusionFee, channel)));
+    }
+  }
+
   /**
    * Builds, simulates, signs and submits one `charge_many` with the channel's
    * active key and reports what the transaction decided. Throws on RPC and
