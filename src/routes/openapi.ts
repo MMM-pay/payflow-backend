@@ -379,6 +379,47 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/mandates/{id}/timeline")]: {
+      get: {
+        tags: ["mandates"],
+        summary: "A mandate's complete lifecycle timeline",
+        description: "Subscription, charge, pause/resume, cancellation, ending and completion events in ascending ledger order. Amounts and fees are decimal strings.",
+        operationId: `listMandateTimeline${operationSuffix(root)}`,
+        parameters: [idParameter()],
+        responses: {
+          "200": {
+            description: "The mandate's ordered lifecycle events.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    events: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          mandateId: { type: "integer" },
+                          txHash: { type: "string" },
+                          kind: { type: "string", enum: ["subscribed", "charged", "pause_changed", "cancelled", "mandate_ended", "mandate_completed"] },
+                          ledger: { type: "integer" },
+                          at: { type: ["integer", "null"], description: "Ledger close time in Unix seconds." },
+                          details: { type: "object", additionalProperties: { type: ["string", "boolean"] } },
+                        },
+                        required: ["mandateId", "txHash", "kind", "ledger", "at", "details"],
+                      },
+                    },
+                  },
+                  required: ["events"],
+                },
+              },
+            },
+          },
+          "400": invalidRequest(),
+          "404": notFound("mandate_not_found", "mandate"),
+        },
+      },
+    },
     [p("/mandates/{id}/charges")]: {
       get: {
         tags: ["mandates"],
