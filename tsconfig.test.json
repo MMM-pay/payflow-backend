@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The test files are checked, never built: `npm run build` emits only
+    // `src/`, so the tests must not land in `dist/`.
+    "noEmit": true,
+    // The test files live beside `src/`, not under it, so the root has to
+    // cover the whole repository for the compiler to accept them.
+    "rootDir": ".",
+    // `node:test` and `node:sqlite` are globals the tests import by name,
+    // so no ambient type package is needed for them; `node` provides the
+    // rest (process, Buffer, NodeJS.ProcessEnv).
+    "types": ["node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts"
+  ]
+}

@@ -17,6 +17,7 @@ import { asReader, TokenMetadataService } from "./lib/tokens.ts";
 import { sendApiError } from "./routes/errors.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
+import type { WebhookDispatcher } from "./lib/webhooks.ts";
 import { logger } from "./lib/logger.ts";
 import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
@@ -93,11 +94,13 @@ function lagOf(indexer: IndexerStatus | undefined): number | null {
 
 export interface NetworkRuntime {
   config: NetworkConfig;
-  db: Storage;
+  db: Storage | DatabaseSync;
   events?: EventEmitter | undefined;
   indexer?: IndexerStatus | undefined;
   summaryCache?: MerchantSummaryCache | undefined;
   rpc?: RpcStatus | undefined;
+  /** Delivers charge events to registered webhooks. */
+  webhooks?: WebhookDispatcher | undefined;
   /** Token metadata source; without one the network's native asset still
    * resolves and every other token reports unavailable (never the network). */
   tokens?: TokenMetadataService | undefined;
@@ -361,6 +364,7 @@ export function createApp(
         summaryCache: rt.summaryCache,
         defaultToken: rt.config.defaultToken ?? config.TOKEN_ID,
         tokens: tokenServiceOf(rt),
+        webhooks: rt.webhooks,
       })),
     ),
   );

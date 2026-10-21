@@ -87,6 +87,7 @@ export interface OpenApiDocument {
   };
   servers?: { url: string; description?: string }[];
   tags?: { name: string; description?: string }[];
+  externalDocs?: { url: string; description?: string };
   paths: Record<string, PathItemObject>;
   components?: {
     schemas?: Record<string, SchemaObject>;
@@ -96,6 +97,16 @@ export interface OpenApiDocument {
 
 /** The API version, as `package.json` has it. */
 const API_VERSION = "0.2.0";
+
+/**
+ * The API changelog, which also carries the deprecation policy.
+ *
+ * It is linked from the document's `externalDocs` so a generated client keeps
+ * a pointer to it: a caller can see what changed between the version it was
+ * built against and the one it calls, and how long a deprecated field or
+ * route keeps working.
+ */
+const API_CHANGELOG_URL = "https://github.com/MMM-pay/payflow-backend/blob/main/API_CHANGELOG.md";
 
 /** How the document is mounted and what it may mention. */
 export interface OpenApiOptions {
@@ -157,6 +168,16 @@ const merchantParameter = (): ParameterObject => ({
   required: false,
   description: "Only rows belonging to this merchant.",
   schema: { type: "string", description: ADDRESS_DESCRIPTION },
+});
+
+/** An opaque cursor from a previous page's `nextCursor`; fetch the page after it. */
+const cursorParameter = (): ParameterObject => ({
+  name: "cursor",
+  in: "query",
+  required: false,
+  description:
+    "Opaque cursor returned by a previous page. Page by primary key, not by offset; null on the final page.",
+  schema: { type: "string" },
 });
 
 /** A query parameter holding a subscriber address. */
@@ -222,7 +243,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         description:
           "Plans a merchant has published, newest first. Each amount is a decimal string in the plan's token's smallest unit.",
         operationId: `listPlans${operationSuffix(root)}`,
-        parameters: [merchantParameter(), limitParameter()],
+        parameters: [merchantParameter(), cursorParameter(), limitParameter()],
         responses: {
           "200": {
             description: "The plans.",
@@ -232,8 +253,13 @@ function apiPaths(root: string): Record<string, PathItemObject> {
                   type: "object",
                   properties: {
                     plans: { type: "array", items: { $ref: "#/components/schemas/Plan" } },
+                    nextCursor: {
+                      type: ["string", "null"],
+                      description:
+                        "Opaque cursor to fetch the next page; null when this is the final page.",
+                    },
                   },
-                  required: ["plans"],
+                  required: ["plans", "nextCursor"],
                 },
               },
             },
@@ -306,6 +332,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             description: "Only mandates in this state.",
             schema: { type: "string", enum: ["Active", "Paused", "Cancelled", "Completed"] },
           },
+          cursorParameter(),
           limitParameter(),
         ],
         responses: {
@@ -317,8 +344,13 @@ function apiPaths(root: string): Record<string, PathItemObject> {
                   type: "object",
                   properties: {
                     mandates: { type: "array", items: { $ref: "#/components/schemas/Mandate" } },
+                    nextCursor: {
+                      type: ["string", "null"],
+                      description:
+                        "Opaque cursor to fetch the next page; null when this is the final page.",
+                    },
                   },
-                  required: ["mandates"],
+                  required: ["mandates", "nextCursor"],
                 },
               },
             },
@@ -371,6 +403,35 @@ function apiPaths(root: string): Record<string, PathItemObject> {
           },
           "400": invalidRequest(),
           "404": notFound("mandate_not_found", "mandate"),
+        },
+      },
+    },
+    [p("/webhooks")]: {
+      post: {
+        tags: ["webhooks"],
+        summary: "Register a webhook for charge events",
+        description:
+          "Registers a URL to receive signed POSTs when one of the merchant's mandates charges. The caller proves control of the merchant's Stellar address with an ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`; the returned secret is used to verify the `Payflow-Signature` header on deliveries.",
+        operationId: `registerWebhook${operationSuffix(root)}`,
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/WebhookRegistrationRequest" },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "The webhook registration, including its HMAC signing secret.",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Webhook" },
+              },
+            },
+          },
+          "400": invalidRequest(),
+          "429": errorResponse('The per-IP rate limit was reached (error.code = "rate_limited").'),
         },
       },
     },
@@ -1244,6 +1305,43 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["mandateId", "merchant", "amount", "at"],
     },
+    WebhookRegistrationRequest: {
+      type: "object",
+      properties: {
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        url: { type: "string", format: "uri", description: "The URL charge events are POSTed to." },
+        secret: {
+          type: "string",
+          description:
+            "HMAC key used to sign deliveries. When absent the service generates one and returns it once.",
+        },
+        signature: {
+          type: "string",
+          description:
+            "Base64-encoded ed25519 signature of `payflow-webhook:v1:<merchant>:<url>:<timestamp>`, proving control of the merchant address.",
+        },
+        timestamp: {
+          type: "integer",
+          description:
+            "Unix seconds. Signatures older than ten minutes are refused, so a captured request cannot be replayed indefinitely.",
+        },
+      },
+      required: ["merchant", "url", "signature", "timestamp"],
+    },
+    Webhook: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        url: { type: "string", format: "uri" },
+        secret: {
+          type: "string",
+          description: "HMAC key used to sign delivery requests; treat it as a secret.",
+        },
+        active: { type: "boolean", description: "Whether deliveries are currently enabled." },
+      },
+      required: ["id", "merchant", "url", "secret", "active"],
+    },
     UpcomingCharges: {
       type: "object",
       properties: {
@@ -1479,7 +1577,8 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       description:
         "The API serves a projection of the Payflow contracts' events: plans, mandates, the charges settled against them and the vault balances behind them.\n\n" +
         "Every amount is a decimal string in the token's smallest unit (stroops for XLM), never a JSON number, so no precision is lost. Every non-2xx response uses the same envelope, `{ \"error\": { \"code\", \"message\", \"requestId\" } }`, where `code` is stable per condition.\n\n" +
-        "When the instance serves more than one network, the same paths are also reachable under `/api/<network>/...`.",
+        "When the instance serves more than one network, the same paths are also reachable under `/api/<network>/...`.\n\n" +
+        "What changed in the API between releases, and how long a deprecated field or route keeps working before it is removed, is recorded in [API_CHANGELOG.md](API_CHANGELOG.md).",
       license: { name: "Apache-2.0", identifier: "Apache-2.0" },
     },
     servers: [{ url: "/", description: "This service." }],
@@ -1497,6 +1596,10 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       { name: "service", description: "Health, readiness, metrics and this document." },
       { name: "admin", description: "Operator endpoints; they need a bearer token." },
     ],
+    externalDocs: {
+      url: API_CHANGELOG_URL,
+      description: "The API changelog and the deprecation policy.",
+    },
     paths,
     components: {
       schemas: componentSchemas(),

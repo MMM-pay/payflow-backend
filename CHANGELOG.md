@@ -7,6 +7,43 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **A coverage report with a minimum threshold (#49).** `npm run test:coverage`
+  runs the tests with Node's own coverage and writes an lcov report to
+  `lcov.info`, which CI uploads as an artifact. The `coverage` job
+  fails when the line coverage of `src/` falls below the threshold
+  `--test-coverage-lines` sets: 94%, the measured baseline of 96.63% minus
+  two percentage points. No coverage tool is added as a dependency — the test
+  runner already knows how to measure itself.
+- **An operator CLI (#41).** `npm run cli -- <command>` answers the questions an
+  incident asks — is the projection current, what does mandate 42 look like,
+  what is due, settle this mandate, rebuild the projection — without an ad-hoc
+  script or a hand-written SQL query. `status`, `mandate` and `due` read the
+  projection only and need no network; `charge` and `reindex` use the keeper and
+  the indexer themselves, so the CLI cannot drift from what the service does.
+  Every command has its own `--help`. The two commands that change something
+  refuse to run until `--yes` says so, amounts are printed as the decimal
+  strings the projection stores, and no secret is ever printed. `status --api`
+  adds the running instance's verdict and the live indexer's health — whether
+  it is paused, what it last failed on, how many events it rejected — which the
+  projection file on its own does not hold. `reindex --from` refuses to move
+  the cursor *forwards*, because the ledgers in between would never be applied;
+  `--skip-ahead` is how an operator accepts that gap on purpose.
+- **An API changelog and a deprecation policy (#172).** `API_CHANGELOG.md`
+  records what changed in the HTTP API apart from the service's own changelog,
+  and states how long a deprecated field or route keeps working: one minor
+  release of notice, announced in the response with `Deprecation` and `Sunset`
+  headers and in the OpenAPI document with `deprecated: true`. The document's
+  `externalDocs` links the file, and a test reads it to prove the link and the
+  policy are both there.
+- **Keeper dry-run mode (#38).** `KEEPER_DRY_RUN=true` makes a settlement pass
+  rehearse instead of settle: every due charge is built and simulated against
+  the RPC exactly as a real pass would — account lookup, inclusion fee,
+  vault-balance skips and key rotation included — but the keeper stops after
+  the simulation: nothing is signed, `sendTransaction` is never called, and
+  backoff, pass history and metrics are left untouched. Each mandate answers
+  `simulated`, carrying the simulation's error when the charge would fail, so
+  an operator can exercise a first run on a new deployment before it costs a
+  fee. The new variable is in the README's configuration table.
 - **An OpenAPI description of the API (#7).** `GET /api/openapi.json` serves an
   OpenAPI 3.1 document covering every route and `/health`, with the parameters
   each route takes, the responses it answers and the schema of each body.
@@ -146,9 +183,54 @@ All notable changes to payflow-backend. The format follows
   database, and its routes under `/api/<name>/...`; unprefixed routes keep
   serving the default network unchanged. `/health` reports every network.
 - A route test suite for two configured networks.
+- **Cursor pagination for list endpoints (#3).** `GET /api/plans` and
+  `GET /api/mandates` accept an opaque `?cursor=` and return `nextCursor`,
+  keyed on the primary key (`id DESC`) instead of an offset, so clients can
+  page past the 200-row cap. `nextCursor` is `null` on the final page, the
+  existing `limit` behaviour is unchanged (capped at 200), and an invalid
+  cursor is answered `400 invalid_request`. The typed client gained `cursor`
+  on `PlansQuery` and `MandatesQuery`, and the OpenAPI document gained the
+  parameter and `nextCursor` on both pages.
+- **Full-history archive backfill (#4).** The indexer detects when the stored
+  cursor falls behind the oldest ledger the RPC still serves, logs a
+  structured warning naming the exact missing ledger range, and refuses to
+  advance the cursor past the gap unless `ALLOW_GAPS=true` is set. With
+  `ARCHIVE_URL` configured, an `HttpArchive` backfills the gap with
+  idempotent event application before indexing continues, so a service
+  offline longer than RPC retention does not silently under-report. Both
+  variables are in `.env.example` and the README's configuration table.
+- **Webhook dispatcher for charge events (#5).** Merchants register a URL
+  with `POST /api/webhooks`, proving control of their Stellar address with an
+  ed25519 signature. Each `charged` event dispatches a signed `POST`
+  (`Payflow-Signature: sha256=<hex>` HMAC, `Idempotency-Key` for at-least-once
+  delivery) per registered webhook. Failing deliveries retry with exponential
+  backoff for at most five attempts before the webhook is marked failed. The
+  indexer's `events` feed drives delivery, and a short-cadence retry pass
+  makes progress between indexer passes.
+- **Replay test against recorded testnet events (#6).** `test/fixtures/replay-events.json`
+  records five real `getEvents` responses from the deployed contracts, and
+  `test/replay.test.ts` replays them through `decodeEvent` and the projection,
+  asserts the resulting database state matches a committed snapshot, and proves
+  that replaying the fixture twice leaves the database unchanged.
 
 ### Changed
 
+- **The indexer's idempotency is tested under random orderings (#48).** The
+  projection was checked against a handful of hand-written replays. A seeded
+  generator now builds a random history across several mandates, plans and
+  vault rows, applies it in ledger order, and applies the same history again
+  as a shuffled, repeated replay; the two projections have to be identical.
+  The seed is part of the test, so a failure is reproducible. The two orderings
+  the projection does not survive — an update that arrives before the row it
+  updates, and a pause that arrives after the unpause that followed it — are
+  pinned down by their own tests, so what the property relies on is written
+  down rather than assumed.
+
+- **The test files are type-checked (#50).** `tsconfig.json` only covered
+  `src/`, so a type error in a test was never reported: it surfaced as a
+  confusing runtime failure, or not at all. A `tsconfig.test.json` now covers
+  `test/` as well, the CI typecheck job runs it, and `npm run typecheck` runs
+  both. The types that were wrong are fixed, not worked around.
 - **A mandate that does not exist has no charges (#10).**
   `GET /api/mandates/:id/charges` used to answer `200` with an empty list for
   an unknown id, so "no such mandate" and "no charges yet" looked the same. It

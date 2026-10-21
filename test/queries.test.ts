@@ -218,24 +218,43 @@ describe("direct database queries", () => {
   test("listPlans orders by id DESC, filters by merchant, and respects limit", async () => {
     const all = await listPlans(store, { limit: 50 });
     assert.deepEqual(
-      all.map((p) => p.id),
+      all.rows.map((p) => p.id),
       [3, 2, 1],
     );
+    assert.equal(all.nextCursorId, null);
 
     const limited = await listPlans(store, { limit: 2 });
     assert.deepEqual(
-      limited.map((p) => p.id),
+      limited.rows.map((p) => p.id),
       [3, 2],
     );
+    assert.equal(limited.nextCursorId, 2);
 
     const merchantA = await listPlans(store, { merchant: MERCHANT_A, limit: 50 });
     assert.deepEqual(
-      merchantA.map((p) => p.id),
+      merchantA.rows.map((p) => p.id),
       [2, 1],
     );
+    assert.equal(merchantA.nextCursorId, null);
 
     const unknown = await listPlans(store, { merchant: "GNOBODY", limit: 50 });
-    assert.deepEqual(unknown, []);
+    assert.deepEqual(unknown.rows, []);
+    assert.equal(unknown.nextCursorId, null);
+  });
+
+  test("listPlans pages by primary-key cursor instead of offset", async () => {
+    const first = await listPlans(store, { limit: 2 });
+    assert.deepEqual(first.rows.map((p) => p.id), [3, 2]);
+    assert.equal(first.nextCursorId, 2);
+
+    const second = await listPlans(store, { cursor: first.nextCursorId, limit: 2 });
+    assert.deepEqual(second.rows.map((p) => p.id), [1]);
+    assert.equal(second.nextCursorId, null);
+
+    // A cursor before the first row is an empty final page.
+    const none = await listPlans(store, { cursor: 1, limit: 50 });
+    assert.deepEqual(none.rows, []);
+    assert.equal(none.nextCursorId, null);
   });
 
   test("getPlanById returns a plan row or undefined when absent", async () => {
@@ -251,21 +270,24 @@ describe("direct database queries", () => {
   test("listMandates filters by ids, subscriber, merchant, status, and limit", async () => {
     const all = await listMandates(store, { limit: 50 });
     assert.deepEqual(
-      all.map((m) => m.id),
+      all.rows.map((m) => m.id),
       [4, 3, 2, 1],
     );
+    assert.equal(all.nextCursorId, null);
 
     const byIds = await listMandates(store, { ids: [1, 3, 999], limit: 50 });
     assert.deepEqual(
-      byIds.map((m) => m.id),
+      byIds.rows.map((m) => m.id),
       [3, 1],
     );
 
-    assert.deepEqual(await listMandates(store, { ids: [], limit: 50 }), []);
+    const none = await listMandates(store, { ids: [], limit: 50 });
+    assert.deepEqual(none.rows, []);
+    assert.equal(none.nextCursorId, null);
 
     const bySub = await listMandates(store, { subscriber: SUB_A, limit: 50 });
     assert.deepEqual(
-      bySub.map((m) => m.id),
+      bySub.rows.map((m) => m.id),
       [2, 1],
     );
 
@@ -275,9 +297,23 @@ describe("direct database queries", () => {
       limit: 50,
     });
     assert.deepEqual(
-      byMerchantAndStatus.map((m) => m.id),
+      byMerchantAndStatus.rows.map((m) => m.id),
       [3],
     );
+  });
+
+  test("listMandates pages by primary-key cursor", async () => {
+    const first = await listMandates(store, { limit: 2 });
+    assert.deepEqual(first.rows.map((m) => m.id), [4, 3]);
+    assert.equal(first.nextCursorId, 3);
+
+    const second = await listMandates(store, { cursor: first.nextCursorId, limit: 2 });
+    assert.deepEqual(second.rows.map((m) => m.id), [2, 1]);
+    assert.equal(second.nextCursorId, null);
+
+    // Cursor plus id batch: only ids in the batch below the cursor.
+    const batched = await listMandates(store, { ids: [1, 2], cursor: 2, limit: 50 });
+    assert.deepEqual(batched.rows.map((m) => m.id), [1]);
   });
 
   test("getMandateById returns a mandate row or undefined when absent", async () => {

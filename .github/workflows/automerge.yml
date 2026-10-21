@@ -1,6 +1,6 @@
 name: Auto-merge
 
-# Merges a pull request once all of its CI checks pass. The rules live in the
+# Merges a pull request once the malware scan and all of its CI checks pass. The rules live in the
 # shared workflow MMM-pay/.github/.github/workflows/automerge.yml.
 #
 # To keep a pull request from being merged automatically, mark it as a draft
@@ -8,7 +8,7 @@ name: Auto-merge
 
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, Security]
     types: [completed]
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
@@ -53,8 +53,10 @@ jobs:
     # moves a tagged action to the newest release, and it follows the latest
     # commit of the shared repository's default branch, which publishes no
     # releases of its own.
-    uses: MMM-pay/.github/.github/workflows/automerge.yml@587622ca84b602f128cc3961da02560e950fe1c9 # main
+    uses: MMM-pay/.github/.github/workflows/automerge.yml@3c9de7c464f7d199f4c2dc6d3738a38934df7bec # main
     with:
       post_merge_workflows: "ci.yml"
       request_pages_build: false
       dry_run: ${{ inputs.dry_run == true }}
+      # Same commit as security.yml pins: older scan results are redone.
+      scanner_ref: 3c9de7c464f7d199f4c2dc6d3738a38934df7bec

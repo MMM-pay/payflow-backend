@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
 import type { Express } from "express";
@@ -351,5 +352,40 @@ describe("the OpenAPI document of a single-network instance", () => {
     } finally {
       local.close();
     }
+  });
+});
+
+/**
+ * The API changelog and the deprecation policy it carries.
+ *
+ * An integrator who reads only the OpenAPI document has to be able to find
+ * what changed between releases and how long a deprecated field stays. The
+ * link travels in the document's `externalDocs`, so a generated client carries
+ * it too. The file behind the link is read here rather than trusted: a link to
+ * a missing file is worse than no link, and a policy nobody can find is not a
+ * policy.
+ */
+describe("the API changelog", () => {
+  const CHANGELOG_URL = "https://github.com/MMM-pay/payflow-backend/blob/main/API_CHANGELOG.md";
+
+  /** A file from the repository root, read from disk instead of over HTTP. */
+  const repoFile = (name: string): string => readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
+
+  test("is linked from the OpenAPI description", async () => {
+    const spec = await getSpec();
+    assert.equal(spec.externalDocs?.url, CHANGELOG_URL);
+    assert.match(spec.info.description ?? "", /API_CHANGELOG\.md/);
+  });
+
+  test("records how long a deprecated field or route remains", () => {
+    const changelog = repoFile("API_CHANGELOG.md");
+    assert.match(changelog, /^# API changelog/m);
+    assert.match(changelog, /^## Deprecation policy$/m);
+    assert.match(changelog, /Deprecation/);
+    assert.match(changelog, /Sunset/);
+  });
+
+  test("is linked from the README", () => {
+    assert.match(repoFile("README.md"), /\[API_CHANGELOG\.md\]\(API_CHANGELOG\.md\)/);
   });
 });

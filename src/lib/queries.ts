@@ -26,17 +26,22 @@ import type {
   VaultEventPage,
 } from "../routes/types.ts";
 
-export interface ListPlansFilter {
-  merchant?: string | undefined;
+/** A primary-key cursor names the last row of the previous page. */
+export interface ListCursorFilter {
+  /** The primary key to page after: rows with `id < cursor` are returned. */
+  cursor?: number | undefined;
   limit: number;
 }
 
-export interface ListMandatesFilter {
+export interface ListPlansFilter extends ListCursorFilter {
+  merchant?: string | undefined;
+}
+
+export interface ListMandatesFilter extends ListCursorFilter {
   ids?: number[] | undefined;
   subscriber?: string | undefined;
   merchant?: string | undefined;
   status?: string | undefined;
-  limit: number;
 }
 
 export interface ForecastMandateRow {
@@ -58,12 +63,52 @@ export interface UpcomingMandateRow {
   max_charges: number;
 }
 
-/** List plans ordered newest-first, optionally filtered by merchant. */
-export async function listPlans(db: Storage, filter: ListPlansFilter): Promise<PlanRow[]> {
-  const rows = filter.merchant
-    ? await db.all("SELECT * FROM plans WHERE merchant = ? ORDER BY id DESC LIMIT ?", [filter.merchant, filter.limit])
-    : await db.all("SELECT * FROM plans ORDER BY id DESC LIMIT ?", [filter.limit]);
-  return rows as PlanRow[];
+/**
+ * List plans ordered newest-first, optionally filtered by merchant, paginated
+ * by a primary-key cursor. Fetch one extra row so the caller can tell whether
+ * a further page exists.
+ */
+export async function listPlans(
+  db: Storage,
+  filter: ListPlansFilter,
+): Promise<{ rows: PlanRow[]; nextCursorId: number | null }> {
+  return cursorPage<PlanRow>(
+    db,
+    "FROM plans",
+    filter.merchant ? "WHERE merchant = ?" : "",
+    filter.merchant ? [filter.merchant] : [],
+    filter,
+  );
+}
+
+/**
+ * Page by primary key: fetch `limit + 1` rows ordered by `id DESC`, starting
+ * strictly below `cursor` when one is given. The extra row tells whether a
+ * further page exists; the cursor names a primary key, never an offset, so
+ * inserts or deletes between pages cannot skip or repeat rows.
+ */
+export async function cursorPage<T extends { id: number }>(
+  db: Storage,
+  fromSql: string,
+  whereSql: string,
+  args: unknown[],
+  filter: ListCursorFilter,
+): Promise<{ rows: T[]; nextCursorId: number | null }> {
+  let where = whereSql;
+  if (filter.cursor !== undefined) {
+    where += where.length ? ` AND id < ?` : ` WHERE id < ?`;
+    args.push(filter.cursor);
+  }
+  args.push(filter.limit + 1);
+  const separator = where.length ? " " : "";
+  // `fromSql` ("FROM plans" / "FROM mandates") and `whereSql` ("WHERE ..." or
+  // "") are built from fixed fragments; every value is a bound parameter, so
+  // this interpolation is structural, not user data.
+  const rows = await db.all<T>(`SELECT * ${fromSql}${separator}${where} ORDER BY id DESC LIMIT ?`, args);
+  if (rows.length > filter.limit) {
+    return { rows: rows.slice(0, filter.limit) as T[], nextCursorId: rows[filter.limit - 1]!.id };
+  }
+  return { rows, nextCursorId: null };
 }
 
 /** Look up a single plan by on-chain id. */
@@ -146,15 +191,21 @@ export async function planTokensByIds(db: Storage, planIds: number[]): Promise<M
   return new Map(rows.map((row) => [row.id, row.token]));
 }
 
-/** List mandates ordered newest-first with optional id batch, subscriber, merchant, and status filters. */
+/**
+ * List mandates ordered newest-first with optional id batch, subscriber,
+ * merchant, and status filters, paginated by a primary-key cursor. Fetch one
+ * extra row so the caller can tell whether a further page exists.
+ */
 export async function listMandates(
   db: Storage,
   filter: ListMandatesFilter,
-): Promise<MandateRow[]> {
+): Promise<{ rows: MandateRow[]; nextCursorId: number | null }> {
+  if (filter.ids !== undefined && filter.ids.length === 0) {
+    return { rows: [], nextCursorId: null };
+  }
   const where: string[] = [];
   const args: unknown[] = [];
   if (filter.ids !== undefined) {
-    if (filter.ids.length === 0) return [];
     where.push(`id IN (${filter.ids.map(() => "?").join(",")})`);
     args.push(...filter.ids);
   }
@@ -171,12 +222,7 @@ export async function listMandates(
     args.push(filter.status);
   }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  args.push(filter.limit);
-  const rows = await db.all<MandateRow>(
-    `SELECT * FROM mandates ${clause} ORDER BY id DESC LIMIT ?`,
-    args,
-  );
-  return rows;
+  return cursorPage<MandateRow>(db, "FROM mandates", clause, args, filter);
 }
 
 /** Look up a single mandate by on-chain id. */
@@ -265,6 +311,72 @@ export async function listDueMandates(
         ORDER BY next_charge ASC LIMIT ?`,
     [now, limit],
   );
+}
+
+/**
+ * How many active mandates are eligible for settlement right now.
+ *
+ * The same predicate `listDueMandates` uses, counted instead of listed: an
+ * operator wants the number ("are any mandates waiting?") without pulling
+ * every row of the due list into memory.
+ */
+export async function countDueMandates(db: Storage, now: number): Promise<number> {
+  const row = await db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n
+       FROM mandates
+      WHERE status = 'Active' AND next_charge <= ?
+        AND (max_charges = 0 OR charges_made < max_charges)`,
+    [now],
+  );
+  if (!row) throw new Error("count due mandates query returned no result");
+  return row.n;
+}
+
+/**
+ * The last known vault balance of every listed address, per token.
+ *
+ * `vault_events` records the balance after each deposit, withdrawal and
+ * debit, so the newest event per (address, token) carries the balance the
+ * vault held at that point. An address with no events holds nothing: the
+ * vault starts empty, so its balance is zero.
+ *
+ * The balances stay the strings they are stored as — an amount is never read
+ * as a number, so no precision is lost on the way out.
+ */
+export async function listLatestVaultBalances(
+  db: Storage,
+  addresses: string[],
+): Promise<Map<string, Map<string, string>>> {
+  const unique = [...new Set(addresses)];
+  const balances = new Map<string, Map<string, string>>();
+  if (unique.length === 0) return balances;
+  const placeholders = unique.map(() => "?").join(",");
+  const rows = await db.all<{
+    user: string;
+    token: string;
+    balance: string;
+  }>(
+    // The placeholders are one "?" per de-duped address; the addresses
+    // themselves are bound parameters, so no request data reaches the SQL
+    // text.
+    `SELECT e."user" AS user, e.token AS token, e.balance AS balance
+       FROM vault_events e
+      WHERE e."user" IN (${placeholders})
+        AND NOT EXISTS (
+          SELECT 1 FROM vault_events newer
+           WHERE newer."user" = e."user"
+             AND newer.token = e.token
+             AND (newer.ledger > e.ledger OR
+                  (newer.ledger = e.ledger AND newer.tx_hash > e.tx_hash))
+        )`,
+    unique,
+  );
+  for (const row of rows) {
+    const perToken = balances.get(row.user) ?? new Map<string, string>();
+    perToken.set(row.token, row.balance);
+    balances.set(row.user, perToken);
+  }
+  return balances;
 }
 
 /** Revenue per token: sums from charges and active mandates, joined via plans. */

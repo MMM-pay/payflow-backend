@@ -16,7 +16,8 @@
 > **Live demo:** https://mmm-pay.github.io/payflow-frontend/ Â·
 > **Docs:** https://mmm-pay.github.io/payflow-docs/ ·
 > **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
-> **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md)
+> **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md) ·
+> **API changelog:** [API_CHANGELOG.md](API_CHANGELOG.md)
 
 ---
 
@@ -59,6 +60,7 @@ replays that range on restart. Every write is designed for that:
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
 npm test                  # Tests run without external network access
+npm run test:coverage     # the same tests, with a coverage report and a threshold
 npm run dev
 ```
 
@@ -73,6 +75,61 @@ Run one settlement pass and exit (needs `KEEPER_SECRET`):
 ```bash
 npm run keeper
 ```
+
+Answer the questions an incident asks, without writing SQL (see
+[the operator CLI](#the-operator-cli)):
+
+```bash
+npm run cli -- status
+npm run cli -- mandate 42
+npm run cli -- due
+```
+
+### The operator CLI
+
+`npm run cli -- <command>` is the same projection the API serves, read and
+written through the same code, so it cannot drift from what the service does.
+
+| Command | What it does |
+|---|---|
+| `status` | The indexer's and the API's health for a network: cursor, lag, counts, due mandates, keeper channels |
+| `mandate <id>` | One mandate, its plan, its token and the charges it has settled |
+| `due` | The mandates that are due for charging, each with the `funded` flag the last indexed vault balance gives |
+| `charge <id>` | Trigger a charge for one mandate, through the keeper |
+| `reindex` | Rebuild the projection from a ledger |
+
+Every command has its own help:
+
+```bash
+npm run cli -- --help
+npm run cli -- charge --help
+```
+
+Two rules shape it:
+
+- **Nothing destructive happens by accident.** `charge` moves a subscriber's
+  money and `reindex` rewrites the projection, so both refuse to run until
+  `--yes` says so. `reindex --from` also refuses to move the cursor *forward*,
+  because the ledgers in between would never be applied; `--skip-ahead` is
+  how an operator accepts that gap on purpose.
+- **Amounts stay strings.** An amount is printed as the decimal string the
+  projection stores and compared as a bigint; it never becomes a JavaScript
+  number, so a stroop-scale amount keeps every digit. Secrets are never
+  printed: the keeper's public keys are shown, its secret seeds are not.
+
+`status`, `mandate` and `due` read the projection only and need no network;
+`--offline` keeps `status` from asking the RPC for the latest ledger at all.
+`charge` and `reindex` need the network, and `charge` needs `KEEPER_SECRET`.
+
+Point `status` at a running API to see what the service thinks of itself:
+
+```bash
+npm run cli -- status --api http://127.0.0.1:3000
+```
+
+That adds the API's verdict and the *live* indexer's health — whether it is
+paused, how far it trails, what it last failed on and how many events it
+rejected — which the projection file on its own does not hold.
 
 ### Running it in Docker
 
@@ -114,6 +171,14 @@ in the builder, production dependencies only in the final image.
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
   queue would block every other mandate.
+- **Dry run before the first real pass.** `KEEPER_DRY_RUN=true` makes a pass
+  rehearse settlement: every due charge is built and simulated exactly as a
+  real pass would — account lookup, inclusion fee, vault-balance skips and
+  key rotation included — but nothing is signed or submitted, and no
+  backoff, pass history or metrics change. Each mandate is logged as
+  `simulated`, carrying the simulation's error when the charge would fail, so
+  a new deployment can be exercised before it costs a fee. Set it back to
+  `false` (or edit the env and send `SIGHUP`) to settle for real.
 - **A mandate the vault cannot cover is skipped, not charged.** Before it
   settles anything, the keeper reads `vault.balance(subscriber, token)` from
   the contract — a read-only simulation, no transaction and no fee. One read
@@ -220,6 +285,7 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/mandates/:id` | One mandate |
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
+| `POST` | `/api/webhooks` | Register a URL to receive signed `charged` events; proves control of the merchant address with a signature |
 | `GET` | `/api/vault/:address` | Latest balance per token |
 | `GET` | `/api/vault/:address/events?limit=` | Vault deposit, withdrawal and debit history, newest first |
 | `GET` | `/api/protocol` | Current protocol fee (`fee_bps`) and fee-change history |
@@ -264,6 +330,12 @@ curl -s localhost:8080/api/openapi.json | jq '.paths | keys'
 
 A test compares the document with the routes Express registers, so a route
 that is added without being documented fails the build.
+
+The document's `externalDocs` points at
+[API_CHANGELOG.md](API_CHANGELOG.md), which records what changed in the API
+between releases and how long a deprecated field or route keeps working before
+it is removed — one minor release of notice, announced in the response with
+`Deprecation` and `Sunset` headers.
 
 ### Metrics
 
@@ -434,6 +506,32 @@ a stable `code` and show the human-readable `message` without parsing prose:
 > `GET /api/mandates/:id` does. Before, it answered `200` with an empty
 > list, so "no such mandate" and "no charges yet" looked the same.
 
+### Webhooks
+
+Merchants can register a URL to receive signed `POST`s whenever one of their
+mandates charges, instead of polling. `POST /api/webhooks` registers a URL,
+and the caller proves control of the merchant's Stellar address with an
+ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`
+(signatures older than ten minutes are refused). The response carries the
+HMAC-SHA256 secret used to sign deliveries; treat it as a secret and never
+log it.
+
+Every delivery is a `POST` to the registered URL carrying:
+
+- `Idempotency-Key`: a UUID reused across retries, so receivers can collapse
+  duplicate attempts (delivery is at-least-once).
+- `Payflow-Signature: sha256=<hex>`: an HMAC-SHA256 over the request body
+  using the webhook's secret, so the merchant can verify the request came
+  from this service.
+- The charge event as a JSON body (`event`, `mandate_id`, `subscriber`,
+  `merchant`, `amount`, `fee`, `ledger`).
+
+Failing deliveries retry with exponential backoff (1 minute, doubling, up to
+six hours) for at most five attempts. A webhook that gives up is marked
+failed and stops receiving deliveries until re-registered. Undelivered
+deliveries are retried on a short cadence, so a silent indexer still makes
+delivery progress.
+
 | `error.code` | HTTP | Where |
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
@@ -595,6 +693,7 @@ examined without API downtime.
 | `TOKEN_ID` | — | Default token for the flat merchant-summary amounts. Unset, they span every token |
 | `NETWORKS` | *(empty)* | Extra networks to serve, comma-separated (see below) |
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
+| `KEEPER_DRY_RUN` | `false` | Rehearse each pass: simulate every due charge and log the outcome without signing or submitting anything |
 | `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
 | `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
@@ -606,6 +705,8 @@ examined without API downtime.
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
+| `ARCHIVE_URL` | *(empty)* | Full-history archive URL used to backfill the gap between the stored cursor and the oldest ledger the RPC still serves |
+| `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
 | `DATABASE_URL` | — | `postgres://` or `postgresql://` connection string; when set, PostgreSQL is used instead of SQLite |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
@@ -734,7 +835,8 @@ Docker](#running-it-in-docker)).
 See [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `lint`, `typecheck`, `test`,
 `build`, a container build and a production `audit`; all six must pass, and
 Dependabot keeps dependencies current. Changes are recorded in
-[CHANGELOG.md](CHANGELOG.md).
+[CHANGELOG.md](CHANGELOG.md), and changes to the API surface in
+[API_CHANGELOG.md](API_CHANGELOG.md).
 
 ## Security
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import type { AddressInfo, Server } from "node:http";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { createApp } from "../src/app.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
@@ -9,6 +10,7 @@ import { getMerchantSummary, getPlanById, getProtocolStats, listMandateCharges }
 import { PostgresStorage } from "../src/lib/store/postgres.ts";
 import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 import type { Storage } from "../src/lib/store/types.ts";
+import { WebhookDispatcher } from "../src/lib/webhooks.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 import { asReader, TokenMetadataService } from "../src/lib/tokens.ts";
 import { MerchantSummaryCache } from "../src/routes/index.ts";
@@ -186,5 +188,34 @@ test("SQLite and PostgreSQL return identical projection responses", { skip: !DAT
     assert.deepEqual(await apiResponses(postgres), await apiResponses(sqlite));
   } finally {
     await Promise.all([sqlite.close(), postgres.close()]);
+  }
+});
+
+test("PostgreSQL stores and delivers webhook events", { skip: !DATABASE_URL }, async () => {
+  const storage = await PostgresStorage.open(
+    DATABASE_URL!,
+    `webhook_${process.pid}_${randomBytes(4).toString("hex")}`,
+  );
+  try {
+    const dispatcher = new WebhookDispatcher({
+      db: storage,
+      fetchImpl: async () => new Response("ok", { status: 200 }),
+    });
+    const registration = await dispatcher.register(MERCHANT, "https://payflow.example/hook", "secret");
+    assert.ok(registration.id > 0);
+
+    await dispatcher.onApplied(event("charged", [1n, SUBSCRIBER, MERCHANT], {
+      amount: 100n,
+      fee: 1n,
+      charges_made: 1n,
+      next_charge: 11n,
+    }, "tx-webhook"));
+
+    assert.equal(await dispatcher.pendingCount(registration.id), 0);
+    const deliveries = await dispatcher.deliveries(registration.id);
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0]?.status, "delivered");
+  } finally {
+    await storage.close();
   }
 });

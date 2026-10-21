@@ -36,3 +36,29 @@ export async function tokenFields(
   const meta = await tokens.resolve(tokenId);
   return { tokenSymbol: meta?.symbol ?? null, decimals: meta?.decimals ?? null };
 }
+
+/**
+ * Encode a list cursor: the primary key of the last row on a page, as
+ * base64url JSON (`{ id }`). Opaque to clients — the server pages by primary
+ * key, never by offset — so a row inserted or deleted between pages does not
+ * skip or repeat anything beyond the keyed window itself.
+ */
+export function encodeCursor(id: number): string {
+  return Buffer.from(JSON.stringify({ id }), "utf8").toString("base64url");
+}
+
+/**
+ * Decode a cursor back to the primary key it names. Invalid cursors are the
+ * caller's responsibility to reject with `400 invalid_request`.
+ */
+export function decodeCursor(raw: string): number | null {
+  try {
+    const decoded = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as { id: unknown };
+    if (typeof decoded.id === "number" && Number.isSafeInteger(decoded.id) && decoded.id > 0) {
+      return decoded.id;
+    }
+  } catch {
+    // Not a cursor we issued.
+  }
+  return null;
+}

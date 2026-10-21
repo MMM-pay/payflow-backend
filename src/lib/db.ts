@@ -123,6 +123,37 @@ CREATE TABLE IF NOT EXISTS mandate_events (
   PRIMARY KEY (mandate_id, slot)
 );
 CREATE INDEX IF NOT EXISTS mandate_events_merchant ON mandate_events(merchant, kind, at);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+  id          INTEGER PRIMARY KEY,
+  merchant    TEXT    NOT NULL,
+  url         TEXT    NOT NULL,
+  secret      TEXT    NOT NULL,
+  active      INTEGER NOT NULL DEFAULT 1,
+  failed      INTEGER NOT NULL DEFAULT 0,
+  failures    INTEGER NOT NULL DEFAULT 0,
+  last_attempt INTEGER,
+  last_status INTEGER,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS webhooks_merchant ON webhooks(merchant);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id             INTEGER PRIMARY KEY,
+  webhook_id     INTEGER NOT NULL,
+  event_id       TEXT    NOT NULL,
+  idempotency_key TEXT   NOT NULL,
+  attempt        INTEGER NOT NULL,
+  status         TEXT    NOT NULL,   -- 'pending' | 'delivered' | 'failed'
+  http_status    INTEGER,
+  response_body  TEXT,
+  error          TEXT,
+  payload        TEXT    NOT NULL,
+  retry_at       INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_webhook ON webhook_deliveries(webhook_id);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_due ON webhook_deliveries(status, retry_at);
 `;
 
 /**
