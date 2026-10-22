@@ -76,6 +76,18 @@ release that ships them numbers them here.
   with their projected times.
 - `GET /api/mandates?ids=` — up to 100 mandates in one request.
 - `POST /api/webhooks` — register a URL for signed `charged` events.
+- `POST /api/webhooks/:id/rotate` — replace a webhook's signing secret. During
+  the overlap `Payflow-Signature` lists two signatures,
+  `sha256=<new>, sha256=<old>`; receivers that compare the whole header with
+  one signature must accept any listed one instead.
+- `POST /api/webhooks/:id/test` — deliver a signed `ping` event and report the
+  attempt's status code and latency. Receivers see a new `event` value,
+  `ping`.
+- `GET /api/webhooks/:id/deliveries` — the webhook's last 100 delivery
+  attempts.
+- `GET /api/auth` and `POST /api/auth` — SEP-10 sign-in. Every webhook route
+  also accepts the issued JWT as `Authorization: Bearer <token>`; signed
+  messages keep working unchanged.
 - `/api/<network>/...` — every route again, per configured network.
 - `/api/mandates` and `/api/plans` accept `?cursor=` and return `nextCursor`.
 - `/api/stats` reports charge volume and fees; `/api/due` gained `funded`;

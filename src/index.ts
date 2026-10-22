@@ -4,6 +4,7 @@ import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
 import { WebhookDispatcher } from "./lib/webhooks.ts";
+import { sep10For } from "./routes/auth.ts";
 import { createApp } from "./app.ts";
 import { Indexer } from "./indexer.ts";
 import { Keeper } from "./keeper.ts";
@@ -30,7 +31,11 @@ const runtimes = networks.map((network) => {
   // retention does not silently shrink the projection.
   const archive = network.archiveUrl ? new HttpArchive(network.archiveUrl) : undefined;
   const indexer = new Indexer(db, server, network, undefined, archive);
-  const dispatcher = new WebhookDispatcher({ db, events: indexer.events });
+  const dispatcher = new WebhookDispatcher({
+    db,
+    events: indexer.events,
+    secretOverlapSeconds: config.WEBHOOK_SECRET_OVERLAP_S,
+  });
   dispatcher.bind(indexer.events);
   const runPass = serial(async () => {
     try {
@@ -65,7 +70,9 @@ const runtimes = networks.map((network) => {
     // serves the corrected projection instead of a stale cache entry.
     (merchant) => indexer.merchantCache.invalidate(merchant),
   );
-  return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher };
+  // SEP-10 sign-in reads the signing account's signers through the same RPC.
+  const auth = sep10For(config, network, server);
+  return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth };
 });
 const defaultRuntime = runtimes[0]!;
 // Release the database locks however the process ends; a crash that skips
@@ -140,6 +147,7 @@ const app = createApp(
     rpc: rt.server,
     tokens: rt.tokens,
     webhooks: rt.dispatcher,
+    auth: rt.auth,
   })),
   config,
   adminHooks,

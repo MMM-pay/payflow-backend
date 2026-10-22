@@ -3,7 +3,17 @@ import pino from "pino";
 // Never let a key reach a log aggregator, at the top level or one level down
 // (config objects, error objects with an attached config).
 export const redact = {
-  paths: ["*.KEEPER_SECRET", "KEEPER_SECRET", "*.secret", "secret", "req.headers.authorization"],
+  paths: [
+    "*.KEEPER_SECRET",
+    "KEEPER_SECRET",
+    "*.SEP10_SIGNING_KEY",
+    "SEP10_SIGNING_KEY",
+    "*.SEP10_JWT_SECRET",
+    "SEP10_JWT_SECRET",
+    "*.secret",
+    "secret",
+    "req.headers.authorization",
+  ],
   censor: "[Redacted]",
 };
 

@@ -7,6 +7,16 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **SEP-10 sign-in for merchant-only endpoints (#141).** `GET /api/auth` issues
+  a SEP-10 challenge signed with `SEP10_SIGNING_KEY`, and `POST /api/auth`
+  verifies the signed challenge and returns a short-lived JWT. Webhook routes
+  accept it as a bearer token beside their signed messages.
+- **Webhook delivery history (#140).** Every delivery attempt is logged, the
+  newest 100 per webhook, and served at `GET /api/webhooks/:id/deliveries`.
+- **Webhook secret rotation (#139).** `POST /api/webhooks/:id/rotate` returns a
+  new secret once; both secrets sign for `WEBHOOK_SECRET_OVERLAP_S`.
+- **Webhook test events (#138).** `POST /api/webhooks/:id/test` delivers a
+  signed `ping` through the normal path and reports status code and latency.
 - **A coverage report with a minimum threshold (#49).** `npm run test:coverage`
   runs the tests with Node's own coverage and writes an lcov report to
   `lcov.info`, which CI uploads as an artifact. The `coverage` job

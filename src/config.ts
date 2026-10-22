@@ -21,6 +21,11 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+/** A host name with an optional port (`example.com`, `localhost:8080`). */
+function isDomain(value: string, max: number): boolean {
+  return value.length <= max && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:\d{1,5})?$/i.test(value);
+}
+
 const contractId = z
   .string()
   .refine((value) => StrKey.isValidContract(value), "must be a valid Stellar contract ID");
@@ -195,6 +200,43 @@ const schema = z.object({
 
   ADMIN_TOKEN: z.string().optional(),
 
+  /**
+   * How long a rotated webhook secret keeps signing deliveries beside the new
+   * one, in seconds. During the overlap every delivery carries both
+   * signatures, so a receiver can switch secrets without a gap; 0 drops the
+   * old secret at once (a leak). At most seven days.
+   */
+  WEBHOOK_SECRET_OVERLAP_S: z.coerce.number().int().min(0).max(604_800).default(86_400),
+
+  /**
+   * SEP-10 sign-in (`GET`/`POST /api/auth`). The server account's secret seed
+   * signs challenge transactions; its public key is the `SIGNING_KEY` the
+   * home domain's stellar.toml publishes. Leave empty to disable sign-in.
+   */
+  SEP10_SIGNING_KEY: optionalSecret,
+  /** HMAC-SHA256 key for the issued JWTs; at least 32 characters. */
+  SEP10_JWT_SECRET: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || value.length >= 32, "must be at least 32 characters"),
+  /**
+   * The home domain clients authenticate to: the challenge's first operation
+   * is keyed `<home domain> auth`, which a manage data key caps at 64 bytes.
+   */
+  SEP10_HOME_DOMAIN: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || isDomain(value, 59), "must be a domain of at most 59 characters"),
+  /** The domain serving the auth endpoint; defaults to SEP10_HOME_DOMAIN. */
+  SEP10_WEB_AUTH_DOMAIN: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || isDomain(value, 64), "must be a domain of at most 64 characters"),
+  /** Lifetime of an issued JWT in seconds; short-lived by design. */
+  SEP10_JWT_TTL_S: z.coerce.number().int().min(60).max(86_400).default(3_600),
 });
 
 export type Config = z.infer<typeof schema>;
@@ -229,6 +271,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (parsed.data.KEEPER_ENABLED && !parsed.data.KEEPER_SECRET) {
     throw new Error("KEEPER_ENABLED=true requires KEEPER_SECRET to be set");
+  }
+  if (
+    parsed.data.SEP10_SIGNING_KEY &&
+    (!parsed.data.SEP10_JWT_SECRET || !parsed.data.SEP10_HOME_DOMAIN)
+  ) {
+    throw new Error("SEP10_SIGNING_KEY requires SEP10_JWT_SECRET and SEP10_HOME_DOMAIN to be set");
   }
   return parsed.data;
 }

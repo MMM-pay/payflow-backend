@@ -227,6 +227,59 @@ const invalidRequest = (): ResponseObject =>
     'A query or path parameter is not valid; error.code = "invalid_request" and error.details names the parameter.',
   );
 
+/** How a merchant-only route is authorised, for its description. */
+const MERCHANT_PROOF = (message: string): string =>
+  `The caller proves control of the merchant address with an ed25519 signature over \`${message}\` (\`merchant\`, \`timestamp\`, \`signature\`), or with a SEP-10 JWT from \`/api/auth\` as \`Authorization: Bearer <token>\`, in which case \`merchant\` is the token's account and may be omitted.`;
+
+/** The `{ merchant, timestamp, signature }` proof of a merchant-only POST. */
+const merchantProofBody = (message: string): NonNullable<OperationObject["requestBody"]> => ({
+  required: false,
+  content: {
+    "application/json": {
+      schema: {
+        type: "object",
+        description: `Omitted under a SEP-10 bearer token. The signature is over \`${message}\`.`,
+        properties: {
+          merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+          timestamp: { type: "integer", description: "Unix seconds. Signatures older than ten minutes are refused." },
+          signature: { type: "string", description: `Base64-encoded ed25519 signature of \`${message}\`.` },
+        },
+      },
+    },
+  },
+});
+
+/** The same proof, as query parameters of a merchant-only GET. */
+const merchantProofQuery = (message: string): ParameterObject[] => [
+  { name: "merchant", in: "query", required: false, description: ADDRESS_DESCRIPTION, schema: { type: "string" } },
+  {
+    name: "timestamp",
+    in: "query",
+    required: false,
+    description: "Unix seconds. Signatures older than ten minutes are refused.",
+    schema: { type: "integer", minimum: 0 },
+  },
+  {
+    name: "signature",
+    in: "query",
+    required: false,
+    description: `Base64-encoded ed25519 signature of \`${message}\`. All three are required without a bearer token.`,
+    schema: { type: "string" },
+  },
+];
+
+/** A path parameter holding a webhook id. */
+const webhookIdParameter = (): ParameterObject => ({
+  name: "id",
+  in: "path",
+  required: true,
+  description: "The webhook id returned at registration.",
+  schema: { type: "integer", minimum: 1 },
+});
+
+const unauthorizedProof = (): ResponseObject =>
+  errorResponse('The signature is wrong, malformed or older than ten minutes, or the bearer token is invalid or expired (error.code = "unauthorized").');
+
 /**
  * The paths of the read API, mounted under `root`.
  *
@@ -554,6 +607,125 @@ function apiPaths(root: string): Record<string, PathItemObject> {
           "400": invalidRequest(),
           "401": errorResponse('The signature is wrong, malformed or older than ten minutes (error.code = "unauthorized").'),
           "404": errorResponse('No active webhook with that id belongs to the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/webhooks/{id}/rotate")]: {
+      post: {
+        tags: ["webhooks"],
+        summary: "Rotate a webhook's signing secret",
+        description:
+          "Replaces the webhook's HMAC secret and returns the new one, this once. Until `previousSecretExpiresAt` (WEBHOOK_SECRET_OVERLAP_S after the rotation) every delivery carries two signatures, `Payflow-Signature: sha256=<new>, sha256=<old>`, so the receiver can switch secrets without missing a delivery; afterwards only the new secret signs. " +
+          MERCHANT_PROOF("payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>"),
+        operationId: `rotateWebhookSecret${operationSuffix(root)}`,
+        parameters: [webhookIdParameter()],
+        requestBody: merchantProofBody("payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>"),
+        responses: {
+          "200": {
+            description: "The new secret.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/WebhookRotation" } } },
+          },
+          "400": invalidRequest(),
+          "401": unauthorizedProof(),
+          "404": errorResponse('No active webhook with that id belongs to the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/webhooks/{id}/test")]: {
+      post: {
+        tags: ["webhooks"],
+        summary: "Send a webhook a test event",
+        description:
+          "Delivers `{ \"event\": \"ping\", \"webhook_id\", \"merchant\" }` through the normal delivery path — the same headers and signatures as a charge, and the same backoff retries when it fails — and answers with the first attempt's outcome. " +
+          MERCHANT_PROOF("payflow-webhook-test:v1:<merchant>:<id>:<timestamp>"),
+        operationId: `testWebhook${operationSuffix(root)}`,
+        parameters: [webhookIdParameter()],
+        requestBody: merchantProofBody("payflow-webhook-test:v1:<merchant>:<id>:<timestamp>"),
+        responses: {
+          "200": {
+            description: "How the first attempt went; a failed one is `pending` with its retry time.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/WebhookTestResult" } } },
+          },
+          "400": invalidRequest(),
+          "401": unauthorizedProof(),
+          "404": errorResponse('No webhook with that id is receiving deliveries for the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/webhooks/{id}/deliveries")]: {
+      get: {
+        tags: ["webhooks"],
+        summary: "A webhook's delivery history",
+        description:
+          "The webhook's last 100 delivery attempts, newest first; a delivery that failed and was retried shows every attempt. A deleted webhook keeps its history. " +
+          MERCHANT_PROOF("payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>"),
+        operationId: `listWebhookDeliveries${operationSuffix(root)}`,
+        parameters: [webhookIdParameter(), ...merchantProofQuery("payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>")],
+        responses: {
+          "200": {
+            description: "The attempts.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    webhookId: { type: "integer" },
+                    deliveries: { type: "array", items: { $ref: "#/components/schemas/WebhookDelivery" } },
+                  },
+                  required: ["webhookId", "deliveries"],
+                },
+              },
+            },
+          },
+          "400": invalidRequest(),
+          "401": unauthorizedProof(),
+          "404": errorResponse('No webhook with that id belongs to the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/auth")]: {
+      get: {
+        tags: ["auth"],
+        summary: "SEP-10 challenge",
+        description:
+          "A SEP-10 challenge transaction for `account` to sign: sequence number 0, the server account as source, fifteen-minute time bounds, a `<home domain> auth` manage data operation with the account as source and a random nonce, and a `web_auth_domain` operation, signed by the server. `memo` and muxed accounts are not supported; `client_domain` is ignored. Only served when SEP10_SIGNING_KEY is set; every response carries `Access-Control-Allow-Origin: *`.",
+        operationId: `getAuthChallenge${operationSuffix(root)}`,
+        parameters: [
+          { name: "account", in: "query", required: true, description: "The Stellar account (G...) signing in.", schema: { type: "string" } },
+          { name: "home_domain", in: "query", required: false, description: "Must be the configured home domain when given.", schema: { type: "string" } },
+        ],
+        responses: {
+          "200": {
+            description: "The challenge.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AuthChallenge" } } },
+          },
+          "400": invalidRequest(),
+        },
+      },
+      post: {
+        tags: ["auth"],
+        summary: "Exchange a signed SEP-10 challenge for a JWT",
+        description:
+          "Verifies the client-signed challenge — the server's signature, time bounds, home and web auth domains, and the client signatures: an existing account's signers must meet its medium threshold, an account not on the network must sign with its master key — and returns a short-lived HS256 JWT (`iss`, `sub`, `iat`, `exp`, `jti`). Each challenge yields one token. Accepts JSON or `application/x-www-form-urlencoded`.",
+        operationId: `getAuthToken${operationSuffix(root)}`,
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: { transaction: { type: "string", description: "The signed challenge, base64 XDR." } },
+                required: ["transaction"],
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "The token.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AuthToken" } } },
+          },
+          "400": errorResponse('The challenge is malformed, expired, already used, not this server\'s, or not signed with enough weight (error.code = "invalid_request").'),
         },
       },
     },
@@ -1530,6 +1702,64 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["merchant", "signature", "timestamp"],
     },
+    WebhookRotation: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        secret: { type: "string", description: "The new HMAC key; returned only here, so store it now." },
+        previousSecretExpiresAt: {
+          type: ["integer", "null"],
+          description: "Unix seconds until which the previous secret also signs; null when it was retired at once.",
+        },
+      },
+      required: ["id", "secret", "previousSecretExpiresAt"],
+    },
+    WebhookTestResult: {
+      type: "object",
+      properties: {
+        deliveryId: { type: "integer" },
+        status: { type: "string", enum: ["delivered", "pending", "failed"] },
+        statusCode: { type: ["integer", "null"], description: "The endpoint's HTTP status; null when no response arrived." },
+        latencyMs: { type: "integer" },
+        error: { type: ["string", "null"] },
+        nextRetryAt: { type: ["integer", "null"], description: "Unix seconds of the scheduled retry, when `pending`." },
+      },
+      required: ["deliveryId", "status", "statusCode", "latencyMs", "error", "nextRetryAt"],
+    },
+    WebhookDelivery: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        deliveryId: { type: "integer", description: "Shared by a delivery's retries." },
+        eventId: { type: "string", description: "`charge:<tx hash>` or `ping:<uuid>`." },
+        attempt: { type: "integer" },
+        status: {
+          type: "string",
+          enum: ["delivered", "pending", "failed"],
+          description: "The delivery's state after this attempt; `pending` means a retry is scheduled.",
+        },
+        statusCode: { type: ["integer", "null"] },
+        error: { type: ["string", "null"] },
+        nextRetryAt: { type: ["integer", "null"], description: "Unix seconds." },
+        attemptedAt: { type: "integer", description: "Unix seconds." },
+      },
+      required: ["id", "deliveryId", "eventId", "attempt", "status", "statusCode", "error", "nextRetryAt", "attemptedAt"],
+    },
+    AuthChallenge: {
+      type: "object",
+      properties: {
+        transaction: { type: "string", description: "The challenge transaction envelope, base64 XDR." },
+        network_passphrase: { type: "string" },
+      },
+      required: ["transaction", "network_passphrase"],
+    },
+    AuthToken: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "A JWT to send as `Authorization: Bearer <token>` to merchant-only routes." },
+      },
+      required: ["token"],
+    },
     UpcomingCharges: {
       type: "object",
       properties: {
@@ -1783,6 +2013,7 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       { name: "stats", description: "Protocol-wide totals." },
       { name: "service", description: "Health, readiness, metrics and this document." },
       { name: "admin", description: "Operator endpoints; they need a bearer token." },
+      { name: "auth", description: "SEP-10 sign-in for merchant-only routes." },
     ],
     externalDocs: {
       url: API_CHANGELOG_URL,

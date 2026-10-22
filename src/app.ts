@@ -16,6 +16,7 @@ import { sendApiError } from "./routes/errors.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import type { WebhookDispatcher } from "./lib/webhooks.ts";
+import type { Sep10Auth } from "./routes/auth.ts";
 import { logger } from "./lib/logger.ts";
 import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
@@ -83,6 +84,9 @@ export function errorHandler(
   sendApiError(res, _req, 500, "internal_error");
 }
 
+/** `/api/auth` and `/api/<network>/auth`, with or without a query string. */
+const SEP10_PATH = /^\/api\/(?:[a-z][a-z0-9-]*\/)?auth(?:\?|$)/;
+
 /** Ledgers the indexer may trail the network by before it is considered behind. */
 const MAX_LAG = 120;
 
@@ -131,6 +135,8 @@ export interface NetworkRuntime {
   rpc?: RpcStatus | undefined;
   /** Delivers charge events to registered webhooks. */
   webhooks?: WebhookDispatcher | undefined;
+  /** SEP-10 sign-in (`/api/auth`); absent when it is not configured. */
+  auth?: Sep10Auth | undefined;
   /** Token metadata source; without one the network's native asset still
    * resolves and every other token reports unavailable (never the network). */
   tokens?: TokenMetadataService | undefined;
@@ -276,11 +282,16 @@ export function createApp(
       });
     });
   });
+  const corsOrigin = config.CORS_ORIGIN === "*" ? true : config.CORS_ORIGIN.split(",");
   app.use(
-    cors({
-      origin: config.CORS_ORIGIN === "*" ? true : config.CORS_ORIGIN.split(","),
-      // Browsers hide non-safelisted response headers from scripts unless exposed.
-      exposedHeaders: ["X-Request-Id"],
+    cors((req, callback) => {
+      callback(null, {
+        // SEP-10 requires `Access-Control-Allow-Origin: *` on its endpoints,
+        // errors included, so any wallet can sign in from a browser.
+        origin: SEP10_PATH.test(req.url ?? "") ? "*" : corsOrigin,
+        // Browsers hide non-safelisted response headers from scripts unless exposed.
+        exposedHeaders: ["X-Request-Id"],
+      });
     }),
   );
   app.use(express.json({ limit: "64kb" }));
@@ -403,6 +414,7 @@ export function createApp(
         defaultToken: rt.config.defaultToken ?? config.TOKEN_ID,
         tokens: tokenServiceOf(rt),
         webhooks: rt.webhooks,
+        auth: rt.auth,
       })),
     ),
   );

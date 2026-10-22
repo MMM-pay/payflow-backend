@@ -372,6 +372,10 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
 | `POST` | `/api/webhooks` | Register a URL to receive signed `charged` events; proves control of the merchant address with a signature |
+| `POST` | `/api/webhooks/:id/rotate` | Replace a webhook's signing secret; both secrets sign during the overlap |
+| `POST` | `/api/webhooks/:id/test` | Send a signed `ping` through the normal delivery path; returns status code and latency |
+| `GET` | `/api/webhooks/:id/deliveries` | The webhook's last 100 delivery attempts: event, status code, error, attempt, next retry |
+| `GET` / `POST` | `/api/auth` | SEP-10 challenge, and a JWT for a signed challenge (only when `SEP10_SIGNING_KEY` is set) |
 | `GET` | `/api/vault/:address` | Latest balance per token |
 | `GET` | `/api/vault/:address/events?limit=` | Vault deposit, withdrawal and debit history, newest first |
 | `GET` | `/api/protocol` | Current protocol fee (`fee_bps`) and fee-change history |
@@ -630,6 +634,42 @@ its own message prefix, so a signature for one cannot be replayed as another.
 A wrong, malformed or expired (older than ten minutes) signature is a `401
 unauthorized`.
 
+`POST /api/webhooks/:id/rotate` (signed over
+`payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>`) replaces a webhook's
+secret and returns the new one once. For `WEBHOOK_SECRET_OVERLAP_S` (one day
+by default; `0` retires the old secret at once, for a leak) every delivery
+carries both signatures, `Payflow-Signature: sha256=<new>, sha256=<old>`;
+receivers should accept a request when any listed signature matches a secret
+they hold. After the overlap only the new secret signs.
+
+`POST /api/webhooks/:id/test` (signed over
+`payflow-webhook-test:v1:<merchant>:<id>:<timestamp>`) delivers
+`{ "event": "ping", "webhook_id", "merchant" }` through the normal path — same
+headers, same signatures, same retries — and answers with the attempt's
+`status`, `statusCode`, `latencyMs`, `error` and `nextRetryAt`.
+
+`GET /api/webhooks/:id/deliveries` (signed over
+`payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>`, as query
+parameters) lists the webhook's last 100 delivery attempts, newest first: a
+delivery that failed and was retried shows each attempt, with its status code,
+error and the retry it scheduled. Older attempts are pruned as new ones are
+written.
+
+#### SEP-10 sign-in
+
+Instead of signing a message for every call, a merchant can sign in once with
+[SEP-10](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md):
+`GET /api/auth?account=<G...>` returns a challenge transaction, the wallet
+signs it, and `POST /api/auth` with `{ "transaction": "<signed XDR>" }` (JSON
+or form-encoded) returns `{ "token": "<JWT>" }`. Every webhook route accepts
+that token as `Authorization: Bearer <token>` in place of `merchant`,
+`timestamp` and `signature`. Tokens last `SEP10_JWT_TTL_S` (an hour by
+default), are valid only on the network that issued them, and each challenge
+yields one token. An account that exists must sign with signers meeting its
+medium threshold; one that does not must sign with its master key. Publish
+the server's public key as `SIGNING_KEY` and the endpoint as
+`WEB_AUTH_ENDPOINT` in the home domain's `stellar.toml`.
+
 | `error.code` | HTTP | Where |
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
@@ -642,7 +682,7 @@ unauthorized`.
 | `token_metadata_unavailable` | 502 | `GET /api/tokens/:id` while the token contract cannot be read |
 | `rate_limited` | 429 | API request exceeded the configured per-IP limit; includes `Retry-After` |
 | `stream_limit` | 503 | `GET /api/stream` when the concurrent stream cap is reached |
-| `unauthorized` | 401 | A `/admin/*` request without a valid bearer token, or a webhook list/delete with a wrong or expired signature |
+| `unauthorized` | 401 | A `/admin/*` request without a valid bearer token, or a webhook management request with a wrong or expired signature or an invalid or expired SEP-10 token |
 | `reindex_unavailable` | 503 | `POST /admin/reindex` on a process without an indexer |
 | `indexer_unavailable` | 503 | `/admin/indexer/pause`/`resume` on a process without an indexer |
 | `keeper_unavailable` | 503 | A keeper endpoint while `KEEPER_ENABLED=false` |
@@ -820,6 +860,12 @@ examined without API downtime.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
 | `ADMIN_TOKEN` | — | Bearer token for `/admin`. Unset keeps those routes disabled |
+| `WEBHOOK_SECRET_OVERLAP_S` | `86400` | Seconds a rotated webhook secret keeps signing beside the new one (0–604800) |
+| `SEP10_SIGNING_KEY` | — | Secret seed of the SEP-10 server account. Unset keeps `/api/auth` disabled |
+| `SEP10_JWT_SECRET` | — | HMAC key for SEP-10 JWTs, at least 32 characters; required with `SEP10_SIGNING_KEY` |
+| `SEP10_HOME_DOMAIN` | — | Home domain of the challenge (`<home domain> auth`); required with `SEP10_SIGNING_KEY` |
+| `SEP10_WEB_AUTH_DOMAIN` | `SEP10_HOME_DOMAIN` | Domain serving `/api/auth`, the challenge's `web_auth_domain` |
+| `SEP10_JWT_TTL_S` | `3600` | JWT lifetime in seconds (60–86400) |
 
 Setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports OpenTelemetry spans for every
 RPC call (`rpc.<method>`), indexer and keeper pass, and HTTP request. Every

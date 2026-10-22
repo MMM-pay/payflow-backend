@@ -157,6 +157,10 @@ CREATE TABLE IF NOT EXISTS webhooks (
   merchant    TEXT    NOT NULL,
   url         TEXT    NOT NULL,
   secret      TEXT    NOT NULL,
+  -- The secret a rotation replaced; it signs beside the new one until
+  -- previous_secret_expires_at (unix seconds).
+  previous_secret TEXT,
+  previous_secret_expires_at INTEGER,
   active      INTEGER NOT NULL DEFAULT 1,
   failed      INTEGER NOT NULL DEFAULT 0,
   failures    INTEGER NOT NULL DEFAULT 0,
@@ -183,6 +187,23 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS webhook_deliveries_webhook ON webhook_deliveries(webhook_id);
 CREATE INDEX IF NOT EXISTS webhook_deliveries_due ON webhook_deliveries(status, retry_at);
 
+-- Delivery history: one row per HTTP attempt, so a delivery that failed and
+-- then succeeded shows both. Pruned to the newest 100 rows per webhook on
+-- every insert; the index serves both the prune and the newest-first read.
+CREATE TABLE IF NOT EXISTS webhook_attempts (
+  id            INTEGER PRIMARY KEY,
+  webhook_id    INTEGER NOT NULL,
+  delivery_id   INTEGER NOT NULL,
+  event_id      TEXT    NOT NULL,
+  attempt       INTEGER NOT NULL,
+  status        TEXT    NOT NULL,   -- the delivery's status after the attempt
+  http_status   INTEGER,
+  error         TEXT,
+  next_retry_at INTEGER,
+  attempted_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS webhook_attempts_webhook ON webhook_attempts(webhook_id, id);
+
 -- Contract upgrade history. Records when contracts are upgraded with new code.
 CREATE TABLE IF NOT EXISTS contract_upgrades (
   contract_id TEXT    NOT NULL,
@@ -206,6 +227,8 @@ const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]
   ["plans", "name", "TEXT NOT NULL DEFAULT ''"],
   ["mandates", "fee_bps", "INTEGER NOT NULL DEFAULT 0"],
   ["mandates", "ended_by", "TEXT"],
+  ["webhooks", "previous_secret", "TEXT"],
+  ["webhooks", "previous_secret_expires_at", "INTEGER"],
 ];
 
 /**

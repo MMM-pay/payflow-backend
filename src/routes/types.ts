@@ -392,6 +392,64 @@ export interface WebhookListResponse {
   webhooks: WebhookSummary[];
 }
 
+/** `POST /api/webhooks/:id/rotate`: the new secret, returned this once. */
+export interface WebhookRotation {
+  id: number;
+  /** HMAC-SHA256 key that signs deliveries from now on. */
+  secret: string;
+  /** Unix seconds until which the previous secret also signs; null when it was dropped at once. */
+  previousSecretExpiresAt: number | null;
+}
+
+/** The state of a delivery after an attempt. */
+export type WebhookDeliveryStatus = "delivered" | "pending" | "failed";
+
+/** `POST /api/webhooks/:id/test`: how the ping's first attempt went. */
+export interface WebhookTestResult {
+  deliveryId: number;
+  /** `pending` means the attempt failed and a retry is scheduled at `nextRetryAt`. */
+  status: WebhookDeliveryStatus;
+  /** The endpoint's HTTP status; null when no response arrived. */
+  statusCode: number | null;
+  latencyMs: number;
+  error: string | null;
+  nextRetryAt: number | null;
+}
+
+/** One delivery attempt, as `GET /api/webhooks/:id/deliveries` lists it. */
+export interface WebhookDelivery {
+  id: number;
+  /** The delivery the attempt belongs to; its retries share it. */
+  deliveryId: number;
+  /** `charge:<tx hash>` or `ping:<uuid>`. */
+  eventId: string;
+  attempt: number;
+  status: WebhookDeliveryStatus;
+  statusCode: number | null;
+  error: string | null;
+  /** Unix seconds of the retry this attempt scheduled; null unless `pending`. */
+  nextRetryAt: number | null;
+  /** Unix seconds. */
+  attemptedAt: number;
+}
+
+export interface WebhookDeliveriesResponse {
+  webhookId: number;
+  deliveries: WebhookDelivery[];
+}
+
+/** `GET /api/auth`: a SEP-10 challenge transaction for the client to sign. */
+export interface AuthChallengeResponse {
+  /** Base64 XDR transaction envelope. */
+  transaction: string;
+  network_passphrase: string;
+}
+
+/** `POST /api/auth`: a SEP-10 JWT, sent as `Authorization: Bearer <token>`. */
+export interface AuthTokenResponse {
+  token: string;
+}
+
 export interface StatsResponse {
   plans: number;
   mandates: number;
