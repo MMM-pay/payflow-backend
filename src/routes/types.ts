@@ -47,6 +47,26 @@ export interface PlanRow extends TokenFields {
   period: number;
   active: number;
   ledger: number;
+  /**
+   * The merchant's self-declared display name (see {@link MerchantProfile});
+   * null when the merchant has not set a profile. Not verified by anyone.
+   */
+  merchantName?: string | null;
+}
+
+/**
+ * A merchant's profile, as the plan registry's `profile_updated` event last
+ * set it. Self-declared: the contract stores the name and the URL without
+ * verifying either, so they are a claim the merchant makes about itself.
+ */
+export interface MerchantProfile {
+  merchant: string;
+  /** Display name, at most 64 bytes on-chain. */
+  name: string;
+  /** Website or terms URL, at most 256 bytes on-chain. Not validated. */
+  url: string;
+  /** The ledger of the profile update the row reflects. */
+  ledger: number;
 }
 
 export interface MandateRow extends TokenFields {
@@ -109,6 +129,30 @@ export interface DueMandateRow {
    * mandates are reported as not funded.
    */
   funded: boolean;
+}
+
+/** A due mandate the last known vault balance cannot cover: one row of a merchant's unpaid report. */
+export interface UnpaidMandateRow {
+  id: number;
+  subscriber: string;
+  /** When the charge fell due, in unix seconds. */
+  next_charge: number;
+  /** The charge, in the token's smallest unit. */
+  amount: string;
+  /** The last indexed vault balance of the plan's token; "0" when none is indexed. */
+  balance: string;
+  /** What the balance is missing: amount − balance. */
+  shortfall: string;
+  /** How long the charge has been due: `now` − `next_charge`, in seconds. */
+  overdue_seconds: number;
+}
+
+export interface MerchantUnpaidResponse {
+  merchant: string;
+  /** The instant the report was built, in unix seconds. */
+  now: number;
+  /** Longest overdue first; ties by mandate id. */
+  unpaid: UnpaidMandateRow[];
 }
 
 export interface PlanPage {
@@ -187,6 +231,28 @@ export interface ProtocolResponse {
   history: ProtocolFeeChange[];
   /** The latest code version of each contract that has been upgraded. */
   contract_versions: { contract_id: string; wasm_hash: string; ledger: number }[];
+}
+
+/** One bucket of the protocol fee report. */
+export interface ProtocolFeeBucket {
+  /**
+   * The bucket's label: `2025-01-15` for a day, the Monday's date
+   * (`2025-01-13`) for a week, and `2025-01` for a month. All in UTC.
+   */
+  bucket: string;
+  /** Fees the protocol collected in the bucket, token's smallest unit. */
+  fee: string;
+  /** Charges settled in the bucket. */
+  charges: number;
+}
+
+export interface ProtocolFeesResponse {
+  /** The bucket size the report is grouped by. */
+  bucket: RevenueBucketSize;
+  /** The buckets, oldest first. */
+  buckets: ProtocolFeeBucket[];
+  /** The same figures summed over every bucket in the report. */
+  totals: Omit<ProtocolFeeBucket, "bucket">;
 }
 
 export interface KeeperPassSummary {

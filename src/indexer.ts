@@ -528,6 +528,9 @@ export class Indexer {
       case "plan_status_changed":
         this.onPlanStatus(e);
         return "applied";
+      case "profile_updated":
+        this.onProfileUpdated(e);
+        return "applied";
       case "subscribed": {
         const [, , merchant] = e.topics;
         this.onSubscribed(e);
@@ -640,6 +643,28 @@ export class Indexer {
     this.db
       .prepare("UPDATE plans SET active = ? WHERE id = ?")
       .run(e.data.active ? 1 : 0, num(planId));
+  }
+
+  /**
+   * A merchant's self-declared profile: the latest `set_profile` wins.
+   *
+   * Keyed on the merchant, and the update only lands when the event is no
+   * older than the stored row, so replaying a range (or backfilling an older
+   * one from the archive) can never roll a profile back. Within one ledger the
+   * events are applied in order, so the last update of the ledger wins on a
+   * replay exactly as it did the first time.
+   */
+  private onProfileUpdated(e: DecodedEvent): void {
+    const [merchant] = e.topics;
+    this.db
+      .prepare(
+        `INSERT INTO merchant_profiles (merchant, name, url, ledger)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(merchant) DO UPDATE SET
+           name = excluded.name, url = excluded.url, ledger = excluded.ledger
+         WHERE excluded.ledger >= merchant_profiles.ledger`,
+      )
+      .run(str(merchant), str(e.data.name), str(e.data.url), e.ledger);
   }
 
   private onSubscribed(e: DecodedEvent): void {

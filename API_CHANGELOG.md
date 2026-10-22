@@ -72,6 +72,17 @@ release that ships them numbers them here.
   completed per bucket, and the net.
 - `GET /api/merchants/:address/forecast` — projected charges over the next N
   days, net of fees.
+- `GET /api/protocol/fees` — the protocol's fee revenue per `day`, `week` or
+  `month` bucket of ledger close time (#149).
+- `GET /api/plans?sort=subscribers` — plans ranked by active mandates, ties
+  broken by plan id; refuses `cursor` and returns `nextCursor: null` (#148).
+- `GET /api/merchants/:address/profile` — the merchant's **self-declared**
+  display name and URL; `404 profile_not_found` when none is set. Plan
+  responses gained `merchantName` (the same self-declared name, or `null`)
+  (#147).
+- `GET /api/merchants/:address/unpaid` — due mandates the last known vault
+  balance cannot cover, with `balance`, `shortfall` and `overdue_seconds`,
+  longest overdue first (#146).
 - `GET /api/subscribers/:address/upcoming` — charges due over the next N days,
   with their projected times.
 - `GET /api/mandates?ids=` — up to 100 mandates in one request.

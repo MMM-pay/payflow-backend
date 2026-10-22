@@ -152,6 +152,17 @@ CREATE TABLE IF NOT EXISTS mandate_timeline (
 );
 CREATE INDEX IF NOT EXISTS mandate_timeline_order ON mandate_timeline(mandate_id, ledger, tx_hash, kind);
 
+-- A merchant's self-declared profile, from the plan registry's
+-- profile_updated event: a display name and a URL the contract stores without
+-- verifying. One row per merchant, upserted with a ledger guard so a replayed
+-- older event can never overwrite a newer profile.
+CREATE TABLE IF NOT EXISTS merchant_profiles (
+  merchant TEXT    PRIMARY KEY,
+  name     TEXT    NOT NULL,
+  url      TEXT    NOT NULL,
+  ledger   INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS webhooks (
   id          INTEGER PRIMARY KEY,
   merchant    TEXT    NOT NULL,
@@ -246,6 +257,15 @@ const ADDED_INDEXES: ReadonlyArray<[table: string, name: string, columns: string
   // and buckets them by their close time, so the range filter is served from
   // the index rather than from a scan of the merchant's whole history.
   ["charges", "charges_merchant_created_at", "merchant, created_at"],
+  // Ranking plans by active mandates counts each plan's active mandates with
+  // one covering range lookup instead of a scan of every mandate.
+  ["mandates", "mandates_plan_status", "plan_id, status"],
+  // The protocol fee report finds the newest charge and reads only the
+  // charges inside its bucket window, straight from the index.
+  ["charges", "charges_created_at_fee", "created_at, fee"],
+  // A merchant's unpaid report walks its due mandates oldest-due first, so
+  // the range and the order both come from the index.
+  ["mandates", "mandates_merchant_status_next_charge", "merchant, status, next_charge"],
 ];
 
 export function migrate(db: DatabaseSync): void {
@@ -335,6 +355,7 @@ export function clearProjections(db: DatabaseSync): void {
   // Do not remove cursor, raw events, or operational webhook configuration.
   for (const table of [
     "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline", "contract_upgrades",
+    "merchant_profiles",
   ]) {
     db.exec(`DELETE FROM ${table}`);
   }

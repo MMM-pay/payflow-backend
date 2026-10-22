@@ -2,8 +2,9 @@ import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
 import {
   getMandateById,
+  isFunded,
+  lastKnownBalances,
   listDueMandates,
-  listLatestVaultBalances,
   listMandateCharges,
   listMandateTimeline,
   listMandates,
@@ -192,29 +193,18 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
 
     const now = Math.floor(Date.now() / 1000);
     const rows = listDueMandates(db, now, limitOf(limit.value));
-    // A mandate carries no token of its own; it inherits its plan's, and the
-    // vault balance is per (subscriber, token).
-    const tokens = planTokensByIds(db, rows.map((row) => row.plan_id));
-    const balances = listLatestVaultBalances(
-      db,
-      rows.map((row) => row.subscriber),
-    );
+    // The vault balance is per (subscriber, token), and a mandate inherits its
+    // plan's token; the merchant unpaid report shares this funded test.
+    const balances = lastKnownBalances(db, rows);
 
-    const due: DueMandateRow[] = rows.map((row) => {
-      const token = tokens.get(row.plan_id);
-      const balance = token ? balances.get(row.subscriber)?.get(token) : undefined;
-      return {
-        id: row.id,
-        subscriber: row.subscriber,
-        merchant: row.merchant,
-        next_charge: row.next_charge,
-        amount: row.amount,
-        // Amounts are compared as bigints: a balance is a decimal string in
-        // the token's smallest unit and must never round-trip through a
-        // JavaScript number.
-        funded: balance !== undefined && BigInt(balance) >= BigInt(row.amount),
-      };
-    });
+    const due: DueMandateRow[] = rows.map((row, i) => ({
+      id: row.id,
+      subscriber: row.subscriber,
+      merchant: row.merchant,
+      next_charge: row.next_charge,
+      amount: row.amount,
+      funded: isFunded(balances[i], row.amount),
+    }));
     const body: DuePage = { now, due };
     res.json(body);
   });

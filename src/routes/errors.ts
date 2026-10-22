@@ -12,6 +12,7 @@ export type ApiErrorCode =
   | "not_found"
   | "plan_not_found"
   | "mandate_not_found"
+  | "profile_not_found"
   | "invalid_ids"
   | "too_many_ids"
   | "invalid_request"
@@ -74,6 +75,7 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   not_found: "The requested resource was not found.",
   plan_not_found: "No plan exists with that id.",
   mandate_not_found: "No mandate exists with that id.",
+  profile_not_found: "The merchant has not set a profile.",
   invalid_ids: "The `ids` parameter must be a comma-separated list of positive integers.",
   too_many_ids: "The `ids` parameter accepts at most 100 mandate ids.",
   invalid_request: "The request parameters are not valid.",

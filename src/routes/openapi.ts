@@ -294,9 +294,21 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["plans"],
         summary: "List published plans",
         description:
-          "Plans a merchant has published, newest first. Each amount is a decimal string in the plan's token's smallest unit.",
+          "Plans a merchant has published, newest first. Each amount is a decimal string in the plan's token's smallest unit. With `sort=subscribers` the plans are ranked by active mandates instead, most first, ties broken by plan id ascending: one page of `limit` plans, so `nextCursor` is null and `cursor` is refused.",
         operationId: `listPlans${operationSuffix(root)}`,
-        parameters: [merchantParameter(), cursorParameter(), limitParameter()],
+        parameters: [
+          merchantParameter(),
+          cursorParameter(),
+          limitParameter(),
+          {
+            name: "sort",
+            in: "query",
+            required: false,
+            description:
+              "`subscribers` ranks the plans by active mandates, most first, ties broken by plan id ascending. Absent: newest first.",
+            schema: { type: "string", enum: ["subscribers"] },
+          },
+        ],
         responses: {
           "200": {
             description: "The plans.",
@@ -776,6 +788,45 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/merchants/{address}/profile")]: {
+      get: {
+        tags: ["merchants"],
+        summary: "A merchant's self-declared profile",
+        description:
+          "The display name and URL the merchant last set through the plan registry's `set_profile`. **Self-declared:** the contract does not verify either value and neither does this API, so treat them as a claim the merchant makes about itself, and treat the URL as untrusted input when rendering it.",
+        operationId: `getMerchantProfile${operationSuffix(root)}`,
+        parameters: [addressParameter()],
+        responses: {
+          "200": {
+            description: "The merchant's self-declared profile.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/MerchantProfile" } },
+            },
+          },
+          "400": invalidRequest(),
+          "404": errorResponse('The merchant has not set a profile (error.code = "profile_not_found").'),
+        },
+      },
+    },
+    [p("/merchants/{address}/unpaid")]: {
+      get: {
+        tags: ["merchants"],
+        summary: "A merchant's unpaid mandates",
+        description:
+          "The merchant's due mandates whose last known vault balance cannot cover the charge (the mandates `/due` reports with `funded: false`), with the shortfall and how long each has been due, longest overdue first, ties broken by mandate id. The balance is the one the indexer last saw, so it can trail the chain.",
+        operationId: `listMerchantUnpaid${operationSuffix(root)}`,
+        parameters: [addressParameter(), limitParameter()],
+        responses: {
+          "200": {
+            description: "The unpaid mandates.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/MerchantUnpaid" } },
+            },
+          },
+          "400": invalidRequest(),
+        },
+      },
+    },
     [p("/merchants/{address}/subscribers")]: {
       get: {
         tags: ["merchants"],
@@ -1020,6 +1071,34 @@ function apiPaths(root: string): Record<string, PathItemObject> {
               "application/json": { schema: { $ref: "#/components/schemas/Protocol" } },
             },
           },
+        },
+      },
+    },
+    [p("/protocol/fees")]: {
+      get: {
+        tags: ["protocol"],
+        summary: "Protocol fee revenue over time",
+        description:
+          "The fees the protocol collected, summed per calendar bucket of the close time of the ledger each charge was emitted in. The report covers the most recent `limit` buckets (366 by default, at most 1000), ending with the bucket of the newest charge.",
+        operationId: `getProtocolFees${operationSuffix(root)}`,
+        parameters: [
+          bucketParameter(),
+          {
+            name: "limit",
+            in: "query",
+            required: false,
+            description: "How many of the most recent buckets to report. Capped at 1000; a larger value is not an error.",
+            schema: { type: "integer", minimum: 1, maximum: 1000, default: 366 },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "The fee report.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/ProtocolFees" } },
+            },
+          },
+          "400": invalidRequest(),
         },
       },
     },
@@ -1438,10 +1517,30 @@ function componentSchemas(): Record<string, SchemaObject> {
             period: { type: "integer", description: "The billing period in seconds." },
             active: { type: "integer", description: "1 when the plan is published, 0 when it is not." },
             ledger: { type: "integer" },
+            merchantName: {
+              type: ["string", "null"],
+              description:
+                "The merchant's self-declared display name (see `/merchants/{address}/profile`); not verified. Null when the merchant has not set a profile.",
+            },
           },
           required: ["id", "merchant", "name", "token", "amount", "period", "active", "ledger"],
         },
       ],
+    },
+    MerchantProfile: {
+      type: "object",
+      description:
+        "A merchant's self-declared profile. The plan registry stores it without verifying the name or the URL, so it is a claim the merchant makes about itself.",
+      properties: {
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        name: { type: "string", description: "Self-declared display name, at most 64 bytes." },
+        url: {
+          type: "string",
+          description: "Self-declared website or terms URL, at most 256 bytes. Not validated; render it as untrusted input.",
+        },
+        ledger: { type: "integer", description: "The ledger of the profile update this reflects." },
+      },
+      required: ["merchant", "name", "url", "ledger"],
     },
     Mandate: {
       allOf: [
@@ -1528,6 +1627,28 @@ function componentSchemas(): Record<string, SchemaObject> {
         },
       },
       required: ["id", "subscriber", "merchant", "next_charge", "amount", "funded"],
+    },
+    UnpaidMandate: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        subscriber: { type: "string", description: ADDRESS_DESCRIPTION },
+        next_charge: { type: "integer", description: "When the charge fell due, in unix seconds." },
+        amount: amount(),
+        balance: amount(),
+        shortfall: amount(),
+        overdue_seconds: { type: "integer", description: "How long the charge has been due: `now` − `next_charge`." },
+      },
+      required: ["id", "subscriber", "next_charge", "amount", "balance", "shortfall", "overdue_seconds"],
+    },
+    MerchantUnpaid: {
+      type: "object",
+      properties: {
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        now: { type: "integer", description: "The instant the report was built, in unix seconds." },
+        unpaid: { type: "array", items: { $ref: "#/components/schemas/UnpaidMandate" } },
+      },
+      required: ["merchant", "now", "unpaid"],
     },
     PlanStats: {
       type: "object",
@@ -1893,6 +2014,24 @@ function componentSchemas(): Record<string, SchemaObject> {
         },
       },
       required: ["fee_bps", "history", "contract_versions"],
+    },
+    ProtocolFeeBucket: {
+      type: "object",
+      properties: {
+        bucket: { type: "string", description: "The bucket's label, in UTC." },
+        fee: amount(),
+        charges: { type: "integer" },
+      },
+      required: ["bucket", "fee", "charges"],
+    },
+    ProtocolFees: {
+      type: "object",
+      properties: {
+        bucket: { type: "string", enum: ["day", "week", "month"] },
+        buckets: { type: "array", items: { $ref: "#/components/schemas/ProtocolFeeBucket" } },
+        totals: { $ref: "#/components/schemas/ProtocolFeeBucket" },
+      },
+      required: ["bucket", "buckets", "totals"],
     },
     Stats: {
       type: "object",

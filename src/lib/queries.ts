@@ -15,14 +15,18 @@ import type {
   ProtocolResponse,
   MandateRow,
   MerchantChurnResponse,
+  MerchantProfile,
   MerchantRevenueResponse,
   MerchantSummary,
   PlanRow,
+  ProtocolFeeBucket,
+  ProtocolFeesResponse,
   RevenueBucket,
   RevenueBucketSize,
   StatsResponse,
   SubscriberSummary,
   TokenRevenue,
+  UnpaidMandateRow,
   VaultBalancePage,
   VaultEventPage,
 } from "../routes/types.ts";
@@ -74,6 +78,21 @@ export function listPlans(
   db: DatabaseSync,
   filter: ListPlansFilter,
 ): { rows: PlanRow[]; nextCursorId: number | null } {
+  const { where, args } = planFilter(filter);
+  return cursorPage(
+    db,
+    "FROM plans",
+    where,
+    args,
+    filter,
+  );
+}
+
+/** The WHERE clause and bound values of the merchant and name filters a plan listing takes. */
+function planFilter(filter: Omit<ListPlansFilter, "cursor" | "limit">): {
+  where: string;
+  args: unknown[];
+} {
   const conditions: string[] = [];
   const args: unknown[] = [];
 
@@ -90,15 +109,36 @@ export function listPlans(
     args.push(`%${escaped}%`);
   }
 
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  return { where: conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "", args };
+}
 
-  return cursorPage(
-    db,
-    "FROM plans",
-    where,
-    args,
-    filter,
-  );
+/**
+ * The `limit` most popular plans: the most active mandates first, ties broken
+ * by plan id ascending so the order is total and stable. A plan without an
+ * active mandate still ranks, last, with a count of zero.
+ *
+ * Each plan's count is one covering range lookup on `mandates_plan_status`
+ * (plan_id, status), so the cost is O(P log M + A) for the P plans the
+ * filters keep, M mandates and A of them active; SQLite keeps only the top
+ * `limit` rows while it sorts, so memory is O(limit).
+ */
+export function listPlansBySubscribers(
+  db: DatabaseSync,
+  filter: Omit<ListPlansFilter, "cursor">,
+): PlanRow[] {
+  const { where, args } = planFilter(filter);
+  return db
+    .prepare(
+      // `where` is built from fixed fragments and every value is a bound
+      // parameter, so this interpolation is structural, not user data.
+      // eslint-disable-next-line no-restricted-syntax
+      `SELECT * FROM plans ${where}
+        ORDER BY (SELECT COUNT(*) FROM mandates m
+                   WHERE m.plan_id = plans.id AND m.status = 'Active') DESC,
+                 id ASC
+        LIMIT ?`,
+    )
+    .all(...(args as never[]), filter.limit) as unknown as PlanRow[];
 }
 
 /**
@@ -137,6 +177,36 @@ export function getPlanById(db: DatabaseSync, id: number): PlanRow | undefined {
   return db
     .prepare("SELECT * FROM plans WHERE id = ?")
     .get(id) as unknown as PlanRow | undefined;
+}
+
+/** A merchant's self-declared profile, or undefined when it never set one. */
+export function getMerchantProfile(
+  db: DatabaseSync,
+  merchant: string,
+): MerchantProfile | undefined {
+  return db
+    .prepare("SELECT merchant, name, url, ledger FROM merchant_profiles WHERE merchant = ?")
+    .get(merchant) as unknown as MerchantProfile | undefined;
+}
+
+/**
+ * Batch the self-declared display name for a set of merchants, so naming a
+ * page of plans costs one primary-key read rather than one per row. Addresses
+ * are de-duped first; a merchant without a profile is absent from the map.
+ */
+export function merchantNamesByAddress(
+  db: DatabaseSync,
+  merchants: string[],
+): Map<string, string> {
+  const unique = [...new Set(merchants)];
+  if (unique.length === 0) return new Map();
+  const rows = db
+    // The interpolation is `?` placeholders only, one per de-duped address;
+    // the addresses themselves are bound parameters, never interpolated.
+    // eslint-disable-next-line no-restricted-syntax
+    .prepare(`SELECT merchant, name FROM merchant_profiles WHERE merchant IN (${unique.map(() => "?").join(",")})`)
+    .all(...(unique as never[])) as unknown as { merchant: string; name: string }[];
+  return new Map(rows.map((row) => [row.merchant, row.name]));
 }
 
 /** A plan's statistics, grouped from its mandates and their settled charges. */
@@ -395,6 +465,109 @@ export function getProtocolFeeHistory(db: DatabaseSync): ProtocolResponse {
 }
 
 /**
+ * The protocol's fee income over time: the sum of every charge's fee, in
+ * calendar buckets of the ledger close time the charge was emitted in.
+ *
+ * `charges` is keyed on (tx_hash, mandate_id), so a replayed ledger cannot
+ * count a fee twice, and `created_at` is the chain's clock, so the report is
+ * the same whether a charge was indexed live or on a backfill. Every sum reads
+ * as bigint, so no amount round-trips through a JavaScript number.
+ *
+ * The report covers the newest `limit` buckets, ending with the one the most
+ * recent charge falls in, and every bucket between the first and the last one
+ * with fees is present, so a chart has no gaps. Only the charges inside that
+ * window are read: the newest and the oldest charge are one index seek each
+ * and the window is one covering range scan of `charges_created_at_fee`, so
+ * the cost is O(log C + W) for C charges and W of them in the window, and
+ * memory is O(limit) buckets.
+ */
+export function getProtocolFees(
+  db: DatabaseSync,
+  bucket: RevenueBucketSize,
+  limit: number,
+): ProtocolFeesResponse {
+  // Each edge is one seek on `charges_created_at_fee`; SQLite answers a lone
+  // MIN or MAX from the index without reading the table.
+  const edge = (sql: string): number | null =>
+    (db.prepare(sql).get() as { at: number | null } | undefined)?.at ?? null;
+  const newest = edge("SELECT MAX(created_at) AS at FROM charges");
+  const oldest = edge("SELECT MIN(created_at) AS at FROM charges");
+  if (newest === null || oldest === null) {
+    return { bucket, buckets: [], totals: { fee: "0", charges: 0 } };
+  }
+
+  const stmt = db.prepare(
+    // The bucket expression is a vetted static fragment chosen by the bucket
+    // size; the window start is a bound parameter, so no request data reaches
+    // the SQL text.
+    // eslint-disable-next-line no-restricted-syntax
+    `SELECT ${BUCKET_SQL[bucket]} AS bucket,
+            COALESCE(SUM(CAST(fee AS INTEGER)), 0) AS fee,
+            COUNT(*) AS charges
+       FROM (
+         SELECT CAST(created_at / 1000 AS INTEGER) AS at, fee
+           FROM charges
+          WHERE created_at >= ?
+       )
+      GROUP BY bucket
+      ORDER BY bucket`,
+  );
+  // Read the sums as bigint so a large fee total never round-trips through a
+  // JavaScript number at stroop scale.
+  stmt.setReadBigInts(true);
+  // `created_at` is unix milliseconds; the bucket arithmetic is in seconds.
+  const last = Math.floor(newest / 1000);
+  const first = windowStart(bucket, last, limit);
+  const rows = stmt.all(first * 1000) as unknown as Array<{
+    bucket: bigint;
+    fee: bigint;
+    charges: bigint;
+  }>;
+
+  // A bucket start is a timestamp, not an amount, and fits in a number; a
+  // count is never an amount either.
+  const perBucket = new Map<number, { fee: bigint; charges: number }>(
+    rows.map((row) => [Number(row.bucket), { fee: row.fee, charges: Number(row.charges) }]),
+  );
+
+  // The window ends at the newest charge's bucket and starts `limit` buckets
+  // earlier, or at the oldest charge's bucket when the history is shorter, so
+  // the gap-filled range never exceeds the limit.
+  const from = Math.max(first, Math.floor(oldest / 1000));
+  const buckets: ProtocolFeeBucket[] = bucketStarts(bucket, from, last).map((start) => {
+    const entry = perBucket.get(Math.floor(start.getTime() / 1000));
+    return {
+      bucket: bucketLabel(bucket, start),
+      fee: String(entry?.fee ?? 0n),
+      charges: entry?.charges ?? 0,
+    };
+  });
+
+  let fee = 0n;
+  let charges = 0;
+  for (const b of buckets) {
+    fee += BigInt(b.fee);
+    charges += b.charges;
+  }
+  return { bucket, buckets, totals: { fee: String(fee), charges } };
+}
+
+/**
+ * The start, in unix seconds, of the oldest of the `count` buckets that end
+ * with the one `at` (unix seconds) falls in. Months step on the calendar, so
+ * a window of months always starts on the first of a month.
+ */
+function windowStart(bucket: RevenueBucketSize, at: number, count: number): number {
+  const last = bucketStart(bucket, at);
+  const back = count - 1;
+  if (bucket === "month") {
+    return Math.floor(Date.UTC(last.getUTCFullYear(), last.getUTCMonth() - back, 1) / 1000);
+  }
+  const step = bucket === "day" ? 86_400 : 604_800;
+  return Math.floor(last.getTime() / 1000) - back * step;
+}
+
+/**
  * List active mandates currently eligible for settlement at `now`.
  *
  * `plan_id` comes along so the caller can find the mandate's token — the
@@ -483,6 +656,102 @@ export function listLatestVaultBalances(
     balances.set(row.user, perToken);
   }
   return balances;
+}
+
+/**
+ * The last indexed vault balance each due mandate would be paid from, in row
+ * order: the subscriber's balance of the mandate's plan token, or undefined
+ * when none is indexed. A mandate carries no token of its own — it inherits
+ * its plan's — so a batch of rows costs two reads, not two per row.
+ */
+export function lastKnownBalances(
+  db: DatabaseSync,
+  rows: DueMandateRecord[],
+): Array<string | undefined> {
+  const tokens = planTokensByIds(db, rows.map((row) => row.plan_id));
+  const balances = listLatestVaultBalances(db, rows.map((row) => row.subscriber));
+  return rows.map((row) => {
+    const token = tokens.get(row.plan_id);
+    return token ? balances.get(row.subscriber)?.get(token) : undefined;
+  });
+}
+
+/**
+ * Whether the last known vault balance covers a charge: the `funded` flag of
+ * `/due`. Amounts are compared as bigints: a balance is a decimal string in
+ * the token's smallest unit and must never round-trip through a JavaScript
+ * number. A subscriber the projection has never seen holds nothing.
+ */
+export function isFunded(balance: string | undefined, amount: string): boolean {
+  return balance !== undefined && BigInt(balance) >= BigInt(amount);
+}
+
+/** Due mandates read per step of the unpaid report; keeps each batch's `IN (...)` lists small. */
+const UNPAID_PAGE = 200;
+
+/**
+ * A merchant's due mandates whose last known vault balance cannot cover the
+ * charge, longest overdue first (ties by mandate id), at most `limit` of them.
+ *
+ * The due predicate is the one `/due` uses and the funded test is
+ * {@link isFunded}, so a mandate is here exactly when `/due` reports it with
+ * `funded: false`. The due mandates are walked in keyset pages over
+ * `mandates_merchant_status_next_charge`, already in report order, and the
+ * walk stops as soon as `limit` unpaid ones are found: the cost is O(D) for
+ * the D due mandates read before then, never a scan of the merchant's whole
+ * history, and memory is O(page + limit).
+ */
+export function listMerchantUnpaidMandates(
+  db: DatabaseSync,
+  merchant: string,
+  now: number,
+  limit: number,
+): UnpaidMandateRow[] {
+  // The keyset is spelled as a closed range on next_charge plus a tiebreak on
+  // id, not as a row value: SQLite's planner (with no ANALYZE statistics)
+  // then seeks the merchant's own index on both bounds instead of walking the
+  // protocol-wide `mandates_due` index. test/db.test.ts pins the plan.
+  const page = db.prepare(
+    `SELECT id, subscriber, merchant, next_charge, amount, plan_id
+       FROM mandates
+      WHERE merchant = ? AND status = 'Active'
+        AND next_charge BETWEEN ? AND ?
+        AND (next_charge > ? OR id > ?)
+        AND (max_charges = 0 OR charges_made < max_charges)
+      ORDER BY next_charge, id
+      LIMIT ?`,
+  );
+  const unpaid: UnpaidMandateRow[] = [];
+  let after = { next_charge: -1, id: -1 };
+  for (;;) {
+    const rows = page.all(
+      merchant,
+      after.next_charge,
+      now,
+      after.next_charge,
+      after.id,
+      UNPAID_PAGE,
+    ) as unknown as DueMandateRecord[];
+    const balances = lastKnownBalances(db, rows);
+    for (const [i, row] of rows.entries()) {
+      const balance = balances[i];
+      if (isFunded(balance, row.amount)) continue;
+      // No indexed balance means the vault holds nothing of the token.
+      const held = BigInt(balance ?? "0");
+      unpaid.push({
+        id: row.id,
+        subscriber: row.subscriber,
+        next_charge: row.next_charge,
+        amount: row.amount,
+        balance: String(held),
+        shortfall: String(BigInt(row.amount) - held),
+        overdue_seconds: now - row.next_charge,
+      });
+      if (unpaid.length === limit) return unpaid;
+    }
+    if (rows.length < UNPAID_PAGE) return unpaid;
+    after = rows[rows.length - 1]!;
+  }
 }
 
 /** Revenue per token: sums from charges and active mandates, joined via plans. */

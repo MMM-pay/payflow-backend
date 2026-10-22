@@ -1,20 +1,25 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
 import {
+  getMerchantProfile,
   getMerchantSummary,
   listMerchantChargesAfter,
   listMerchantForecastMandates,
   listMerchantSubscribers,
+  listMerchantUnpaidMandates,
   getMerchantChurn,
   getMerchantRevenue,
 } from "../lib/queries.ts";
 import { churnBucketSize } from "../lib/churn.ts";
+import { sendApiError } from "./errors.ts";
 import type {
   ForecastResponse,
   MerchantChurnResponse,
+  MerchantProfile,
   MerchantRevenueResponse,
   MerchantSubscribersResponse,
   MerchantSummary,
+  MerchantUnpaidResponse,
 } from "./types.ts";
 import {
   DEFAULT_REVENUE_BUCKETS,
@@ -153,6 +158,44 @@ export function merchantsRouter(
 
     const body = getMerchantSummary(db, address.value, defaultToken);
     cache.set(cacheKey, body);
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/profile`: the display name and URL the merchant
+   * last set through the plan registry's `set_profile`. Self-declared: the
+   * contract does not verify either, so neither does this route.
+   */
+  r.get("/merchants/:address/profile", (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const body: MerchantProfile | undefined = getMerchantProfile(db, address.value);
+    if (!body) {
+      sendApiError(res, req, 404, "profile_not_found");
+      return;
+    }
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/unpaid`: the merchant's due mandates whose last
+   * known vault balance cannot cover the charge, with the shortfall and how
+   * long each has been due, longest overdue first. The same funded test as
+   * `/due`, so the balance can trail the chain the same way.
+   */
+  r.get("/merchants/:address/unpaid", (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const now = Math.floor(Date.now() / 1000);
+    const body: MerchantUnpaidResponse = {
+      merchant: address.value,
+      now,
+      unpaid: listMerchantUnpaidMandates(db, address.value, now, limitOf(limit.value)),
+    };
     res.json(body);
   });
 

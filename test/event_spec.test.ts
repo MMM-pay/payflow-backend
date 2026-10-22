@@ -39,6 +39,21 @@ describe("contract spec validation", () => {
     assert.deepEqual(problems, []);
   });
 
+  test("profile_updated matches the plan registry's ProfileUpdated event", () => {
+    // `#[contractevent] struct ProfileUpdated { #[topic] merchant, name, url }`:
+    // the merchant is the topic after the event name, name and url the data map.
+    assert.deepEqual(
+      specProblems(event("profile_updated", [MERCHANT], { name: "Acme", url: "https://acme.example" })),
+      [],
+    );
+    assert.ok(
+      specProblems(event("profile_updated", [MERCHANT], { name: "Acme", url: 7n }))!.some(
+        (p) => p.includes("'url'") && p.includes("string"),
+      ),
+      "a retyped url is reported",
+    );
+  });
+
   test("a renamed event field is reported, not silently stored as 0", () => {
     // The contract renamed `next_charge` to `charge_after`: the old field is
     // missing and the new one is unknown. Both must surface as problems.

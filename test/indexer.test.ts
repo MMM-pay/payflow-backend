@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test, describe, beforeEach } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
-import { Keypair, StrKey } from "@stellar/stellar-sdk";
+import { Keypair, nativeToScVal, StrKey } from "@stellar/stellar-sdk";
 import { migrate, openDatabase } from "../src/lib/db.ts";
 import { Indexer } from "../src/indexer.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
@@ -1044,5 +1044,92 @@ describe("indexer idempotency under random orderings", () => {
     } finally {
       d.close();
     }
+  });
+});
+
+describe("merchant profiles", () => {
+  let d: ReturnType<typeof db>;
+  let ix: Indexer;
+
+  beforeEach(() => {
+    d = db();
+    ix = indexer(d);
+  });
+
+  /** A plan registry `profile_updated` event, as `set_profile` emits it. */
+  const profileUpdated = (name: string, url: string, ledger: number, txHash: string): DecodedEvent => ({
+    ...event("profile_updated", [MERCHANT], { name, url }),
+    ledger,
+    txHash,
+  });
+
+  // node:sqlite rows have a null prototype; copy them so deepEqual compares values.
+  const profiles = () =>
+    d.prepare("SELECT merchant, name, url, ledger FROM merchant_profiles").all().map((row) => ({ ...row }));
+
+  test("profile_updated is projected one row per merchant", () => {
+    assert.equal(ix.apply(profileUpdated("Acme", "https://acme.example", 100, "tx-p1")), "applied");
+    assert.deepEqual(profiles(), [
+      { merchant: MERCHANT, name: "Acme", url: "https://acme.example", ledger: 100 },
+    ]);
+  });
+
+  test("a later update replaces the profile", () => {
+    ix.apply(profileUpdated("Acme", "https://acme.example", 100, "tx-p1"));
+    ix.apply(profileUpdated("Acme Corp", "https://acme.example/terms", 120, "tx-p2"));
+    assert.deepEqual(profiles(), [
+      { merchant: MERCHANT, name: "Acme Corp", url: "https://acme.example/terms", ledger: 120 },
+    ]);
+  });
+
+  test("replaying the same range is a no-op", () => {
+    const range = [
+      profileUpdated("Acme", "https://acme.example", 100, "tx-p1"),
+      profileUpdated("Acme Corp", "https://acme.example/terms", 120, "tx-p2"),
+    ];
+    for (const e of range) ix.apply(e);
+    const once = profiles();
+    // A crash after the writes but before the cursor saved replays the range.
+    for (const e of range) ix.apply(e);
+    assert.deepEqual(profiles(), once);
+  });
+
+  test("an older event applied after a newer one never rolls the profile back", () => {
+    ix.apply(profileUpdated("Acme Corp", "https://acme.example/terms", 120, "tx-p2"));
+    // An archive backfill of an earlier range, or an overlapping window.
+    ix.apply(profileUpdated("Acme", "https://acme.example", 100, "tx-p1"));
+    assert.deepEqual(profiles(), [
+      { merchant: MERCHANT, name: "Acme Corp", url: "https://acme.example/terms", ledger: 120 },
+    ]);
+  });
+
+  test("a profile_updated without its url fails the spec and is not projected", () => {
+    const bad = { ...event("profile_updated", [MERCHANT], { name: "Acme" }), txHash: "tx-bad" };
+    assert.equal(ix.apply(bad), "mismatched");
+    assert.deepEqual(profiles(), []);
+  });
+
+  test("a rebuild from the raw events reproduces the profile", () => {
+    // The events table is what rebuildProjections replays; store the update
+    // there exactly as the indexer retains a raw RPC event.
+    const topics = JSON.stringify([
+      nativeToScVal("profile_updated", { type: "symbol" }).toXDR("base64"),
+      nativeToScVal(MERCHANT, { type: "address" }).toXDR("base64"),
+    ]);
+    const data = nativeToScVal(
+      { name: "Acme", url: "https://acme.example" },
+      { type: { name: ["symbol", "string"], url: ["symbol", "string"] } },
+    ).toXDR("base64");
+    d.prepare(
+      `INSERT INTO events (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+       VALUES ('e1', 'C', 100, 'tx-p1', 'e1', ?, ?, NULL)`,
+    ).run(topics, data);
+    // A stale row the rebuild must clear before it replays.
+    d.prepare("INSERT INTO merchant_profiles (merchant, name, url, ledger) VALUES (?, 'Stale', 'x', 999)").run(MERCHANT);
+
+    assert.equal(ix.rebuildProjections(), 1);
+    assert.deepEqual(profiles(), [
+      { merchant: MERCHANT, name: "Acme", url: "https://acme.example", ledger: 100 },
+    ]);
   });
 });

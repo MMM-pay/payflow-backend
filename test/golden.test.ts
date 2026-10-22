@@ -94,6 +94,7 @@ const ROUTES: RouteSpec[] = [
   { file: "vault_balances", method: "GET", path: `/api/vault/${SUBSCRIBER}`, status: 200 },
   { file: "vault_events", method: "GET", path: `/api/vault/${SUBSCRIBER}/events`, status: 200 },
   { file: "protocol", method: "GET", path: "/api/protocol", status: 200 },
+  { file: "protocol_fees", method: "GET", path: "/api/protocol/fees?bucket=day", status: 200 },
   { file: "due", method: "GET", path: "/api/due", status: 200 },
   { file: "merchant_summary", method: "GET", path: `/api/merchants/${MERCHANT}/summary`, status: 200 },
   { file: "merchant_forecast", method: "GET", path: `/api/merchants/${MERCHANT}/forecast`, status: 200 },
@@ -198,6 +199,22 @@ describe("golden response fixtures", () => {
       assert.deepEqual(body, loadFixture(route.file));
     });
   }
+
+  test("the protocol fee report matches the sum of the charge fees in the fixtures", () => {
+    const charges = (loadFixture("mandate_charges") as { charges: { fee: string }[] }).charges;
+    const fees = loadFixture("protocol_fees") as {
+      buckets: { fee: string }[];
+      totals: { fee: string; charges: number };
+    };
+    const stats = loadFixture("stats") as { totalFees: string };
+    const expected = charges.reduce((total, charge) => total + BigInt(charge.fee), 0n);
+
+    assert.equal(BigInt(fees.totals.fee), expected);
+    assert.equal(fees.totals.charges, charges.length);
+    assert.equal(fees.buckets.reduce((total, b) => total + BigInt(b.fee), 0n), expected);
+    // The all-time total `/api/stats` already reports, now split by period.
+    assert.equal(fees.totals.fee, stats.totalFees);
+  });
 
   test("a renamed field is caught by the snapshot", async () => {
     // Prove the fixtures are load-bearing: the plan-by-id snapshot pins the
