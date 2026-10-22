@@ -4,6 +4,7 @@ import express from "express";
 import { nativeToScVal } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { rawEventsRouter } from "../src/routes/events.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 
 test("raw event feed filters, pages without duplicates, and validates cursors", async () => {
   const db = openDatabase(":memory:");
@@ -19,7 +20,7 @@ test("raw event feed filters, pages without duplicates, and validates cursors", 
       nativeToScVal(900719925474099300000n, { type: "i128" }).toXDR("base64"), 1700000000);
   }
   const app = express();
-  app.use("/api", rawEventsRouter(db));
+  app.use("/api", rawEventsRouter(asStorage(db)));
   const server = app.listen(0);
   try {
     const address = server.address();

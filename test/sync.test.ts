@@ -152,7 +152,7 @@ describe("indexer sync", () => {
       calls: [],
     };
     const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 100 }));
-    ix.apply({
+    await ix.apply({
       name: "subscribed",
       contractId: CONTRACT,
       ledger: 99,
@@ -173,6 +173,28 @@ describe("indexer sync", () => {
     assert.equal(result.applied, 1);
     assert.deepEqual(received, ["charged"]);
     assert.equal(result.cursor, 101);
+    db.close();
+  });
+
+  test("a failed ledger window rolls back projections, cursor, and notifications", async () => {
+    const db = openDatabase(":memory:");
+    db.exec(`CREATE TRIGGER fail_second_plan BEFORE INSERT ON plans
+      WHEN NEW.id = 2 BEGIN SELECT RAISE(ABORT, 'projection failure'); END`);
+    const chain: FakeChain = {
+      latest: 102,
+      oldest: 100,
+      events: [rawEvent(100, 1), rawEvent(101, 2)],
+      calls: [],
+    };
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 100 }));
+    const received: string[] = [];
+    ix.events.on("applied", (event: { name: string }) => received.push(event.name));
+
+    await assert.rejects(ix.tick(), /projection failure/);
+
+    assert.deepEqual(plans(db), []);
+    assert.equal(readCursor(db, 0), 0);
+    assert.deepEqual(received, []);
     db.close();
   });
 

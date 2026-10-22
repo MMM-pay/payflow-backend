@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import {
   getPlanById,
   getPlanStats,
@@ -33,12 +33,12 @@ const planSortSchema = z.enum(["subscribers"]);
  * amount stays a string — the endpoint never fails just because RPC is down.
  * Each row also carries the merchant's self-declared display name, or `null`.
  */
-export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Router {
+export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
   const r = Router();
 
   /** Join the token metadata and the merchant's display name onto a page of plans. */
   const enrich = async (rows: PlanRow[]): Promise<PlanRow[]> => {
-    const names = merchantNamesByAddress(db, rows.map((row) => row.merchant));
+    const names = await merchantNamesByAddress(db, rows.map((row) => row.merchant));
     return Promise.all(
       rows.map(async (row) => ({
         ...row,
@@ -88,7 +88,7 @@ export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Rou
         ]);
         return;
       }
-      const rows = listPlansBySubscribers(db, {
+      const rows = await listPlansBySubscribers(db, {
         merchant: merchant.value,
         q: q.value,
         limit: limitOf(limit.value),
@@ -98,7 +98,7 @@ export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Rou
       return;
     }
 
-    const page = listPlans(db, {
+    const page = await listPlans(db, {
       merchant: merchant.value,
       q: q.value,
       cursor: cursor.value,
@@ -115,7 +115,7 @@ export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Rou
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
 
-    const row = getPlanById(db, id.value);
+    const row = await getPlanById(db, id.value);
     if (!row) {
       sendApiError(res, req, 404, "plan_not_found");
       return;
@@ -126,16 +126,16 @@ export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Rou
 
   /** `GET /plans/:id/stats`: active and total mandates, cancellations, gross
    * collected, and average charges per mandate. */
-  r.get("/plans/:id/stats", (req, res) => {
+  r.get("/plans/:id/stats", async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const planId = id.value;
 
-    if (!getPlanById(db, planId)) {
+    if (!(await getPlanById(db, planId))) {
       sendApiError(res, req, 404, "plan_not_found");
       return;
     }
-    const stats = getPlanStats(db, planId);
+    const stats = await getPlanStats(db, planId);
     const body: PlanStatsResponse = {
       planId,
       activeMandates: stats.activeMandates,

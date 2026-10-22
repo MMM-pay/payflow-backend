@@ -27,7 +27,7 @@ describe("contract spec validation", () => {
     ix = new Indexer(d, {} as never, {} as never);
   });
 
-  test("a well-formed event passes the spec", () => {
+  test("a well-formed event passes the spec", async () => {
     const problems = specProblems(
       event("plan_created", [MERCHANT, 1n], {
         token: TOKEN,
@@ -54,7 +54,7 @@ describe("contract spec validation", () => {
     );
   });
 
-  test("a renamed event field is reported, not silently stored as 0", () => {
+  test("a renamed event field is reported, not silently stored as 0", async () => {
     // The contract renamed `next_charge` to `charge_after`: the old field is
     // missing and the new one is unknown. Both must surface as problems.
     const bad = event("charged", [1n, SUBSCRIBER, MERCHANT], {
@@ -74,13 +74,13 @@ describe("contract spec validation", () => {
       "the unknown replacement field is reported too",
     );
 
-    ix.apply(event("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+    await ix.apply(event("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n,
       amount: 10_000_000n,
       period: 2_592_000n,
       next_charge: 1_700_000_000n,
     }));
-    const outcome = ix.apply(bad);
+    const outcome = await ix.apply(bad);
     assert.equal(outcome, "mismatched");
     assert.equal(ix.mismatchedEvents, 1, "the mismatch is counted");
 
@@ -94,7 +94,7 @@ describe("contract spec validation", () => {
     assert.equal(mandate.next_charge, 1_700_000_000, "nor overwritten with 0");
   });
 
-  test("a retyped amount is reported instead of becoming 0", () => {
+  test("a retyped amount is reported instead of becoming 0", async () => {
     const bad = event("plan_created", [MERCHANT, 2n], {
       token: TOKEN,
       amount: "ten million",
@@ -104,11 +104,11 @@ describe("contract spec validation", () => {
       specProblems(bad)!.some((p) => p.includes("'amount'") && p.includes("i128")),
       "the field name and expected type appear in the report",
     );
-    assert.equal(ix.apply(bad), "mismatched");
+    assert.equal(await ix.apply(bad), "mismatched");
     assert.equal(d.prepare("SELECT * FROM plans").all().length, 0, "no zero row stored");
   });
 
-  test("a negative value in an unsigned field is reported", () => {
+  test("a negative value in an unsigned field is reported", async () => {
     const bad = event("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n,
       amount: 10n,
@@ -118,12 +118,12 @@ describe("contract spec validation", () => {
     assert.ok(specProblems(bad)!.some((p) => p.includes("period")));
   });
 
-  test("extra topics are reported", () => {
+  test("extra topics are reported", async () => {
     const bad = event("pause_changed", [1n, SUBSCRIBER, "someone else"], { paused: true });
     assert.ok(specProblems(bad)!.some((p) => p.includes("unexpected topic")));
   });
 
-  test("optional fields may be absent", () => {
+  test("optional fields may be absent", async () => {
     // Deployments emitted plan_created without a name before names existed.
     assert.deepEqual(
       specProblems(
@@ -137,9 +137,9 @@ describe("contract spec validation", () => {
     );
   });
 
-  test("events outside the spec are ignored, not counted as mismatches", () => {
+  test("events outside the spec are ignored, not counted as mismatches", async () => {
     assert.equal(specProblems(event("some_future_event", [], { x: 1n })), null);
-    assert.equal(ix.apply(event("some_future_event", [], { x: 1n })), "unknown");
+    assert.equal(await ix.apply(event("some_future_event", [], { x: 1n })), "unknown");
     assert.equal(ix.mismatchedEvents, 0);
   });
 });

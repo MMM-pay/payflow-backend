@@ -116,10 +116,10 @@ describe("replay of recorded testnet events", () => {
     assert.equal(charged.data.fee, 100_000n);
   });
 
-  test("replaying the fixture produces a committed snapshot of state", () => {
+  test("replaying the fixture produces a committed snapshot of state", async () => {
     const db = openDatabase(":memory:");
     const ix = new Indexer(db, {} as never, {} as never);
-    for (const e of events) ix.apply(e);
+    for (const e of events) await ix.apply(e);
 
     const plans = db
       .prepare(
@@ -296,7 +296,7 @@ describe("replay of recorded testnet events", () => {
     db.close();
   });
 
-  test("replaying the fixture twice leaves the database unchanged", () => {
+  test("replaying the fixture twice leaves the database unchanged", async () => {
     const db = openDatabase(":memory:");
     const ix = new Indexer(db, {} as never, {} as never);
 
@@ -309,10 +309,10 @@ describe("replay of recorded testnet events", () => {
       churn: db.prepare("SELECT * FROM mandate_events ORDER BY at").all(),
     });
 
-    for (const e of events) ix.apply(e);
+    for (const e of events) await ix.apply(e);
     const first = snapshot();
 
-    for (const e of events) ix.apply(e);
+    for (const e of events) await ix.apply(e);
     const second = snapshot();
 
     assert.deepEqual(second, first, "a second replay is a no-op");
@@ -321,11 +321,11 @@ describe("replay of recorded testnet events", () => {
     db.close();
   });
 
-  test("no recorded event fails the contract spec", () => {
+  test("no recorded event fails the contract spec", async () => {
     let mismatched = 0;
     for (const e of events) {
       const ix = new Indexer(openDatabase(":memory:"), {} as never, {} as never);
-      if (ix.apply(e) === "mismatched") mismatched += 1;
+      if ((await ix.apply(e)) === "mismatched") mismatched += 1;
     }
     assert.equal(mismatched, 0);
   });

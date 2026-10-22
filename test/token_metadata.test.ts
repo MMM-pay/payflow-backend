@@ -53,9 +53,9 @@ const db = openDatabase(":memory:");
 before(async () => {
   const ix = new Indexer(db, {} as never, {} as never);
   // Plan 1 pays in USDC, plan 2 in the network's native asset.
-  ix.apply(ev("plan_created", [MERCHANT, 1n], { token: USDC, amount: 5_000_000n, period: 2_592_000n }));
-  ix.apply(ev("plan_created", [MERCHANT, 2n], { token: NATIVE_ID, amount: 10_000_000n, period: 2_592_000n }));
-  ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("plan_created", [MERCHANT, 1n], { token: USDC, amount: 5_000_000n, period: 2_592_000n }));
+  await ix.apply(ev("plan_created", [MERCHANT, 2n], { token: NATIVE_ID, amount: 10_000_000n, period: 2_592_000n }));
+  await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 5_000_000n, period: 2_592_000n, next_charge: 1n,
   }));
 
@@ -166,7 +166,7 @@ describe("token metadata joined onto plan and mandate responses", () => {
   test("an unreadable token leaves the amount but nulls the metadata", async () => {
     const memDb = openDatabase(":memory:");
     const ix = new Indexer(memDb, {} as never, {} as never);
-    ix.apply(ev("plan_created", [MERCHANT, 9n], { token: UNKNOWN, amount: 1n, period: 2_592_000n }));
+    await ix.apply(ev("plan_created", [MERCHANT, 9n], { token: UNKNOWN, amount: 1n, period: 2_592_000n }));
     const tokens = new TokenMetadataService(reader, { networkPassphrase: TESTNET });
     const app = createApp(memDb, config, undefined, undefined, tokens);
     const testServer = app.listen(0);

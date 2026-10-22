@@ -13,6 +13,8 @@ import type { Config } from "./config.ts";
 import { logger } from "./lib/logger.ts";
 import { metrics } from "./lib/metrics.ts";
 import { simulationSource } from "./lib/simulate.ts";
+import { asStorage } from "./lib/store/index.ts";
+import type { Storage } from "./lib/store/types.ts";
 import { planTokensByIds } from "./lib/queries.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
 
@@ -212,7 +214,7 @@ export interface Channel {
  * rehearse a first run on a new deployment before it costs a fee.
  */
 export class Keeper {
-  private readonly db: DatabaseSync;
+  private readonly db: Storage;
   private readonly server: KeeperRpc;
   private config: Config;
   /**
@@ -243,8 +245,8 @@ export class Keeper {
   private batchEntryMissing = false;
   private readonly passes: KeeperPassSummary[] = [];
 
-  constructor(db: DatabaseSync, server: KeeperRpc, config: Config) {
-    this.db = db;
+  constructor(db: Storage | DatabaseSync, server: KeeperRpc, config: Config) {
+    this.db = asStorage(db);
     this.server = server;
     this.config = config;
     if (!config.KEEPER_SECRET) {
@@ -331,10 +333,10 @@ export class Keeper {
    * charge. With `KEEPER_MERCHANTS` set, only those merchants' mandates are
    * returned; empty means every merchant.
    */
-  findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): DueMandate[] {
+  async findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): Promise<DueMandate[]> {
     const due: DueMandate[] = [];
     // Read past the backing-off mandates so they cannot fill the batch.
-    for (const m of this.queryDue(now, limit + this.backoff.size)) {
+    for (const m of await this.queryDue(now, limit + this.backoff.size)) {
       const wait = this.backoff.get(m.id);
       if (wait && wait.retryAt > now) continue;
       due.push(m);
@@ -343,30 +345,25 @@ export class Keeper {
     return due;
   }
 
-  /**
-   * `KEEPER_MERCHANTS` as a JSON array, bound into the due queries'
-   * `json_each` filter; `[]` means every merchant. Binding the list keeps
-   * the SQL text fixed whatever the config holds.
-   */
-  private merchantsJson(): string {
-    return JSON.stringify(this.config.KEEPER_MERCHANTS ?? []);
+  private async queryDue(now: number, limit: number): Promise<DueMandate[]> {
+    if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
+    return this.queryDueByOldest(now, limit);
   }
 
-  private queryDue(now: number, limit: number): DueMandate[] {
-    if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
-    const merchants = this.merchantsJson();
-    return this.db
-      .prepare(
-        `SELECT id, subscriber, merchant, next_charge, amount, plan_id
-           FROM mandates
-          WHERE status = 'Active'
-            AND next_charge <= ?
-            AND (max_charges = 0 OR charges_made < max_charges)
-            AND (? = '[]' OR merchant IN (SELECT value FROM json_each(?)))
-          ORDER BY next_charge ASC
-          LIMIT ?`,
-      )
-      .all(now, merchants, merchants, limit) as unknown as DueMandate[];
+  private async queryDueByOldest(now: number, limit: number): Promise<DueMandate[]> {
+    const merchants = this.config.KEEPER_MERCHANTS ?? [];
+    const merchantFilter = merchants.length ? `AND merchant IN (${merchants.map(() => "?").join(",")})` : "";
+    return this.db.all<DueMandate>(
+      `SELECT id, subscriber, merchant, next_charge, amount, plan_id
+         FROM mandates
+        WHERE status = 'Active'
+          AND next_charge <= ?
+          AND (max_charges = 0 OR charges_made < max_charges)
+          ${merchantFilter}
+        ORDER BY next_charge ASC
+        LIMIT ?`,
+      [now, ...merchants, limit],
+    );
   }
 
   /**
@@ -378,18 +375,18 @@ export class Keeper {
    * then id, so the order is deterministic. The scan is unbounded by design:
    * "largest first" must see every due mandate before it can pick a batch.
    */
-  private queryDueLargest(now: number, limit: number): DueMandate[] {
-    const merchants = this.merchantsJson();
-    const rows = this.db
-      .prepare(
-        `SELECT id, subscriber, merchant, next_charge, amount, plan_id
-           FROM mandates
-          WHERE status = 'Active'
-            AND next_charge <= ?
-            AND (max_charges = 0 OR charges_made < max_charges)
-            AND (? = '[]' OR merchant IN (SELECT value FROM json_each(?)))`,
-      )
-      .all(now, merchants, merchants) as unknown as DueMandate[];
+  private async queryDueLargest(now: number, limit: number): Promise<DueMandate[]> {
+    const merchants = this.config.KEEPER_MERCHANTS ?? [];
+    const merchantFilter = merchants.length ? `AND merchant IN (${merchants.map(() => "?").join(",")})` : "";
+    const rows = await this.db.all<DueMandate>(
+      `SELECT id, subscriber, merchant, plan_id, next_charge, amount
+         FROM mandates
+        WHERE status = 'Active'
+          AND next_charge <= ?
+          AND (max_charges = 0 OR charges_made < max_charges)
+          ${merchantFilter}`,
+      [now, ...merchants],
+    );
     rows.sort((a, b) => {
       const amountDiff = BigInt(b.amount) - BigInt(a.amount);
       if (amountDiff > 0n) return 1;
@@ -417,10 +414,7 @@ export class Keeper {
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
-    const due = this.findDue(now);
-    // Mandates the vault cannot cover are dropped before any transaction is
-    // built: the charge would fail in simulation anyway, and skipping it
-    // saves the RPC call and the fee.
+    const due = await this.findDue(now);
     const { chargeable, skipped } = await this.withoutShortfalls(due);
     const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
     const channels = chargeable.length > 0 ? await this.distributableChannels() : [];
@@ -506,7 +500,7 @@ export class Keeper {
 
     // A mandate carries no token of its own; it inherits its plan's, and the
     // vault balance is per (subscriber, token).
-    const tokens = planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
+    const tokens = await planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
     // One read per subscriber and token per pass: a subscriber with several
     // mandates on the same plan is one balance, not one read each.
     const balances = new Map<string, bigint | null>();

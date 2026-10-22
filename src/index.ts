@@ -1,5 +1,5 @@
 import { loadConfig, networkConfigs } from "./config.ts";
-import { openDatabase } from "./lib/db.ts";
+import { openStorage } from "./lib/store/index.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -20,11 +20,9 @@ const networks = networkConfigs(config);
 
 // One indexer and one database per network, so cursors and projections never
 // mix. `runtimes[0]` is the default network: it serves the unprefixed routes.
-const runtimes = networks.map((network) => {
-  // Mark the database as in use so `npm run reindex` refuses to move it away
-  // underneath us; a second server on the same file fails here too.
-  const releaseLock = acquireLock(network.databasePath);
-  const db = openDatabase(network.databasePath);
+const runtimes = await Promise.all(networks.map(async (network) => {
+  const releaseLock = network.databaseUrl ? undefined : acquireLock(network.databasePath);
+  const db = await openStorage(network);
   const server = makeRpc(network);
   // A full-history archive backfills the gap between the stored cursor and
   // the oldest ledger the RPC still serves, so an outage longer than RPC
@@ -73,12 +71,12 @@ const runtimes = networks.map((network) => {
   // SEP-10 sign-in reads the signing account's signers through the same RPC.
   const auth = sep10For(config, network, server);
   return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth };
-});
+}));
 const defaultRuntime = runtimes[0]!;
 // Release the database locks however the process ends; a crash that skips
 // this leaves a stale lock, which the next taker detects by its dead PID.
 process.on("exit", () => {
-  for (const rt of runtimes) rt.releaseLock();
+  for (const rt of runtimes) rt.releaseLock?.();
 });
 
 const keeper = config.KEEPER_ENABLED
@@ -261,11 +259,11 @@ async function shutdown(signal: string): Promise<void> {
   const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
-  http.close(() => {
-    for (const rt of runtimes) {
-      rt.db.close();
-      rt.releaseLock();
-    }
+  http.close(async () => {
+    await Promise.all(runtimes.map(async (rt) => {
+      await rt.db.close();
+      rt.releaseLock?.();
+    }));
     process.exit(0);
   });
 }

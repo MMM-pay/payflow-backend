@@ -1,6 +1,6 @@
 import type { EventEmitter } from "node:events";
-import type { DatabaseSync } from "node:sqlite";
 import { Router } from "express";
+import type { Storage } from "../lib/store/types.ts";
 import { getMandateMerchant } from "../lib/queries.ts";
 import { num, type DecodedEvent } from "../lib/stellar.ts";
 import { sendApiError } from "./errors.ts";
@@ -10,10 +10,10 @@ const HEARTBEAT_MS = 25_000;
 const MAX_STREAMS = 100;
 const STREAM_EVENTS = new Set(["charged", "subscribed", "cancelled", "mandate_ended"]);
 
-function addressesOf(event: DecodedEvent, db: DatabaseSync): {
+async function addressesOf(event: DecodedEvent, db: Storage): Promise<{
   subscriber: string | undefined;
   merchant: string | undefined;
-} {
+}> {
   if (event.name === "subscribed" || event.name === "charged") {
     return { subscriber: String(event.topics[1]), merchant: String(event.topics[2]) };
   }
@@ -25,14 +25,14 @@ function addressesOf(event: DecodedEvent, db: DatabaseSync): {
   }
   return {
     subscriber: String(event.topics[1]),
-    merchant: getMandateMerchant(db, num(event.topics[0])),
+    merchant: await getMandateMerchant(db, num(event.topics[0])),
   };
 }
 
 /** Stream projected subscription events without polling the database. */
 export function streamRouter(
   events: EventEmitter,
-  db: DatabaseSync,
+  db: Storage,
   maxStreams = MAX_STREAMS,
 ): Router {
   const router = Router();
@@ -77,10 +77,11 @@ export function streamRouter(
     res.flushHeaders();
     res.write(": connected\n\n");
 
-    const onApplied = (event: DecodedEvent): void => {
+    const onApplied = async (event: DecodedEvent): Promise<void> => {
       try {
         if (!STREAM_EVENTS.has(event.name)) return;
-        const addresses = addressesOf(event, db);
+        const addresses = await addressesOf(event, db);
+        if (closed) return;
         if (merchant && merchant !== addresses.merchant) return;
         if (subscriber && subscriber !== addresses.subscriber) return;
         const data = JSON.stringify(event, (_key, value: unknown) =>

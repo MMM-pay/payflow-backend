@@ -29,7 +29,7 @@ what this service is for. It does three jobs:
 
 | Component | Job |
 |---|---|
-| **Indexer** | Polls Soroban RPC for contract events and projects them into SQLite |
+| **Indexer** | Polls Soroban RPC for contract events and projects them into SQLite or PostgreSQL |
 | **Keeper** | Finds mandates that have fallen due and calls `charge` on-chain |
 | **API** | Serves the projection to the frontend over REST |
 
@@ -116,7 +116,7 @@ On multi-network deployments, the same feed is also available at
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 477 tests, no network needed
+npm test                  # Tests run without external network access
 npm run test:coverage     # the same tests, with a coverage report and a threshold
 npm run dev
 ```
@@ -855,6 +855,7 @@ examined without API downtime.
 | `ARCHIVE_URL` | *(empty)* | Full-history archive URL used to backfill the gap between the stored cursor and the oldest ledger the RPC still serves |
 | `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
+| `DATABASE_URL` | — | `postgres://` or `postgresql://` connection string; when set, PostgreSQL is used instead of SQLite |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
@@ -914,11 +915,12 @@ MAINNET_SUBSCRIPTION_ID=C...
 MAINNET_INDEXER_START_LEDGER=5110418
 ```
 
-Each network runs its own indexer with its own cursor and its own SQLite
-database — derived from `DATABASE_PATH` (`./payflow.db` becomes
-`./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise — so
-ledger numbers, replay windows and outages on one network never affect the
-other. Unprefixed `/api/...` routes always serve the default network
+Each network runs its own indexer with its own cursor and projection. With
+`DATABASE_URL`, each network is isolated in its own PostgreSQL schema; otherwise
+it uses a SQLite file derived from `DATABASE_PATH` (`./payflow.db` becomes
+`./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise. Ledger
+numbers, replay windows and outages on one network never affect the other.
+Unprefixed `/api/...` routes always serve the default network
 (`STELLAR_NETWORK`); everything is also reachable under `/api/<name>/...`. The
 keeper settles the default network only.
 
@@ -929,7 +931,8 @@ keeper settles the default network only.
 `/health` as the health check. The free plan has no disk, so the SQLite
 projection is rebuilt from `INDEXER_START_LEDGER` after each restart, which
 takes seconds while the deployment ledger is within RPC retention (about 7
-days on testnet). On a paid plan, add a disk and point `DATABASE_PATH` at it.
+days on testnet). Use `DATABASE_URL` for persistent PostgreSQL storage and
+horizontal API instances, or add a disk and point `DATABASE_PATH` at it.
 
 **Keeper.** [`.github/workflows/keeper.yml`](.github/workflows/keeper.yml)
 settles due testnet mandates roughly every 15 minutes from GitHub Actions,

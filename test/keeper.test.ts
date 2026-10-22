@@ -522,30 +522,30 @@ describe("keeper merchant filter (KEEPER_MERCHANTS)", () => {
     insertMandate(db, 3, 1_002, "500", THIRD_MERCHANT);
   }
 
-  test("an empty list settles every merchant's mandates", () => {
+  test("an empty list settles every merchant's mandates", async () => {
     const db = openDatabase(":memory:");
     seed(db);
-    assert.deepEqual(merchantKeeper(db, []).findDue(2_000).map((m) => m.id), [1, 2, 3]);
-    assert.deepEqual(merchantKeeper(db, undefined).findDue(2_000).map((m) => m.id), [1, 2, 3]);
+    assert.deepEqual((await merchantKeeper(db, []).findDue(2_000)).map((m) => m.id), [1, 2, 3]);
+    assert.deepEqual((await merchantKeeper(db, undefined).findDue(2_000)).map((m) => m.id), [1, 2, 3]);
     db.close();
   });
 
-  test("only the listed merchants' mandates are due", () => {
+  test("only the listed merchants' mandates are due", async () => {
     const db = openDatabase(":memory:");
     seed(db);
-    assert.deepEqual(merchantKeeper(db, [MERCHANT]).findDue(2_000).map((m) => m.id), [1]);
+    assert.deepEqual((await merchantKeeper(db, [MERCHANT]).findDue(2_000)).map((m) => m.id), [1]);
     assert.deepEqual(
-      merchantKeeper(db, [MERCHANT, THIRD_MERCHANT]).findDue(2_000).map((m) => m.id),
+      (await merchantKeeper(db, [MERCHANT, THIRD_MERCHANT]).findDue(2_000)).map((m) => m.id),
       [1, 3],
     );
     db.close();
   });
 
-  test("the filter applies to KEEPER_ORDER=largest too", () => {
+  test("the filter applies to KEEPER_ORDER=largest too", async () => {
     const db = openDatabase(":memory:");
     seed(db);
     assert.deepEqual(
-      merchantKeeper(db, [MERCHANT, THIRD_MERCHANT], "largest").findDue(2_000).map((m) => m.id),
+      (await merchantKeeper(db, [MERCHANT, THIRD_MERCHANT], "largest").findDue(2_000)).map((m) => m.id),
       [3, 1],
     );
     db.close();
@@ -579,11 +579,11 @@ describe("keeper due-mandate ordering", () => {
     );
   }
 
-  test("oldest-due first is the default when KEEPER_ORDER is unset", () => {
+  test("oldest-due first is the default when KEEPER_ORDER is unset", async () => {
     const db = openDatabase(":memory:");
     insertMandate(db, 1, 1_000, "5");
     insertMandate(db, 2, 1_001, "1000000"); // bigger, but due later
-    const due = orderingKeeper(db).findDue(2_000);
+    const due = await orderingKeeper(db).findDue(2_000);
     assert.deepEqual(
       due.map((m) => m.id),
       [1, 2],
@@ -592,12 +592,12 @@ describe("keeper due-mandate ordering", () => {
     db.close();
   });
 
-  test("KEEPER_ORDER=oldest sorts by due date regardless of amount", () => {
+  test("KEEPER_ORDER=oldest sorts by due date regardless of amount", async () => {
     const db = openDatabase(":memory:");
     insertMandate(db, 1, 1_002, "9000000");
     insertMandate(db, 2, 1_000, "100");
     insertMandate(db, 3, 1_001, "500000000");
-    const due = orderingKeeper(db, "oldest").findDue(2_000);
+    const due = await orderingKeeper(db, "oldest").findDue(2_000);
     assert.deepEqual(
       due.map((m) => m.id),
       [2, 3, 1],
@@ -605,12 +605,12 @@ describe("keeper due-mandate ordering", () => {
     db.close();
   });
 
-  test("KEEPER_ORDER=largest sorts by amount descending", () => {
+  test("KEEPER_ORDER=largest sorts by amount descending", async () => {
     const db = openDatabase(":memory:");
     insertMandate(db, 1, 1_000, "5");
     insertMandate(db, 2, 1_001, "1000000");
     insertMandate(db, 3, 1_002, "700");
-    const due = orderingKeeper(db, "largest").findDue(2_000);
+    const due = await orderingKeeper(db, "largest").findDue(2_000);
     assert.deepEqual(
       due.map((m) => m.id),
       [2, 3, 1],
@@ -619,7 +619,7 @@ describe("keeper due-mandate ordering", () => {
     db.close();
   });
 
-  test("largest compares decimal strings exactly, beyond float precision", () => {
+  test("largest compares decimal strings exactly, beyond float precision", async () => {
     const db = openDatabase(":memory:");
     // 2^53 + 1 and 2^53 are indistinguishable as JS numbers but not as BigInt.
     insertMandate(db, 1, 1_000, "9007199254740992");
@@ -627,7 +627,7 @@ describe("keeper due-mandate ordering", () => {
     // A lexicographic TEXT sort would put "5..." before "10...".
     insertMandate(db, 3, 1_002, "5000000");
     insertMandate(db, 4, 1_003, "10000000000");
-    const due = orderingKeeper(db, "largest").findDue(2_000);
+    const due = await orderingKeeper(db, "largest").findDue(2_000);
     assert.deepEqual(
       due.map((m) => m.id),
       [2, 1, 4, 3],
@@ -635,12 +635,12 @@ describe("keeper due-mandate ordering", () => {
     db.close();
   });
 
-  test("largest breaks ties by oldest-due, then id", () => {
+  test("largest breaks ties by oldest-due, then id", async () => {
     const db = openDatabase(":memory:");
     insertMandate(db, 1, 1_002, "700");
     insertMandate(db, 2, 1_000, "700");
     insertMandate(db, 3, 1_001, "700");
-    const due = orderingKeeper(db, "largest").findDue(2_000);
+    const due = await orderingKeeper(db, "largest").findDue(2_000);
     assert.deepEqual(
       due.map((m) => m.id),
       [2, 3, 1],
@@ -649,13 +649,13 @@ describe("keeper due-mandate ordering", () => {
     db.close();
   });
 
-  test("largest still respects the batch limit", () => {
+  test("largest still respects the batch limit", async () => {
     const db = openDatabase(":memory:");
     insertMandate(db, 1, 1_000, "5");
     insertMandate(db, 2, 1_001, "1000");
     insertMandate(db, 3, 1_002, "70");
     insertMandate(db, 4, 1_003, "400");
-    const due = orderingKeeper(db, "largest").findDue(2_000, 2);
+    const due = await orderingKeeper(db, "largest").findDue(2_000, 2);
     assert.deepEqual(
       due.map((m) => m.id),
       [2, 4],
@@ -696,7 +696,7 @@ describe("keeper due-mandate ordering", () => {
     assert.equal(first[0]!.status, "failed");
     assert.equal(first[1]!.status, "settled");
 
-    const nextBatch = keeper.findDue(10_030);
+    const nextBatch = await keeper.findDue(10_030);
     assert.deepEqual(
       nextBatch.map((m) => m.id),
       [2],
