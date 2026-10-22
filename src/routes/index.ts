@@ -5,7 +5,9 @@ import type { TokenMetadataService } from "../lib/tokens.ts";
 import type { Storage } from "../lib/store/types.ts";
 import { asStorage } from "../lib/store/index.ts";
 import type { WebhookDispatcher } from "../lib/webhooks.ts";
+import { authRouter, type Sep10Auth } from "./auth.ts";
 import { mandatesRouter } from "./mandates.ts";
+import { rawEventsRouter } from "./events.ts";
 import {
   defaultMerchantSummaryCache,
   merchantsRouter,
@@ -32,6 +34,8 @@ export interface NetworkRoutes {
   events?: EventEmitter | undefined;
   /** Delivers charge events to registered webhooks. */
   webhooks?: WebhookDispatcher | undefined;
+  /** SEP-10 sign-in; merchant-only routes accept its JWTs. */
+  auth?: Sep10Auth | undefined;
 }
 
 /**
@@ -56,6 +60,7 @@ export function buildApiRouter(networks: NetworkRoutes[]): Router {
         network.defaultToken,
         network.events,
         network.webhooks,
+        network.auth,
       ),
     );
   }
@@ -67,6 +72,7 @@ export function buildApiRouter(networks: NetworkRoutes[]): Router {
       defaultNetwork.defaultToken,
       defaultNetwork.events,
       defaultNetwork.webhooks,
+      defaultNetwork.auth,
     ),
   );
   return router;
@@ -94,12 +100,14 @@ export function buildRoutes(
   defaultToken?: string,
   events?: EventEmitter,
   webhooks?: WebhookDispatcher,
+  auth?: Sep10Auth,
 ): Router {
   const r = Router();
   r.use((_req, res, next) => {
     res.setHeader("Cache-Control", "public, max-age=5");
     next();
   });
+  r.use(rawEventsRouter(db));
   r.use(plansRouter(db, tokens));
   r.use(protocolRouter(db));
   r.use(mandatesRouter(db, tokens));
@@ -108,7 +116,8 @@ export function buildRoutes(
   r.use(statsRouter(db));
   r.use(tokensRouter(tokens));
   if (events) r.use(streamRouter(events, db));
-  if (webhooks) r.use(webhooksRouter(webhooks));
+  if (auth) r.use(authRouter(auth));
+  if (webhooks) r.use(webhooksRouter(db, webhooks, auth));
   r.use(vaultRouter(db));
   return r;
 }

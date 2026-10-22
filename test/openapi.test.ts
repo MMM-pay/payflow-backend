@@ -216,6 +216,10 @@ describe("the OpenAPI document", () => {
       "/api/stats",
       "/api/stream",
       "/api/keeper",
+      "/api/auth",
+      "/api/webhooks/{id}/rotate",
+      "/api/webhooks/{id}/test",
+      "/api/webhooks/{id}/deliveries",
     ]) {
       assert.ok(path in spec.paths, `${path} is missing from the OpenAPI document`);
     }

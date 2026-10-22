@@ -1,10 +1,10 @@
 import { EventEmitter } from "node:events";
-import { rpc } from "@stellar/stellar-sdk";
+import { rpc, xdr } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
-
-export type IndexerConfig = Config | NetworkConfig;
 import type { Storage } from "./lib/store/types.ts";
 import { asStorage } from "./lib/store/index.ts";
+
+export type IndexerConfig = Config | NetworkConfig;
 import {
   big,
   decodeEvent,
@@ -265,6 +265,7 @@ export class Indexer {
           pastEnd = true;
           break;
         }
+        await this.retain(raw);
         const decoded = decodeEvent(raw);
         if (!decoded) continue;
         if ((await this.apply(decoded)) !== "mismatched") applied += 1;
@@ -428,6 +429,7 @@ export class Indexer {
         for (const raw of result.value) {
           const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
           if (ct !== null) lastSeenCloseTime = ct;
+          await this.retain(raw, storage);
           const decoded = decodeEvent(raw);
           if (!decoded) continue;
           if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
@@ -453,6 +455,72 @@ export class Indexer {
     this.publishMetrics(applied);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
+  }
+
+
+  /** Preserve every event before decoding, including unknown contract events. */
+  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<void> {
+    const eventId =
+      raw.id ??
+      `${raw.ledger}:${raw.txHash}:${raw.topic.map((topic) => topic.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`;
+    await storage.run(
+      `INSERT OR IGNORE INTO events
+         (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        eventId,
+        raw.contractId?.toString() ?? "",
+        raw.ledger,
+        raw.txHash,
+        raw.id ?? "",
+        JSON.stringify(raw.topic.map((topic) => topic.toXDR("base64"))),
+        raw.value.toXDR("base64"),
+        parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
+      ],
+    );
+  }
+
+  /** Rebuild event-derived projections locally, without querying RPC. */
+  async rebuildProjections(): Promise<number> {
+    const rows = await this.db.all<{
+      contract_id: string;
+      ledger: number;
+      tx_hash: string;
+      topics: string;
+      data: string;
+      close_time: number | null;
+    }>(
+      "SELECT contract_id, ledger, tx_hash, topics, data, close_time FROM events ORDER BY ledger, event_id",
+    );
+    return this.db.transaction(async (storage) => {
+      for (const table of [
+        "plans",
+        "mandates",
+        "charges",
+        "vault_events",
+        "fee_history",
+        "mandate_events",
+        "mandate_timeline",
+        "contract_upgrades",
+        "merchant_profiles",
+      ]) {
+        await storage.run(`DELETE FROM ${table}`);
+      }
+      let applied = 0;
+      for (const row of rows) {
+        const raw = {
+          contractId: row.contract_id,
+          ledger: row.ledger,
+          txHash: row.tx_hash,
+          topic: (JSON.parse(row.topics) as string[]).map((topic) => xdr.ScVal.fromXDR(topic, "base64")),
+          value: xdr.ScVal.fromXDR(row.data, "base64"),
+          ledgerClosedAt: row.close_time === null ? undefined : new Date(row.close_time * 1000).toISOString(),
+        } as unknown as rpc.Api.EventResponse;
+        const decoded = decodeEvent(raw);
+        if (decoded && (await this.apply(decoded, storage)) === "applied") applied += 1;
+      }
+      return applied;
+    });
   }
 
   /** Run passes until the cursor reaches the RPC's latest ledger. */
@@ -508,32 +576,41 @@ export class Indexer {
         await this.onSubscribed(e, storage);
         await this.recordChurn(e, "started", str(e.topics[2]), storage);
         this.notify(e, notifications);
+        await this.recordTimeline(e, storage);
+        return "applied";
+      case "profile_updated":
+        await this.onProfileUpdated(e, storage);
         return "applied";
       case "charged":
         await this.onCharged(e, storage);
         this.notify(e, notifications);
+        await this.recordTimeline(e, storage);
         return "applied";
       case "cancelled":
         {
           const merchant = await this.onStatus(e, "Cancelled", "subscriber", storage);
           await this.recordChurn(e, "cancelled", merchant, storage);
           this.notify(e, notifications);
+          await this.recordTimeline(e, storage);
           return "applied";
         }
       case "mandate_ended": {
         const merchant = await this.onStatus(e, "Cancelled", "merchant", storage) ?? str(e.topics[1]);
         await this.recordChurn(e, "ended", merchant, storage);
-        this.events.emit("applied", e);
+        await this.recordTimeline(e, storage);
+        this.notify(e, notifications);
         return "applied";
       }
       case "mandate_completed": {
         const merchant = await this.onStatus(e, "Completed", null, storage);
         await this.recordChurn(e, "completed", merchant, storage);
         this.notify(e, notifications);
+        await this.recordTimeline(e, storage);
         return "applied";
       }
       case "pause_changed":
         await this.onPauseChanged(e, storage);
+        await this.recordTimeline(e, storage);
         return "applied";
       case "fee_changed":
         await this.onFeeChanged(e, storage);
@@ -543,6 +620,15 @@ export class Indexer {
       case "debit":
         await this.onVaultEvent(e, storage);
         return "applied";
+      case "upgraded": {
+        // Emitted by a contract's admin-gated upgrade with the new wasm hash.
+        const raw = e.data.new_wasm_hash;
+        const hash =
+          raw instanceof Uint8Array ? Buffer.from(raw).toString("hex") : typeof raw === "string" ? raw : "";
+        if (!hash) return "unknown";
+        await this.recordContractUpgrade(e.contractId, e.txHash, e.ledger, e.closeTime ?? null, hash, storage);
+        return "applied";
+      }
       default:
         logger.debug({ name: e.name }, "unhandled event");
         return "unknown";
@@ -576,9 +662,43 @@ export class Indexer {
     );
   }
 
+  /**
+   * Append each on-chain lifecycle event without altering the existing churn
+   * aggregation table. A tx can emit different kinds for the same mandate;
+   * (mandate_id, tx_hash, kind) makes crash replays idempotent.
+   */
+  private async recordTimeline(e: DecodedEvent, storage: Storage): Promise<void> {
+    const mandateId = num(e.topics[0]);
+    const details: Record<string, string | boolean> = {};
+    if (e.name === "pause_changed") {
+      details.paused = e.data.paused === true;
+    } else if (e.name === "charged") {
+      details.amount = big(e.data.amount);
+      details.fee = big(e.data.fee);
+      details.chargesMade = String(e.data.charges_made);
+    }
+    await storage.run(
+      "INSERT OR IGNORE INTO mandate_timeline (mandate_id, tx_hash, kind, ledger, at, details) VALUES (?, ?, ?, ?, ?, ?)",
+      [mandateId, e.txHash, e.name, e.ledger, e.closeTime ?? null, JSON.stringify(details)],
+    );
+  }
+
   private async onPlanStatus(e: DecodedEvent, storage: Storage): Promise<void> {
     const [, planId] = e.topics;
     await storage.run("UPDATE plans SET active = ? WHERE id = ?", [e.data.active ? 1 : 0, num(planId)]);
+  }
+
+  /** Update a merchant's profile without letting a replay roll it backwards. */
+  private async onProfileUpdated(e: DecodedEvent, storage: Storage): Promise<void> {
+    const [merchant] = e.topics;
+    await storage.run(
+      `INSERT INTO merchant_profiles (merchant, name, url, ledger)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(merchant) DO UPDATE SET
+         name = excluded.name, url = excluded.url, ledger = excluded.ledger
+       WHERE excluded.ledger >= merchant_profiles.ledger`,
+      [str(merchant), str(e.data.name), str(e.data.url), e.ledger],
+    );
   }
 
   private async onSubscribed(e: DecodedEvent, storage: Storage): Promise<void> {
@@ -770,6 +890,28 @@ export class Indexer {
         num(e.data.new_fee_bps),
         e.ledger,
       ],
+    );
+  }
+
+  /**
+   * Record a contract upgrade when detected through contract events.
+   * This tracks when a contract's code is upgraded with metadata about the change.
+   */
+  private async recordContractUpgrade(
+    contractId: string,
+    txHash: string,
+    ledger: number,
+    closeTime: number | null,
+    newHash: string,
+    storage: Storage,
+    oldHash?: string,
+  ): Promise<void> {
+    if (!closeTime) return;
+    await storage.run(
+      `INSERT OR IGNORE INTO contract_upgrades
+         (contract_id, tx_hash, ledger, close_time, new_hash, old_hash)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [contractId, txHash, ledger, closeTime, newHash, oldHash ?? null],
     );
   }
 }

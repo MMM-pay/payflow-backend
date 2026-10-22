@@ -44,6 +44,15 @@
       "data": [{ "name": "active", "type": "boolean" }]
     },
     {
+      "name": "profile_updated",
+      "contract": "plan_registry",
+      "topics": [{ "name": "merchant", "type": "address" }],
+      "data": [
+        { "name": "name", "type": "string" },
+        { "name": "url", "type": "string" }
+      ]
+    },
+    {
       "name": "subscribed",
       "contract": "subscription",
       "topics": [

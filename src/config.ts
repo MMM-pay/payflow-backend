@@ -21,6 +21,11 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+/** A host name with an optional port (`example.com`, `localhost:8080`). */
+function isDomain(value: string, max: number): boolean {
+  return value.length <= max && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:\d{1,5})?$/i.test(value);
+}
+
 const contractId = z
   .string()
   .refine((value) => StrKey.isValidContract(value), "must be a valid Stellar contract ID");
@@ -39,6 +44,14 @@ const postgresUrl = z.preprocess(
     .url()
     .refine((value) => ["postgres:", "postgresql:"].includes(new URL(value).protocol), "must use a postgres URL")
     .optional(),
+);
+
+const adminTokensSchema = z.array(
+  z.object({
+    token: z.string().min(16, "each admin token needs at least 16 characters"),
+    scopes: z.array(z.enum(["reindex", "keeper", "indexer", "*"])).nonempty().optional(),
+    expiresAt: z.number().int().positive().optional(),
+  }),
 );
 
 const schema = z.object({
@@ -88,6 +101,10 @@ const schema = z.object({
           .refine(StrKey.isValidEd25519SecretSeed, "must be a valid Stellar secret seed"),
       ),
     ),
+  /** Use charge_many when the deployed contract supports it. */
+  KEEPER_BATCH: z.string().default("true").transform((v) => v === "true"),
+  /** Mandates per batch transaction, bounded by the contract's supported list size. */
+  KEEPER_BATCH_SIZE: z.coerce.number().int().min(2).max(25).default(10),
   KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   /**
    * Which due mandate to settle first: `oldest` (due date ascending, the
@@ -95,6 +112,21 @@ const schema = z.object({
    * high-value mandates under a fee budget).
    */
   KEEPER_ORDER: z.enum(["oldest", "largest"]).default("oldest"),
+  /**
+   * Only settle mandates payable to these merchants, comma-separated
+   * `G...` addresses. Empty (the default) settles every merchant's mandates,
+   * so an operator running a keeper for their own business can stop paying
+   * fees for everyone else's.
+   */
+  KEEPER_MERCHANTS: z
+    .string()
+    .default("")
+    .transform((raw) => [...new Set(raw.split(",").map((part) => part.trim()).filter(Boolean))])
+    .pipe(
+      z.array(
+        z.string().refine(StrKey.isValidEd25519PublicKey, "must be a valid Stellar account address"),
+      ),
+    ),
   KEEPER_FEE_PERCENTILE: z.enum(["50", "60", "70", "80", "90", "95", "99"]).default("90"),
   KEEPER_MAX_FEE: z.coerce
     .bigint()
@@ -173,13 +205,69 @@ const schema = z.object({
   // variable blank, and a container that reads it must not refuse to start
   // over a URL that is not there.
   OTEL_EXPORTER_OTLP_ENDPOINT: z
-    .union([z.literal(""), z.string().url()])
+    .union([z.literal(""), z.url()])
     .optional()
     .transform((value) => (value === "" ? undefined : value)),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
 
   ADMIN_TOKEN: z.string().optional(),
+  /**
+   * Scoped operator tokens, as a JSON array of
+   * `{ "token": "...", "scopes": ["reindex" | "keeper" | "indexer" | "*"], "expiresAt": <unix seconds> }`.
+   * `scopes` defaults to all; `expiresAt` is optional. `ADMIN_TOKEN` keeps
+   * working as a full-access token with no expiry.
+   */
+  ADMIN_TOKENS: z
+    .string()
+    .optional()
+    .transform((raw, ctx) => {
+      if (!raw || !raw.trim()) return [];
+      try {
+        const parsed = adminTokensSchema.parse(JSON.parse(raw));
+        return parsed;
+      } catch (err) {
+        ctx.addIssue({ code: "custom", message: `ADMIN_TOKENS must be a JSON array of tokens (${err instanceof Error ? err.message.slice(0, 120) : "invalid"})` });
+        return z.NEVER;
+      }
+    }),
 
+  /**
+   * How long a rotated webhook secret keeps signing deliveries beside the new
+   * one, in seconds. During the overlap every delivery carries both
+   * signatures, so a receiver can switch secrets without a gap; 0 drops the
+   * old secret at once (a leak). At most seven days.
+   */
+  WEBHOOK_SECRET_OVERLAP_S: z.coerce.number().int().min(0).max(604_800).default(86_400),
+
+  /**
+   * SEP-10 sign-in (`GET`/`POST /api/auth`). The server account's secret seed
+   * signs challenge transactions; its public key is the `SIGNING_KEY` the
+   * home domain's stellar.toml publishes. Leave empty to disable sign-in.
+   */
+  SEP10_SIGNING_KEY: optionalSecret,
+  /** HMAC-SHA256 key for the issued JWTs; at least 32 characters. */
+  SEP10_JWT_SECRET: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || value.length >= 32, "must be at least 32 characters"),
+  /**
+   * The home domain clients authenticate to: the challenge's first operation
+   * is keyed `<home domain> auth`, which a manage data key caps at 64 bytes.
+   */
+  SEP10_HOME_DOMAIN: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || isDomain(value, 59), "must be a domain of at most 59 characters"),
+  /** The domain serving the auth endpoint; defaults to SEP10_HOME_DOMAIN. */
+  SEP10_WEB_AUTH_DOMAIN: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || isDomain(value, 64), "must be a domain of at most 64 characters"),
+  /** Lifetime of an issued JWT in seconds; short-lived by design. */
+  SEP10_JWT_TTL_S: z.coerce.number().int().min(60).max(86_400).default(3_600),
 });
 
 export type Config = z.infer<typeof schema>;
@@ -216,6 +304,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (parsed.data.KEEPER_ENABLED && !parsed.data.KEEPER_SECRET) {
     throw new Error("KEEPER_ENABLED=true requires KEEPER_SECRET to be set");
+  }
+  if (
+    parsed.data.SEP10_SIGNING_KEY &&
+    (!parsed.data.SEP10_JWT_SECRET || !parsed.data.SEP10_HOME_DOMAIN)
+  ) {
+    throw new Error("SEP10_SIGNING_KEY requires SEP10_JWT_SECRET and SEP10_HOME_DOMAIN to be set");
   }
   return parsed.data;
 }
@@ -266,7 +360,7 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
 function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): NetworkConfig {
   const prefix = name.toUpperCase().replace(/-/g, "_");
   const schema = z.object({
-    [`${prefix}_SOROBAN_RPC_URL`]: z.string().url(),
+    [`${prefix}_SOROBAN_RPC_URL`]: z.url(),
     [`${prefix}_NETWORK_PASSPHRASE`]: z.string().min(1),
     [`${prefix}_PLAN_REGISTRY_ID`]: contractId,
     [`${prefix}_VAULT_ID`]: contractId,

@@ -153,6 +153,7 @@ function fakeRpc(
     },
     getAccount: async (address: string) => new Account(address, "1") as never,
     getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
+    getLedgerEntries: async () => ({ entries: [], latestLedger: chain.latest }) as never,
     prepareTransaction: async (tx) => {
       prepared.push(tx as Transaction);
       return tx as Transaction;

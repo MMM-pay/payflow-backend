@@ -1923,3 +1923,444 @@ describe("request validation", () => {
     assert.equal((unfiltered.body.plans as unknown[]).length, 1);
   });
 });
+
+/** Serve one projection on a random port, for a block that seeds its own. */
+async function serveDb(database: ReturnType<typeof openDatabase>): Promise<{
+  get: <T = Record<string, unknown>>(path: string) => Promise<{ status: number; body: T }>;
+  close: () => void;
+}> {
+  const app = createApp(database, config);
+  const listening = await new Promise<Server>((resolve) => {
+    const s = app.listen(0, () => resolve(s));
+  });
+  const addr = listening.address();
+  const root = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+  return {
+    get: async <T = Record<string, unknown>>(path: string) => {
+      const res = await fetch(root + path);
+      return { status: res.status, body: (await res.json()) as T };
+    },
+    close: () => listening.close(),
+  };
+}
+
+type ErrorBody = { error: { code: string; details?: { path: string }[] } };
+
+describe("protocol fee revenue over time", () => {
+  const feeDb = openDatabase(":memory:");
+  const feeIx = new Indexer(feeDb, {} as never, {} as never);
+  const MERCHANT_A = testAddress(60);
+  const MERCHANT_B = testAddress(61);
+  const SUB = testAddress(62);
+  let api: Awaited<ReturnType<typeof serveDb>>;
+
+  const at = (month: number, day: number, hour: number) =>
+    Math.floor(Date.UTC(2025, month, day, hour) / 1000);
+
+  /** A charge stamped with its ledger's close time, as the decoder sets it. */
+  const charge = (mandate: bigint, merchant: string, fee: bigint, tx: string, closeTime: number): DecodedEvent => ({
+    name: "charged", contractId: "C", ledger: 1, txHash: tx, closeTime,
+    topics: [mandate, SUB, merchant],
+    data: { amount: 1_000_000n, fee, charges_made: 1n, next_charge: 4_000_000_000n },
+  });
+
+  // Across two merchants: the report is protocol-wide. 2025-03-10 is a Monday.
+  const CHARGES = [
+    charge(1n, MERCHANT_A, 100_000n, "fee-a", at(2, 10, 12)),
+    charge(2n, MERCHANT_B, 50_000n, "fee-b", at(2, 10, 18)),
+    charge(1n, MERCHANT_A, 25_000n, "fee-c", at(2, 12, 12)),
+    charge(2n, MERCHANT_B, 10_000n, "fee-d", at(3, 2, 9)),
+  ];
+
+  /** The sum of every charge fee the projection holds, as bigint. */
+  const sumOfChargeFees = () =>
+    (feeDb.prepare("SELECT fee FROM charges").all() as { fee: string }[]).reduce(
+      (total, row) => total + BigInt(row.fee),
+      0n,
+    );
+
+  type Fees = {
+    bucket: string;
+    buckets: { bucket: string; fee: string; charges: number }[];
+    totals: { fee: string; charges: number };
+  };
+
+  before(async () => {
+    for (const e of CHARGES) feeIx.apply(e);
+    api = await serveDb(feeDb);
+  });
+
+  after(() => {
+    api.close();
+    feeDb.close();
+  });
+
+  test("the totals match the sum of the charge fees", async () => {
+    for (const bucket of ["day", "week", "month"]) {
+      const { status, body } = await api.get<Fees>(`/api/protocol/fees?bucket=${bucket}`);
+      assert.equal(status, 200);
+      assert.equal(body.totals.fee, String(sumOfChargeFees()), `${bucket} totals`);
+      assert.equal(body.totals.fee, "185000");
+      assert.equal(body.totals.charges, CHARGES.length);
+      const perBucket = body.buckets.reduce((total, b) => total + BigInt(b.fee), 0n);
+      assert.equal(perBucket, 185_000n, `${bucket} buckets add up to the total`);
+    }
+  });
+
+  test("day buckets follow the ledger close time and fill the gaps", async () => {
+    const { body } = await api.get<Fees>("/api/protocol/fees?bucket=day");
+    assert.equal(body.bucket, "day");
+    // 2025-03-10 through 2025-04-02, every day present.
+    assert.equal(body.buckets.length, 24);
+    assert.deepEqual(body.buckets[0], { bucket: "2025-03-10", fee: "150000", charges: 2 });
+    assert.deepEqual(body.buckets[1], { bucket: "2025-03-11", fee: "0", charges: 0 });
+    assert.deepEqual(body.buckets[2], { bucket: "2025-03-12", fee: "25000", charges: 1 });
+    assert.deepEqual(body.buckets.at(-1), { bucket: "2025-04-02", fee: "10000", charges: 1 });
+    for (const b of body.buckets) assert.equal(typeof b.fee, "string", "a fee is never a JSON number");
+  });
+
+  test("week and month buckets are calendar periods in UTC", async () => {
+    const week = await api.get<Fees>("/api/protocol/fees?bucket=week");
+    assert.deepEqual(
+      week.body.buckets.map((b) => [b.bucket, b.fee]),
+      [["2025-03-10", "175000"], ["2025-03-17", "0"], ["2025-03-24", "0"], ["2025-03-31", "10000"]],
+    );
+    const month = await api.get<Fees>("/api/protocol/fees?bucket=month");
+    assert.deepEqual(
+      month.body.buckets.map((b) => [b.bucket, b.fee]),
+      [["2025-03", "175000"], ["2025-04", "10000"]],
+    );
+  });
+
+  test("bucket defaults to month", async () => {
+    const { body } = await api.get<Fees>("/api/protocol/fees");
+    assert.equal(body.bucket, "month");
+  });
+
+  test("limit keeps the most recent buckets, ending with the newest charge", async () => {
+    const days = await api.get<Fees>("/api/protocol/fees?bucket=day&limit=2");
+    assert.deepEqual(days.body.buckets, [
+      { bucket: "2025-04-01", fee: "0", charges: 0 },
+      { bucket: "2025-04-02", fee: "10000", charges: 1 },
+    ]);
+    assert.deepEqual(days.body.totals, { fee: "10000", charges: 1 });
+
+    const months = await api.get<Fees>("/api/protocol/fees?bucket=month&limit=1");
+    assert.deepEqual(months.body.buckets, [{ bucket: "2025-04", fee: "10000", charges: 1 }]);
+  });
+
+  test("replaying the charges leaves the report unchanged", async () => {
+    const before = await api.get<Fees>("/api/protocol/fees?bucket=day");
+    for (const e of CHARGES) feeIx.apply(e);
+    const after = await api.get<Fees>("/api/protocol/fees?bucket=day");
+    assert.deepEqual(after.body, before.body);
+  });
+
+  test("a bad bucket or limit is refused", async () => {
+    for (const query of ["bucket=year", "limit=0", "limit=lots"]) {
+      const { status, body } = await api.get<ErrorBody>(`/api/protocol/fees?${query}`);
+      assert.equal(status, 400, query);
+      assert.equal(body.error.code, "invalid_request");
+    }
+  });
+
+  test("no charges means no buckets and a zero total", async () => {
+    const emptyDb = openDatabase(":memory:");
+    const empty = await serveDb(emptyDb);
+    try {
+      const { status, body } = await empty.get<Fees>("/api/protocol/fees?bucket=day");
+      assert.equal(status, 200);
+      assert.deepEqual(body, { bucket: "day", buckets: [], totals: { fee: "0", charges: 0 } });
+    } finally {
+      empty.close();
+      emptyDb.close();
+    }
+  });
+});
+
+describe("most popular plans", () => {
+  const popDb = openDatabase(":memory:");
+  const popIx = new Indexer(popDb, {} as never, {} as never);
+  const MERCHANT_A = testAddress(70);
+  const MERCHANT_B = testAddress(71);
+  let api: Awaited<ReturnType<typeof serveDb>>;
+
+  type Plans = { plans: { id: number; merchantName: string | null }[]; nextCursor: string | null };
+
+  before(async () => {
+    const plan = (id: bigint, merchant: string) =>
+      popIx.apply(ev("plan_created", [merchant, id], { token: "C", amount: 1_000n, period: 2_592_000n }, `plan-${id}`));
+    let mandate = 0n;
+    const subscriberOf = (id: bigint) => testAddress(80 + Number(id));
+    const subscribe = (planId: bigint, merchant: string) => {
+      mandate += 1n;
+      popIx.apply(ev("subscribed", [mandate, subscriberOf(mandate), merchant], {
+        plan_id: planId, amount: 1_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
+      }, `sub-${mandate}`));
+      return mandate;
+    };
+    plan(1n, MERCHANT_A);
+    plan(2n, MERCHANT_A);
+    plan(3n, MERCHANT_A);
+    plan(4n, MERCHANT_B);
+    plan(5n, MERCHANT_B);
+    // Active mandates per plan: 1 → 1, 2 → 3, 3 → 1 (+1 cancelled),
+    // 4 → 1 (+1 paused), 5 → 0 (1 cancelled).
+    subscribe(1n, MERCHANT_A);
+    subscribe(2n, MERCHANT_A);
+    subscribe(2n, MERCHANT_A);
+    subscribe(2n, MERCHANT_A);
+    subscribe(3n, MERCHANT_A);
+    const cancelled3 = subscribe(3n, MERCHANT_A);
+    subscribe(4n, MERCHANT_B);
+    const paused4 = subscribe(4n, MERCHANT_B);
+    const cancelled5 = subscribe(5n, MERCHANT_B);
+    popIx.apply(ev("cancelled", [cancelled3, subscriberOf(cancelled3)], {}, "cancel-3"));
+    popIx.apply(ev("cancelled", [cancelled5, subscriberOf(cancelled5)], {}, "cancel-5"));
+    popIx.apply(ev("pause_changed", [paused4, subscriberOf(paused4)], { paused: true }, "pause-4"));
+    api = await serveDb(popDb);
+  });
+
+  after(() => {
+    api.close();
+    popDb.close();
+  });
+
+  test("ranks plans by active mandates, ties broken by plan id", async () => {
+    const { status, body } = await api.get<Plans>("/api/plans?sort=subscribers");
+    assert.equal(status, 200);
+    // Plans 1, 3 and 4 tie at one active mandate; cancelled and paused
+    // mandates do not count, so plan 5 ranks last with none.
+    assert.deepEqual(body.plans.map((p) => p.id), [2, 1, 3, 4, 5]);
+    assert.equal(body.nextCursor, null);
+  });
+
+  test("honours limit and the merchant filter", async () => {
+    const top = await api.get<Plans>("/api/plans?sort=subscribers&limit=2");
+    assert.deepEqual(top.body.plans.map((p) => p.id), [2, 1]);
+
+    const merchantB = await api.get<Plans>(`/api/plans?sort=subscribers&merchant=${MERCHANT_B}`);
+    assert.deepEqual(merchantB.body.plans.map((p) => p.id), [4, 5]);
+  });
+
+  test("without sort the order is still newest first", async () => {
+    const { body } = await api.get<Plans>("/api/plans");
+    assert.deepEqual(body.plans.map((p) => p.id), [5, 4, 3, 2, 1]);
+  });
+
+  test("a cursor cannot be combined with the ranking", async () => {
+    const { status, body } = await api.get<ErrorBody>(
+      `/api/plans?sort=subscribers&cursor=${encodeCursor(3)}`,
+    );
+    assert.equal(status, 400);
+    assert.equal(body.error.code, "invalid_request");
+    assert.equal(body.error.details?.[0]?.path, "cursor");
+  });
+
+  test("an unknown sort is refused", async () => {
+    const { status, body } = await api.get<ErrorBody>("/api/plans?sort=revenue");
+    assert.equal(status, 400);
+    assert.equal(body.error.details?.[0]?.path, "sort");
+  });
+});
+
+describe("merchant profiles", () => {
+  const profDb = openDatabase(":memory:");
+  const profIx = new Indexer(profDb, {} as never, {} as never);
+  const NAMED = testAddress(90);
+  const UNNAMED = testAddress(91);
+  let api: Awaited<ReturnType<typeof serveDb>>;
+
+  before(async () => {
+    profIx.apply(ev("plan_created", [NAMED, 1n], { token: "C", amount: 1_000n, period: 60n }, "p1"));
+    profIx.apply(ev("plan_created", [UNNAMED, 2n], { token: "C", amount: 1_000n, period: 60n }, "p2"));
+    profIx.apply({
+      ...ev("profile_updated", [NAMED], { name: "Acme", url: "https://acme.example" }, "profile-1"),
+      ledger: 7,
+    });
+    api = await serveDb(profDb);
+  });
+
+  after(() => {
+    api.close();
+    profDb.close();
+  });
+
+  test("serves the self-declared profile", async () => {
+    const { status, body } = await api.get(`/api/merchants/${NAMED}/profile`);
+    assert.equal(status, 200);
+    assert.deepEqual(body, { merchant: NAMED, name: "Acme", url: "https://acme.example", ledger: 7 });
+  });
+
+  test("a merchant without a profile is 404 profile_not_found", async () => {
+    const { status, body } = await api.get<ErrorBody>(`/api/merchants/${UNNAMED}/profile`);
+    assert.equal(status, 404);
+    assert.equal(body.error.code, "profile_not_found");
+  });
+
+  test("a malformed address is refused", async () => {
+    const { status, body } = await api.get<ErrorBody>("/api/merchants/not-an-address/profile");
+    assert.equal(status, 400);
+    assert.equal(body.error.code, "invalid_request");
+  });
+
+  test("plan responses carry the merchant's profile name", async () => {
+    const list = await api.get<{ plans: { id: number; merchantName: string | null }[] }>("/api/plans");
+    assert.deepEqual(
+      list.body.plans.map((p) => [p.id, p.merchantName]),
+      [[2, null], [1, "Acme"]],
+    );
+    const one = await api.get("/api/plans/1");
+    assert.equal(one.body.merchantName, "Acme");
+    const ranked = await api.get<{ plans: { id: number; merchantName: string | null }[] }>(
+      "/api/plans?sort=subscribers",
+    );
+    assert.deepEqual(
+      ranked.body.plans.map((p) => [p.id, p.merchantName]),
+      [[1, "Acme"], [2, null]],
+    );
+  });
+});
+
+describe("merchant unpaid report", () => {
+  const MERCHANT_U = testAddress(100);
+  const MERCHANT_O = testAddress(101);
+  const S1 = testAddress(102);
+  const S2 = testAddress(103);
+  const S3 = testAddress(104);
+  const S4 = testAddress(105);
+  const S5 = testAddress(106);
+  const unpaidDb = openDatabase(":memory:");
+  const unpaidIx = new Indexer(unpaidDb, {} as never, {} as never);
+  let api: Awaited<ReturnType<typeof serveDb>>;
+
+  type Unpaid = {
+    merchant: string;
+    now: number;
+    unpaid: {
+      id: number;
+      subscriber: string;
+      next_charge: number;
+      amount: string;
+      balance: string;
+      shortfall: string;
+      overdue_seconds: number;
+    }[];
+  };
+
+  const subscribe = (
+    ix: Indexer,
+    id: bigint,
+    subscriber: string,
+    merchant: string,
+    planId: bigint,
+    amount: bigint,
+    nextCharge: number,
+  ) =>
+    ix.apply(ev("subscribed", [id, subscriber, merchant], {
+      plan_id: planId, amount, period: 2_592_000n, next_charge: BigInt(nextCharge),
+    }, `sub-${id}`));
+  const deposit = (ix: Indexer, subscriber: string, token: string, balance: bigint, tx: string) =>
+    ix.apply(ev("deposit", [subscriber, token], { amount: balance, balance }, tx));
+
+  before(async () => {
+    unpaidIx.apply(ev("plan_created", [MERCHANT_U, 1n], { token: "CTOKEN", amount: 1n, period: 2_592_000n }, "plan-1"));
+    unpaidIx.apply(ev("plan_created", [MERCHANT_O, 2n], { token: "CTOKEN", amount: 1n, period: 2_592_000n }, "plan-2"));
+    // 1: due an hour, the vault holds 4 of the 10 it needs → unpaid.
+    subscribe(unpaidIx, 1n, S1, MERCHANT_U, 1n, 10_000_000n, NOW - 3_600);
+    deposit(unpaidIx, S1, "CTOKEN", 4_000_000n, "dep-1");
+    // 2: due a day, nothing indexed for the subscriber → unpaid, balance 0.
+    subscribe(unpaidIx, 2n, S2, MERCHANT_U, 1n, 5_000_000n, NOW - 86_400);
+    // 3: due, covered by the vault → funded, not in the report.
+    subscribe(unpaidIx, 3n, S3, MERCHANT_U, 1n, 1_000_000n, NOW - 7_200);
+    deposit(unpaidIx, S3, "CTOKEN", 2_000_000n, "dep-3");
+    // 4: not due yet.
+    subscribe(unpaidIx, 4n, S1, MERCHANT_U, 1n, 99_000_000n, NOW + 3_600);
+    // 5: another merchant's unpaid mandate.
+    subscribe(unpaidIx, 5n, S2, MERCHANT_O, 2n, 5_000_000n, NOW - 86_400);
+    // 6: due as long as mandate 2; the balance is in another token, which
+    // does not pay this plan → unpaid, tied with 2 on time overdue.
+    subscribe(unpaidIx, 6n, S4, MERCHANT_U, 1n, 3_000_000n, NOW - 86_400);
+    deposit(unpaidIx, S4, "COTHER", 50_000_000n, "dep-6");
+    // 7: due and unfunded, but cancelled → no longer chargeable.
+    subscribe(unpaidIx, 7n, S5, MERCHANT_U, 1n, 3_000_000n, NOW - 86_400);
+    unpaidIx.apply(ev("cancelled", [7n, S5], {}, "cancel-7"));
+    api = await serveDb(unpaidDb);
+  });
+
+  after(() => {
+    api.close();
+    unpaidDb.close();
+  });
+
+  test("lists the unfunded due mandates, longest overdue first, ties by id", async () => {
+    const { status, body } = await api.get<Unpaid>(`/api/merchants/${MERCHANT_U}/unpaid`);
+    assert.equal(status, 200);
+    assert.equal(body.merchant, MERCHANT_U);
+    assert.deepEqual(body.unpaid.map((m) => m.id), [2, 6, 1]);
+    const overdue = body.unpaid.map((m) => m.overdue_seconds);
+    assert.deepEqual(overdue, [...overdue].sort((a, b) => b - a), "sorted by time overdue");
+    for (const m of body.unpaid) {
+      assert.equal(m.overdue_seconds, body.now - m.next_charge);
+    }
+  });
+
+  test("reports the balance and the shortfall as bigint-exact strings", async () => {
+    const { body } = await api.get<Unpaid>(`/api/merchants/${MERCHANT_U}/unpaid`);
+    const byId = new Map(body.unpaid.map((m) => [m.id, m]));
+    assert.deepEqual(
+      [byId.get(1)!.amount, byId.get(1)!.balance, byId.get(1)!.shortfall],
+      ["10000000", "4000000", "6000000"],
+    );
+    assert.deepEqual([byId.get(2)!.balance, byId.get(2)!.shortfall], ["0", "5000000"]);
+    assert.deepEqual([byId.get(6)!.balance, byId.get(6)!.shortfall], ["0", "3000000"]);
+  });
+
+  test("is exactly the merchant's /due rows with funded: false", async () => {
+    const due = await api.get<{ due: { id: number; merchant: string; funded: boolean }[] }>("/api/due");
+    const unfunded = due.body.due
+      .filter((m) => m.merchant === MERCHANT_U && !m.funded)
+      .map((m) => m.id)
+      .sort((a, b) => a - b);
+    const { body } = await api.get<Unpaid>(`/api/merchants/${MERCHANT_U}/unpaid`);
+    assert.deepEqual(body.unpaid.map((m) => m.id).sort((a, b) => a - b), unfunded);
+  });
+
+  test("honours limit", async () => {
+    const { body } = await api.get<Unpaid>(`/api/merchants/${MERCHANT_U}/unpaid?limit=1`);
+    assert.deepEqual(body.unpaid.map((m) => m.id), [2]);
+  });
+
+  test("a merchant with nothing unpaid gets an empty list; a bad address is refused", async () => {
+    const empty = await api.get<Unpaid>(`/api/merchants/${UNKNOWN_MERCHANT}/unpaid`);
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.body.unpaid, []);
+    const bad = await api.get<ErrorBody>("/api/merchants/nope/unpaid");
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error.code, "invalid_request");
+  });
+
+  test("finds unpaid mandates behind more than one page of funded ones", async () => {
+    const pageDb = openDatabase(":memory:");
+    const pageIx = new Indexer(pageDb, {} as never, {} as never);
+    const RICH = testAddress(110);
+    const BROKE = testAddress(111);
+    pageIx.apply(ev("plan_created", [MERCHANT_U, 1n], { token: "CTOKEN", amount: 1n, period: 2_592_000n }, "plan-1"));
+    deposit(pageIx, RICH, "CTOKEN", 10_000_000n, "dep-rich");
+    // 250 funded mandates fall due first, so the unpaid ones sit past the
+    // first page of the walk; the two unpaid ones tie on next_charge.
+    for (let i = 1; i <= 250; i += 1) {
+      subscribe(pageIx, BigInt(i), RICH, MERCHANT_U, 1n, 1n, NOW - 100_000 + i);
+    }
+    subscribe(pageIx, 251n, BROKE, MERCHANT_U, 1n, 1n, NOW - 10);
+    subscribe(pageIx, 252n, BROKE, MERCHANT_U, 1n, 1n, NOW - 10);
+    const paged = await serveDb(pageDb);
+    try {
+      const { body } = await paged.get<Unpaid>(`/api/merchants/${MERCHANT_U}/unpaid`);
+      assert.deepEqual(body.unpaid.map((m) => m.id), [251, 252]);
+    } finally {
+      paged.close();
+      pageDb.close();
+    }
+  });
+});

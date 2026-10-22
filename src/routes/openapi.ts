@@ -227,6 +227,59 @@ const invalidRequest = (): ResponseObject =>
     'A query or path parameter is not valid; error.code = "invalid_request" and error.details names the parameter.',
   );
 
+/** How a merchant-only route is authorised, for its description. */
+const MERCHANT_PROOF = (message: string): string =>
+  `The caller proves control of the merchant address with an ed25519 signature over \`${message}\` (\`merchant\`, \`timestamp\`, \`signature\`), or with a SEP-10 JWT from \`/api/auth\` as \`Authorization: Bearer <token>\`, in which case \`merchant\` is the token's account and may be omitted.`;
+
+/** The `{ merchant, timestamp, signature }` proof of a merchant-only POST. */
+const merchantProofBody = (message: string): NonNullable<OperationObject["requestBody"]> => ({
+  required: false,
+  content: {
+    "application/json": {
+      schema: {
+        type: "object",
+        description: `Omitted under a SEP-10 bearer token. The signature is over \`${message}\`.`,
+        properties: {
+          merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+          timestamp: { type: "integer", description: "Unix seconds. Signatures older than ten minutes are refused." },
+          signature: { type: "string", description: `Base64-encoded ed25519 signature of \`${message}\`.` },
+        },
+      },
+    },
+  },
+});
+
+/** The same proof, as query parameters of a merchant-only GET. */
+const merchantProofQuery = (message: string): ParameterObject[] => [
+  { name: "merchant", in: "query", required: false, description: ADDRESS_DESCRIPTION, schema: { type: "string" } },
+  {
+    name: "timestamp",
+    in: "query",
+    required: false,
+    description: "Unix seconds. Signatures older than ten minutes are refused.",
+    schema: { type: "integer", minimum: 0 },
+  },
+  {
+    name: "signature",
+    in: "query",
+    required: false,
+    description: `Base64-encoded ed25519 signature of \`${message}\`. All three are required without a bearer token.`,
+    schema: { type: "string" },
+  },
+];
+
+/** A path parameter holding a webhook id. */
+const webhookIdParameter = (): ParameterObject => ({
+  name: "id",
+  in: "path",
+  required: true,
+  description: "The webhook id returned at registration.",
+  schema: { type: "integer", minimum: 1 },
+});
+
+const unauthorizedProof = (): ResponseObject =>
+  errorResponse('The signature is wrong, malformed or older than ten minutes, or the bearer token is invalid or expired (error.code = "unauthorized").');
+
 /**
  * The paths of the read API, mounted under `root`.
  *
@@ -241,9 +294,21 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["plans"],
         summary: "List published plans",
         description:
-          "Plans a merchant has published, newest first. Each amount is a decimal string in the plan's token's smallest unit.",
+          "Plans a merchant has published, newest first. Each amount is a decimal string in the plan's token's smallest unit. With `sort=subscribers` the plans are ranked by active mandates instead, most first, ties broken by plan id ascending: one page of `limit` plans, so `nextCursor` is null and `cursor` is refused.",
         operationId: `listPlans${operationSuffix(root)}`,
-        parameters: [merchantParameter(), cursorParameter(), limitParameter()],
+        parameters: [
+          merchantParameter(),
+          cursorParameter(),
+          limitParameter(),
+          {
+            name: "sort",
+            in: "query",
+            required: false,
+            description:
+              "`subscribers` ranks the plans by active mandates, most first, ties broken by plan id ascending. Absent: newest first.",
+            schema: { type: "string", enum: ["subscribers"] },
+          },
+        ],
         responses: {
           "200": {
             description: "The plans.",
@@ -379,6 +444,47 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/mandates/{id}/timeline")]: {
+      get: {
+        tags: ["mandates"],
+        summary: "A mandate's complete lifecycle timeline",
+        description: "Subscription, charge, pause/resume, cancellation, ending and completion events in ascending ledger order. Amounts and fees are decimal strings.",
+        operationId: `listMandateTimeline${operationSuffix(root)}`,
+        parameters: [idParameter()],
+        responses: {
+          "200": {
+            description: "The mandate's ordered lifecycle events.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    events: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          mandateId: { type: "integer" },
+                          txHash: { type: "string" },
+                          kind: { type: "string", enum: ["subscribed", "charged", "pause_changed", "cancelled", "mandate_ended", "mandate_completed"] },
+                          ledger: { type: "integer" },
+                          at: { type: ["integer", "null"], description: "Ledger close time in Unix seconds." },
+                          details: { type: "object", additionalProperties: { type: ["string", "boolean"] } },
+                        },
+                        required: ["mandateId", "txHash", "kind", "ledger", "at", "details"],
+                      },
+                    },
+                  },
+                  required: ["events"],
+                },
+              },
+            },
+          },
+          "400": invalidRequest(),
+          "404": notFound("mandate_not_found", "mandate"),
+        },
+      },
+    },
     [p("/mandates/{id}/charges")]: {
       get: {
         tags: ["mandates"],
@@ -434,6 +540,206 @@ function apiPaths(root: string): Record<string, PathItemObject> {
           "429": errorResponse('The per-IP rate limit was reached (error.code = "rate_limited").'),
         },
       },
+      get: {
+        tags: ["webhooks"],
+        summary: "List a merchant's webhooks",
+        description:
+          "The merchant's registered webhooks, newest first, including ones that gave up after failed deliveries. Secrets are never returned, only their last four characters. The caller proves control of the merchant address with an ed25519 signature over `payflow-webhook-list:v1:<merchant>:<timestamp>`.",
+        operationId: `listWebhooks${operationSuffix(root)}`,
+        parameters: [
+          {
+            name: "merchant",
+            in: "query",
+            required: true,
+            description: ADDRESS_DESCRIPTION,
+            schema: { type: "string" },
+          },
+          {
+            name: "timestamp",
+            in: "query",
+            required: true,
+            description: "Unix seconds. Signatures older than ten minutes are refused.",
+            schema: { type: "integer", minimum: 0 },
+          },
+          {
+            name: "signature",
+            in: "query",
+            required: true,
+            description: "Base64-encoded ed25519 signature of `payflow-webhook-list:v1:<merchant>:<timestamp>`.",
+            schema: { type: "string" },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "The merchant's webhooks.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+                    webhooks: { type: "array", items: { $ref: "#/components/schemas/WebhookSummary" } },
+                  },
+                  required: ["merchant", "webhooks"],
+                },
+              },
+            },
+          },
+          "400": invalidRequest(),
+          "401": errorResponse('The signature is wrong, malformed or older than ten minutes (error.code = "unauthorized").'),
+        },
+      },
+    },
+    [p("/webhooks/{id}")]: {
+      delete: {
+        tags: ["webhooks"],
+        summary: "Delete a webhook",
+        description:
+          "Removes one of the merchant's webhooks: it receives no further deliveries, and retries already scheduled are dropped. The caller proves control of the merchant address with an ed25519 signature over `payflow-webhook-delete:v1:<merchant>:<id>:<timestamp>`, sent as a JSON body or, for clients that cannot send a DELETE body, as `merchant`, `timestamp` and `signature` query parameters.",
+        operationId: `deleteWebhook${operationSuffix(root)}`,
+        parameters: [
+          {
+            name: "id",
+            in: "path",
+            required: true,
+            description: "The webhook id returned at registration.",
+            schema: { type: "integer", minimum: 1 },
+          },
+        ],
+        requestBody: {
+          required: false,
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/WebhookDeleteRequest" },
+            },
+          },
+        },
+        responses: {
+          "204": { description: "The webhook was deleted." },
+          "400": invalidRequest(),
+          "401": errorResponse('The signature is wrong, malformed or older than ten minutes (error.code = "unauthorized").'),
+          "404": errorResponse('No active webhook with that id belongs to the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/webhooks/{id}/rotate")]: {
+      post: {
+        tags: ["webhooks"],
+        summary: "Rotate a webhook's signing secret",
+        description:
+          "Replaces the webhook's HMAC secret and returns the new one, this once. Until `previousSecretExpiresAt` (WEBHOOK_SECRET_OVERLAP_S after the rotation) every delivery carries two signatures, `Payflow-Signature: sha256=<new>, sha256=<old>`, so the receiver can switch secrets without missing a delivery; afterwards only the new secret signs. " +
+          MERCHANT_PROOF("payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>"),
+        operationId: `rotateWebhookSecret${operationSuffix(root)}`,
+        parameters: [webhookIdParameter()],
+        requestBody: merchantProofBody("payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>"),
+        responses: {
+          "200": {
+            description: "The new secret.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/WebhookRotation" } } },
+          },
+          "400": invalidRequest(),
+          "401": unauthorizedProof(),
+          "404": errorResponse('No active webhook with that id belongs to the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/webhooks/{id}/test")]: {
+      post: {
+        tags: ["webhooks"],
+        summary: "Send a webhook a test event",
+        description:
+          "Delivers `{ \"event\": \"ping\", \"webhook_id\", \"merchant\" }` through the normal delivery path — the same headers and signatures as a charge, and the same backoff retries when it fails — and answers with the first attempt's outcome. " +
+          MERCHANT_PROOF("payflow-webhook-test:v1:<merchant>:<id>:<timestamp>"),
+        operationId: `testWebhook${operationSuffix(root)}`,
+        parameters: [webhookIdParameter()],
+        requestBody: merchantProofBody("payflow-webhook-test:v1:<merchant>:<id>:<timestamp>"),
+        responses: {
+          "200": {
+            description: "How the first attempt went; a failed one is `pending` with its retry time.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/WebhookTestResult" } } },
+          },
+          "400": invalidRequest(),
+          "401": unauthorizedProof(),
+          "404": errorResponse('No webhook with that id is receiving deliveries for the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/webhooks/{id}/deliveries")]: {
+      get: {
+        tags: ["webhooks"],
+        summary: "A webhook's delivery history",
+        description:
+          "The webhook's last 100 delivery attempts, newest first; a delivery that failed and was retried shows every attempt. A deleted webhook keeps its history. " +
+          MERCHANT_PROOF("payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>"),
+        operationId: `listWebhookDeliveries${operationSuffix(root)}`,
+        parameters: [webhookIdParameter(), ...merchantProofQuery("payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>")],
+        responses: {
+          "200": {
+            description: "The attempts.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    webhookId: { type: "integer" },
+                    deliveries: { type: "array", items: { $ref: "#/components/schemas/WebhookDelivery" } },
+                  },
+                  required: ["webhookId", "deliveries"],
+                },
+              },
+            },
+          },
+          "400": invalidRequest(),
+          "401": unauthorizedProof(),
+          "404": errorResponse('No webhook with that id belongs to the merchant (error.code = "not_found").'),
+        },
+      },
+    },
+    [p("/auth")]: {
+      get: {
+        tags: ["auth"],
+        summary: "SEP-10 challenge",
+        description:
+          "A SEP-10 challenge transaction for `account` to sign: sequence number 0, the server account as source, fifteen-minute time bounds, a `<home domain> auth` manage data operation with the account as source and a random nonce, and a `web_auth_domain` operation, signed by the server. `memo` and muxed accounts are not supported; `client_domain` is ignored. Only served when SEP10_SIGNING_KEY is set; every response carries `Access-Control-Allow-Origin: *`.",
+        operationId: `getAuthChallenge${operationSuffix(root)}`,
+        parameters: [
+          { name: "account", in: "query", required: true, description: "The Stellar account (G...) signing in.", schema: { type: "string" } },
+          { name: "home_domain", in: "query", required: false, description: "Must be the configured home domain when given.", schema: { type: "string" } },
+        ],
+        responses: {
+          "200": {
+            description: "The challenge.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AuthChallenge" } } },
+          },
+          "400": invalidRequest(),
+        },
+      },
+      post: {
+        tags: ["auth"],
+        summary: "Exchange a signed SEP-10 challenge for a JWT",
+        description:
+          "Verifies the client-signed challenge — the server's signature, time bounds, home and web auth domains, and the client signatures: an existing account's signers must meet its medium threshold, an account not on the network must sign with its master key — and returns a short-lived HS256 JWT (`iss`, `sub`, `iat`, `exp`, `jti`). Each challenge yields one token. Accepts JSON or `application/x-www-form-urlencoded`.",
+        operationId: `getAuthToken${operationSuffix(root)}`,
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: { transaction: { type: "string", description: "The signed challenge, base64 XDR." } },
+                required: ["transaction"],
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "The token.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AuthToken" } } },
+          },
+          "400": errorResponse('The challenge is malformed, expired, already used, not this server\'s, or not signed with enough weight (error.code = "invalid_request").'),
+        },
+      },
     },
     [p("/due")]: {
       get: {
@@ -476,6 +782,45 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             description: "The merchant's summary.",
             content: {
               "application/json": { schema: { $ref: "#/components/schemas/MerchantSummary" } },
+            },
+          },
+          "400": invalidRequest(),
+        },
+      },
+    },
+    [p("/merchants/{address}/profile")]: {
+      get: {
+        tags: ["merchants"],
+        summary: "A merchant's self-declared profile",
+        description:
+          "The display name and URL the merchant last set through the plan registry's `set_profile`. **Self-declared:** the contract does not verify either value and neither does this API, so treat them as a claim the merchant makes about itself, and treat the URL as untrusted input when rendering it.",
+        operationId: `getMerchantProfile${operationSuffix(root)}`,
+        parameters: [addressParameter()],
+        responses: {
+          "200": {
+            description: "The merchant's self-declared profile.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/MerchantProfile" } },
+            },
+          },
+          "400": invalidRequest(),
+          "404": errorResponse('The merchant has not set a profile (error.code = "profile_not_found").'),
+        },
+      },
+    },
+    [p("/merchants/{address}/unpaid")]: {
+      get: {
+        tags: ["merchants"],
+        summary: "A merchant's unpaid mandates",
+        description:
+          "The merchant's due mandates whose last known vault balance cannot cover the charge (the mandates `/due` reports with `funded: false`), with the shortfall and how long each has been due, longest overdue first, ties broken by mandate id. The balance is the one the indexer last saw, so it can trail the chain.",
+        operationId: `listMerchantUnpaid${operationSuffix(root)}`,
+        parameters: [addressParameter(), limitParameter()],
+        responses: {
+          "200": {
+            description: "The unpaid mandates.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/MerchantUnpaid" } },
             },
           },
           "400": invalidRequest(),
@@ -553,6 +898,39 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             content: {
               "application/json": { schema: { $ref: "#/components/schemas/MerchantRevenue" } },
             },
+          },
+          "400": invalidRequest(),
+        },
+      },
+    },
+    [p("/merchants/{address}/charges.csv")]: {
+      get: {
+        tags: ["merchants"],
+        summary: "Export a merchant's charges as CSV",
+        description:
+          "Every settled charge for the merchant, oldest first, as a CSV download (`Content-Disposition: attachment`). Columns: `date` (ledger close time, ISO 8601 UTC), `mandate`, `subscriber`, `gross` (what the subscriber paid), `fee` (the protocol's share), `net` (what the merchant kept) and `tx_hash`. Amounts are in token units with seven decimals. The range is half-open: a charge exactly at `to` is excluded.",
+        operationId: `exportMerchantCharges${operationSuffix(root)}`,
+        parameters: [
+          addressParameter(),
+          {
+            name: "from",
+            in: "query",
+            required: false,
+            description: "Start of the range, in unix seconds. Unbounded when absent.",
+            schema: { type: "integer", minimum: 0 },
+          },
+          {
+            name: "to",
+            in: "query",
+            required: false,
+            description: "End of the range (exclusive), in unix seconds. Unbounded when absent.",
+            schema: { type: "integer", minimum: 0 },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "The charges, one per row after a header row.",
+            content: { "text/csv": { schema: { type: "string" } } },
           },
           "400": invalidRequest(),
         },
@@ -696,6 +1074,34 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/protocol/fees")]: {
+      get: {
+        tags: ["protocol"],
+        summary: "Protocol fee revenue over time",
+        description:
+          "The fees the protocol collected, summed per calendar bucket of the close time of the ledger each charge was emitted in. The report covers the most recent `limit` buckets (366 by default, at most 1000), ending with the bucket of the newest charge.",
+        operationId: `getProtocolFees${operationSuffix(root)}`,
+        parameters: [
+          bucketParameter(),
+          {
+            name: "limit",
+            in: "query",
+            required: false,
+            description: "How many of the most recent buckets to report. Capped at 1000; a larger value is not an error.",
+            schema: { type: "integer", minimum: 1, maximum: 1000, default: 366 },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "The fee report.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/ProtocolFees" } },
+            },
+          },
+          "400": invalidRequest(),
+        },
+      },
+    },
     [p("/stats")]: {
       get: {
         tags: ["stats"],
@@ -770,6 +1176,44 @@ function operationSuffix(root: string): string {
 /** The paths that do not belong to the read API. */
 function servicePaths(): Record<string, PathItemObject> {
   return {
+    "/version": {
+      get: {
+        tags: ["service"],
+        summary: "Version and build information",
+        description:
+          "The package version, the git commit the deployment was built from (when the host provides it), the Node.js version, when the process started, and the network and contracts it serves. Contains no secrets.",
+        operationId: "getVersion",
+        responses: {
+          "200": {
+            description: "Version information.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    version: { type: "string" },
+                    commit: { type: "string" },
+                    nodeVersion: { type: "string" },
+                    startedAt: { type: "string", format: "date-time" },
+                    network: { type: "string" },
+                    contracts: {
+                      type: "object",
+                      properties: {
+                        planRegistry: { type: "string" },
+                        vault: { type: "string" },
+                        subscription: { type: "string" },
+                      },
+                      required: ["planRegistry", "vault", "subscription"],
+                    },
+                  },
+                  required: ["version", "commit", "nodeVersion", "startedAt", "network", "contracts"],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     "/health": {
       get: {
         tags: ["service"],
@@ -1073,10 +1517,30 @@ function componentSchemas(): Record<string, SchemaObject> {
             period: { type: "integer", description: "The billing period in seconds." },
             active: { type: "integer", description: "1 when the plan is published, 0 when it is not." },
             ledger: { type: "integer" },
+            merchantName: {
+              type: ["string", "null"],
+              description:
+                "The merchant's self-declared display name (see `/merchants/{address}/profile`); not verified. Null when the merchant has not set a profile.",
+            },
           },
           required: ["id", "merchant", "name", "token", "amount", "period", "active", "ledger"],
         },
       ],
+    },
+    MerchantProfile: {
+      type: "object",
+      description:
+        "A merchant's self-declared profile. The plan registry stores it without verifying the name or the URL, so it is a claim the merchant makes about itself.",
+      properties: {
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        name: { type: "string", description: "Self-declared display name, at most 64 bytes." },
+        url: {
+          type: "string",
+          description: "Self-declared website or terms URL, at most 256 bytes. Not validated; render it as untrusted input.",
+        },
+        ledger: { type: "integer", description: "The ledger of the profile update this reflects." },
+      },
+      required: ["merchant", "name", "url", "ledger"],
     },
     Mandate: {
       allOf: [
@@ -1163,6 +1627,28 @@ function componentSchemas(): Record<string, SchemaObject> {
         },
       },
       required: ["id", "subscriber", "merchant", "next_charge", "amount", "funded"],
+    },
+    UnpaidMandate: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        subscriber: { type: "string", description: ADDRESS_DESCRIPTION },
+        next_charge: { type: "integer", description: "When the charge fell due, in unix seconds." },
+        amount: amount(),
+        balance: amount(),
+        shortfall: amount(),
+        overdue_seconds: { type: "integer", description: "How long the charge has been due: `now` − `next_charge`." },
+      },
+      required: ["id", "subscriber", "next_charge", "amount", "balance", "shortfall", "overdue_seconds"],
+    },
+    MerchantUnpaid: {
+      type: "object",
+      properties: {
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        now: { type: "integer", description: "The instant the report was built, in unix seconds." },
+        unpaid: { type: "array", items: { $ref: "#/components/schemas/UnpaidMandate" } },
+      },
+      required: ["merchant", "now", "unpaid"],
     },
     PlanStats: {
       type: "object",
@@ -1342,6 +1828,97 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["id", "merchant", "url", "secret", "active"],
     },
+    WebhookSummary: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        url: { type: "string", format: "uri" },
+        secretLast4: {
+          type: "string",
+          description: "The signing secret's last four characters; the secret itself is never returned again.",
+        },
+        failed: { type: "boolean", description: "Deliveries gave up after repeated failures." },
+        failures: { type: "integer" },
+        lastAttempt: { type: ["integer", "null"], description: "Unix seconds of the last failed attempt." },
+        lastStatus: { type: ["integer", "null"], description: "HTTP status of the last failed attempt." },
+        createdAt: { type: "integer", description: "Unix seconds." },
+      },
+      required: ["id", "merchant", "url", "secretLast4", "failed", "failures", "lastAttempt", "lastStatus", "createdAt"],
+    },
+    WebhookDeleteRequest: {
+      type: "object",
+      properties: {
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        signature: {
+          type: "string",
+          description: "Base64-encoded ed25519 signature of `payflow-webhook-delete:v1:<merchant>:<id>:<timestamp>`.",
+        },
+        timestamp: {
+          type: "integer",
+          description: "Unix seconds. Signatures older than ten minutes are refused.",
+        },
+      },
+      required: ["merchant", "signature", "timestamp"],
+    },
+    WebhookRotation: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        secret: { type: "string", description: "The new HMAC key; returned only here, so store it now." },
+        previousSecretExpiresAt: {
+          type: ["integer", "null"],
+          description: "Unix seconds until which the previous secret also signs; null when it was retired at once.",
+        },
+      },
+      required: ["id", "secret", "previousSecretExpiresAt"],
+    },
+    WebhookTestResult: {
+      type: "object",
+      properties: {
+        deliveryId: { type: "integer" },
+        status: { type: "string", enum: ["delivered", "pending", "failed"] },
+        statusCode: { type: ["integer", "null"], description: "The endpoint's HTTP status; null when no response arrived." },
+        latencyMs: { type: "integer" },
+        error: { type: ["string", "null"] },
+        nextRetryAt: { type: ["integer", "null"], description: "Unix seconds of the scheduled retry, when `pending`." },
+      },
+      required: ["deliveryId", "status", "statusCode", "latencyMs", "error", "nextRetryAt"],
+    },
+    WebhookDelivery: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        deliveryId: { type: "integer", description: "Shared by a delivery's retries." },
+        eventId: { type: "string", description: "`charge:<tx hash>` or `ping:<uuid>`." },
+        attempt: { type: "integer" },
+        status: {
+          type: "string",
+          enum: ["delivered", "pending", "failed"],
+          description: "The delivery's state after this attempt; `pending` means a retry is scheduled.",
+        },
+        statusCode: { type: ["integer", "null"] },
+        error: { type: ["string", "null"] },
+        nextRetryAt: { type: ["integer", "null"], description: "Unix seconds." },
+        attemptedAt: { type: "integer", description: "Unix seconds." },
+      },
+      required: ["id", "deliveryId", "eventId", "attempt", "status", "statusCode", "error", "nextRetryAt", "attemptedAt"],
+    },
+    AuthChallenge: {
+      type: "object",
+      properties: {
+        transaction: { type: "string", description: "The challenge transaction envelope, base64 XDR." },
+        network_passphrase: { type: "string" },
+      },
+      required: ["transaction", "network_passphrase"],
+    },
+    AuthToken: {
+      type: "object",
+      properties: {
+        token: { type: "string", description: "A JWT to send as `Authorization: Bearer <token>` to merchant-only routes." },
+      },
+      required: ["token"],
+    },
     UpcomingCharges: {
       type: "object",
       properties: {
@@ -1422,8 +1999,39 @@ function componentSchemas(): Record<string, SchemaObject> {
             required: ["tx_hash", "old_fee_bps", "new_fee_bps", "ledger"],
           },
         },
+        contract_versions: {
+          type: "array",
+          description: "The latest code version (wasm hash, hex) of each contract that has been upgraded.",
+          items: {
+            type: "object",
+            properties: {
+              contract_id: { type: "string" },
+              wasm_hash: { type: "string" },
+              ledger: { type: "integer" },
+            },
+            required: ["contract_id", "wasm_hash", "ledger"],
+          },
+        },
       },
-      required: ["fee_bps", "history"],
+      required: ["fee_bps", "history", "contract_versions"],
+    },
+    ProtocolFeeBucket: {
+      type: "object",
+      properties: {
+        bucket: { type: "string", description: "The bucket's label, in UTC." },
+        fee: amount(),
+        charges: { type: "integer" },
+      },
+      required: ["bucket", "fee", "charges"],
+    },
+    ProtocolFees: {
+      type: "object",
+      properties: {
+        bucket: { type: "string", enum: ["day", "week", "month"] },
+        buckets: { type: "array", items: { $ref: "#/components/schemas/ProtocolFeeBucket" } },
+        totals: { $ref: "#/components/schemas/ProtocolFeeBucket" },
+      },
+      required: ["bucket", "buckets", "totals"],
     },
     Stats: {
       type: "object",
@@ -1595,6 +2203,7 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       { name: "stats", description: "Protocol-wide totals." },
       { name: "service", description: "Health, readiness, metrics and this document." },
       { name: "admin", description: "Operator endpoints; they need a bearer token." },
+      { name: "auth", description: "SEP-10 sign-in for merchant-only routes." },
     ],
     externalDocs: {
       url: API_CHANGELOG_URL,

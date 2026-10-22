@@ -15,7 +15,7 @@ import { metrics } from "./lib/metrics.ts";
 import { simulationSource } from "./lib/simulate.ts";
 import { asStorage } from "./lib/store/index.ts";
 import type { Storage } from "./lib/store/types.ts";
-import { listDueMandates, planTokensByIds } from "./lib/queries.ts";
+import { planTokensByIds } from "./lib/queries.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
 
 export interface DueMandate {
@@ -52,6 +52,11 @@ const BACKOFF_BASE_S = 60;
 const BACKOFF_MAX_S = 6 * 60 * 60;
 /** Most charges submitted in one pass. */
 const BATCH = 25;
+/** Mandates per `charge_many` call when `KEEPER_BATCH_SIZE` is not set. */
+const DEFAULT_BATCH_SIZE = 10;
+/** Per-mandate failure text when `charge_many` answers `false` for an id. */
+const BATCH_SKIPPED_ERROR =
+  "charge_many skipped this mandate (not due, not active, or unfunded)";
 
 /**
  * Errors that mean the *signing key* cannot pay for the transaction — a
@@ -75,6 +80,26 @@ function isCongestionFailure(err: unknown): boolean {
   }
 }
 
+/**
+ * Whether a failed simulation means the subscription contract has no
+ * `charge_many` entry point *at all*, so the keeper must stop batching and
+ * settle with single `charge` transactions. Invoking a function the contract
+ * does not export surfaces from the host as a missing Wasm export
+ * ("trying to invoke non-existent contract function",
+ * `Error(WasmVm, MissingValue)`); the other wordings are matched too because
+ * the exact text depends on the host and VM version. Anything else — an
+ * underfunded mandate, a resource limit, a transient RPC failure — is not a
+ * missing entry point: that batch is only skipped for its own pass.
+ */
+function isMissingBatchEntryError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    /non-existent contract function|unknown function|unrecognized function|no such function|function (?:.* )?not (?:found|defined|implemented)|Error\(WasmVm, MissingValue\)/i.test(
+      message,
+    )
+  );
+}
+
 export interface SettleResult {
   mandateId: number;
   /**
@@ -87,6 +112,15 @@ export interface SettleResult {
   txHash?: string;
   error?: string;
 }
+
+/** What one `charge_many` attempt produced, before the fallback is decided. */
+type BatchAttempt =
+  /** The transaction answered for every id, in mandate order. */
+  | { kind: "results"; results: SettleResult[] }
+  /** The node said TRY_AGAIN_LATER; retry the batch once with a higher fee. */
+  | { kind: "congestion" }
+  /** Nothing usable; the caller settles the same ids with single charges. */
+  | { kind: "unavailable" };
 
 /**
  * A mandate the keeper did not even try to settle: the subscriber's vault
@@ -203,6 +237,12 @@ export class Keeper {
    * the old key can be retired. Never holds a secret.
    */
   private pendingRetirement: string | null = null;
+  /**
+   * Set once the contract's simulation reports that it has no `charge_many`
+   * entry point: every later pass settles with single `charge` transactions
+   * until the config is reloaded, which re-detects support after a redeploy.
+   */
+  private batchEntryMissing = false;
   private readonly passes: KeeperPassSummary[] = [];
 
   constructor(db: Storage | DatabaseSync, server: KeeperRpc, config: Config) {
@@ -243,6 +283,9 @@ export class Keeper {
    */
   reloadFromConfig(config: Config): void {
     this.config = config;
+    // The reloaded config may point at a contract that does support
+    // `charge_many`; support is re-detected on the next batch attempt.
+    this.batchEntryMissing = false;
     const previous = this.primary.keys[0]?.publicKey() ?? null;
     this.buildChannels(config);
     if (previous && previous !== this.primary.keys[0]!.publicKey()) {
@@ -287,7 +330,8 @@ export class Keeper {
    * Mandates the indexer believes are chargeable right now, in the order set
    * by `KEEPER_ORDER` (`oldest` = oldest-due first, the default; `largest` =
    * largest amount first), skipping any that are backing off after a failed
-   * charge.
+   * charge. With `KEEPER_MERCHANTS` set, only those merchants' mandates are
+   * returned; empty means every merchant.
    */
   async findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): Promise<DueMandate[]> {
     const due: DueMandate[] = [];
@@ -303,7 +347,23 @@ export class Keeper {
 
   private async queryDue(now: number, limit: number): Promise<DueMandate[]> {
     if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
-    return listDueMandates(this.db, now, limit);
+    return this.queryDueByOldest(now, limit);
+  }
+
+  private async queryDueByOldest(now: number, limit: number): Promise<DueMandate[]> {
+    const merchants = this.config.KEEPER_MERCHANTS ?? [];
+    const merchantFilter = merchants.length ? `AND merchant IN (${merchants.map(() => "?").join(",")})` : "";
+    return this.db.all<DueMandate>(
+      `SELECT id, subscriber, merchant, next_charge, amount, plan_id
+         FROM mandates
+        WHERE status = 'Active'
+          AND next_charge <= ?
+          AND (max_charges = 0 OR charges_made < max_charges)
+          ${merchantFilter}
+        ORDER BY next_charge ASC
+        LIMIT ?`,
+      [now, ...merchants, limit],
+    );
   }
 
   /**
@@ -316,13 +376,16 @@ export class Keeper {
    * "largest first" must see every due mandate before it can pick a batch.
    */
   private async queryDueLargest(now: number, limit: number): Promise<DueMandate[]> {
+    const merchants = this.config.KEEPER_MERCHANTS ?? [];
+    const merchantFilter = merchants.length ? `AND merchant IN (${merchants.map(() => "?").join(",")})` : "";
     const rows = await this.db.all<DueMandate>(
-        `SELECT id, subscriber, merchant, plan_id, next_charge, amount
-           FROM mandates
-          WHERE status = 'Active'
-            AND next_charge <= ?
-            AND (max_charges = 0 OR charges_made < max_charges)`,
-      [now],
+      `SELECT id, subscriber, merchant, plan_id, next_charge, amount
+         FROM mandates
+        WHERE status = 'Active'
+          AND next_charge <= ?
+          AND (max_charges = 0 OR charges_made < max_charges)
+          ${merchantFilter}`,
+      [now, ...merchants],
     );
     rows.sort((a, b) => {
       const amountDiff = BigInt(b.amount) - BigInt(a.amount);
@@ -332,6 +395,22 @@ export class Keeper {
       return a.id - b.id;
     });
     return rows.slice(0, limit);
+  }
+
+  /**
+   * Whether this pass may group due mandates into `charge_many` calls:
+   * batching enabled in the config and the contract has not (yet) reported
+   * that it lacks the entry point. A config built without the flag behaves
+   * like `KEEPER_BATCH=false`, so callers that never opted in keep the
+   * one-charge-per-mandate behaviour exactly.
+   */
+  private batchEnabled(): boolean {
+    return this.config.KEEPER_BATCH === true && !this.batchEntryMissing;
+  }
+
+  /** Mandates one `charge_many` call may carry, bounded by the config. */
+  private batchSize(): number {
+    return this.config.KEEPER_BATCH_SIZE ?? DEFAULT_BATCH_SIZE;
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
@@ -362,12 +441,19 @@ export class Keeper {
       channels.map(async (channel) => {
         for (;;) {
           const slot = cursor;
-          cursor += 1;
-          const mandate = chargeable[slot];
-          if (!mandate) return;
-          const result = await this.settle(mandate.id, fee, channel);
-          this.record(result, now);
-          ordered.push({ slot, result });
+          if (slot >= chargeable.length) return;
+          // Batching groups up to KEEPER_BATCH_SIZE mandates into one
+          // charge_many transaction; without it (or once the contract said
+          // it has no charge_many) the group is a single mandate and this
+          // loop is exactly the old one-charge-at-a-time pass.
+          const size = this.batchEnabled() ? this.batchSize() : 1;
+          const group = chargeable.slice(slot, slot + size);
+          cursor += group.length;
+          const results = await this.settleGroup(group, fee ?? BigInt(BASE_FEE), channel);
+          results.forEach((result, offset) => {
+            this.record(result, now);
+            ordered.push({ slot: slot + offset, result });
+          });
         }
       }),
     );
@@ -807,6 +893,151 @@ export class Keeper {
       return { mandateId, status: "settled", txHash: sent.hash };
     }
     return { mandateId, status: "failed", txHash: sent.hash, error: confirmed.status };
+  }
+
+  /** Settle a group, falling back to individual charges if batching is unavailable. */
+  private async settleGroup(
+    mandates: DueMandate[],
+    inclusionFee: bigint,
+    channel: Channel,
+  ): Promise<SettleResult[]> {
+    if (mandates.length < 2 || !this.batchEnabled() || this.config.KEEPER_DRY_RUN) {
+      return Promise.all(mandates.map((mandate) => this.settle(mandate.id, inclusionFee, channel)));
+    }
+    const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
+    let fee = inclusionFee < maxFee ? inclusionFee : maxFee;
+    let congestionRetries = 0;
+    for (;;) {
+      try {
+        const attempt = await this.submitBatch(mandates.map((mandate) => mandate.id), fee, channel);
+        if (attempt.kind === "results") return attempt.results;
+        if (attempt.kind === "congestion") {
+          const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
+          if (congestionRetries === 0 && retryFee > fee) {
+            congestionRetries += 1;
+            fee = retryFee;
+            logger.warn({ mandates: mandates.length, fee: fee.toString() }, "retrying charge_many with a higher fee");
+            continue;
+          }
+        }
+      } catch (err) {
+        const error = this.scrubError(err instanceof Error ? err.message : String(err));
+        if (isMissingBatchEntryError(err)) {
+          this.batchEntryMissing = true;
+          logger.warn({ error }, "charge_many is unsupported; switching to single charges");
+        } else {
+          logger.warn({ mandates: mandates.length, error }, "charge_many unavailable; falling back to single charges");
+        }
+      }
+      logger.warn({ mandates: mandates.length }, "falling back to single charge transactions");
+      return Promise.all(mandates.map((mandate) => this.settle(mandate.id, inclusionFee, channel)));
+    }
+  }
+
+  /**
+   * Builds, simulates, signs and submits one `charge_many` with the channel's
+   * active key and reports what the transaction decided. Throws on RPC and
+   * signing failures exactly like `submit`, so `settleBatch` applies the same
+   * congestion, key-rotation and error-scrubbing rules; a missing
+   * `charge_many` entry point surfaces here as a simulation throw and is
+   * classified there.
+   */
+  private async submitBatch(
+    mandateIds: number[],
+    fee: bigint,
+    channel: Channel,
+  ): Promise<BatchAttempt> {
+    const key = channel.keys[channel.active]!;
+    const account = await this.server.getAccount(key.publicKey());
+    const contract = new Contract(this.config.SUBSCRIPTION_ID);
+
+    const tx = new TransactionBuilder(account, {
+      fee: fee.toString(),
+      networkPassphrase: this.config.NETWORK_PASSPHRASE,
+    })
+      .addOperation(
+        contract.call(
+          "charge_many",
+          xdr.ScVal.scvVec(mandateIds.map((id) => nativeToScVal(id, { type: "u64" }))),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    // A refusal here throws: no `charge_many` on the contract, a resource
+    // limit, or a transient RPC failure — `settleBatch` classifies it.
+    const prepared = await this.server.prepareTransaction(tx);
+    prepared.sign(key);
+
+    const sent = await this.server.sendTransaction(prepared);
+    if (sent.status === "TRY_AGAIN_LATER") return { kind: "congestion" };
+    if (sent.status === "ERROR") {
+      const error = this.scrubError(
+        typeof sent.errorResult === "string"
+          ? sent.errorResult
+          : JSON.stringify(sent.errorResult ?? sent.status),
+      );
+      logger.warn({ mandates: mandateIds.length, error }, "charge_many rejected before submission");
+      return { kind: "unavailable" };
+    }
+
+    const confirmed = await this.poll(sent.hash);
+    if (confirmed.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      const outcomes = this.batchOutcomes(confirmed.returnValue, mandateIds.length);
+      const skipped = outcomes ? outcomes.filter((charged) => !charged).length : 0;
+      logger.info(
+        { mandates: mandateIds.length, skipped, txHash: sent.hash },
+        "charge_many settled",
+      );
+      return {
+        kind: "results",
+        results: mandateIds.map((mandateId, index) =>
+          outcomes && !outcomes[index]
+            ? { mandateId, status: "failed", txHash: sent.hash, error: BATCH_SKIPPED_ERROR }
+            : { mandateId, status: "settled", txHash: sent.hash },
+        ),
+      };
+    }
+    if (confirmed.status === rpc.Api.GetTransactionStatus.FAILED) {
+      // The group was charged as one transaction and failed as one
+      // transaction; single charges decide each mandate instead of leaving
+      // the whole group to back off behind one repeatedly failing batch.
+      logger.warn(
+        { mandates: mandateIds.length, txHash: sent.hash },
+        "charge_many transaction failed on chain",
+      );
+      return { kind: "unavailable" };
+    }
+    // Still pending after the polling window: one failed result per id, the
+    // same answer a single charge gives — the batch may still land, so it is
+    // never re-sent.
+    return {
+      kind: "results",
+      results: mandateIds.map((mandateId) => ({
+        mandateId,
+        status: "failed",
+        txHash: sent.hash,
+        error: confirmed.status,
+      })),
+    };
+  }
+
+  /**
+   * Decodes `charge_many`'s `Vec<bool>` return value: per id, whether it was
+   * charged. A missing or differently shaped value answers `null` — the
+   * transaction itself succeeded, so the batch counts as settled and the
+   * projection remains the source of truth on the next index pass.
+   */
+  private batchOutcomes(returnValue: xdr.ScVal | undefined, count: number): boolean[] | null {
+    if (!returnValue) return null;
+    try {
+      const decoded: unknown = scValToNative(returnValue);
+      if (!Array.isArray(decoded) || decoded.length !== count) return null;
+      if (!decoded.every((value) => typeof value === "boolean")) return null;
+      return decoded as boolean[];
+    } catch {
+      return null;
+    }
   }
 
   private async poll(

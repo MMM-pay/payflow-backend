@@ -1,0 +1,14 @@
+{
+  "bucket": "day",
+  "buckets": [
+    {
+      "bucket": "2025-06-15",
+      "fee": "100000",
+      "charges": 1
+    }
+  ],
+  "totals": {
+    "fee": "100000",
+    "charges": 1
+  }
+}

@@ -1,19 +1,25 @@
 import { Router } from "express";
 import type { Storage } from "../lib/store/types.ts";
 import {
+  getMerchantProfile,
   getMerchantSummary,
+  listMerchantChargesAfter,
   listMerchantForecastMandates,
   listMerchantSubscribers,
+  listMerchantUnpaidMandates,
   getMerchantChurn,
   getMerchantRevenue,
 } from "../lib/queries.ts";
 import { churnBucketSize } from "../lib/churn.ts";
+import { sendApiError } from "./errors.ts";
 import type {
   ForecastResponse,
   MerchantChurnResponse,
+  MerchantProfile,
   MerchantRevenueResponse,
   MerchantSubscribersResponse,
   MerchantSummary,
+  MerchantUnpaidResponse,
 } from "./types.ts";
 import {
   DEFAULT_REVENUE_BUCKETS,
@@ -85,6 +91,21 @@ export class MerchantSummaryCache {
 export const defaultMerchantSummaryCache = new MerchantSummaryCache();
 
 const DAY_S = 86_400;
+/** Rows read per query while streaming the charges CSV. */
+const CSV_PAGE = 500;
+/** Every token Payflow settles in has seven decimals, as XLM does. */
+const TOKEN_DECIMALS = 7n;
+const TOKEN_SCALE = 10n ** TOKEN_DECIMALS;
+
+/** A smallest-unit amount in token units with seven decimals: 12500000 → 1.2500000. */
+export function tokenUnits(raw: bigint): string {
+  const sign = raw < 0n ? "-" : "";
+  const abs = raw < 0n ? -raw : raw;
+  const fraction = (abs % TOKEN_SCALE).toString().padStart(Number(TOKEN_DECIMALS), "0");
+  return `${sign}${abs / TOKEN_SCALE}.${fraction}`;
+}
+
+const CSV_HEADER = "date,mandate,subscriber,gross,fee,net,tx_hash";
 /** Longest forecast horizon, to keep the arithmetic bounded. */
 const MAX_FORECAST_DAYS = 365;
 /** Buckets reported by the churn endpoint when the caller does not say. */
@@ -137,6 +158,44 @@ export function merchantsRouter(
 
   const body = await getMerchantSummary(db, address.value, defaultToken);
     cache.set(cacheKey, body);
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/profile`: the display name and URL the merchant
+   * last set through the plan registry's `set_profile`. Self-declared: the
+   * contract does not verify either, so neither does this route.
+   */
+  r.get("/merchants/:address/profile", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const body: MerchantProfile | undefined = await getMerchantProfile(db, address.value);
+    if (!body) {
+      sendApiError(res, req, 404, "profile_not_found");
+      return;
+    }
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/unpaid`: the merchant's due mandates whose last
+   * known vault balance cannot cover the charge, with the shortfall and how
+   * long each has been due, longest overdue first. The same funded test as
+   * `/due`, so the balance can trail the chain the same way.
+   */
+  r.get("/merchants/:address/unpaid", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const now = Math.floor(Date.now() / 1000);
+    const body: MerchantUnpaidResponse = {
+      merchant: address.value,
+      now,
+      unpaid: await listMerchantUnpaidMandates(db, address.value, now, limitOf(limit.value)),
+    };
     res.json(body);
   });
 
@@ -218,6 +277,75 @@ export function merchantsRouter(
     res.json(body);
   });
 
+  /**
+   * `GET /merchants/:address/charges.csv?from=&to=`: every settled charge
+   * for the merchant, oldest first, as a CSV download for accounting.
+   *
+   * `gross` is what the subscriber paid, `fee` the protocol's share and
+   * `net` what the merchant kept (gross − fee = net), each in token units
+   * with seven decimals and computed as bigint. `date` is the charge's
+   * ledger close time in ISO 8601 UTC. Rows are streamed a page at a time,
+   * so neither the response nor a single query grows with the history.
+   */
+  r.get("/merchants/:address/charges.csv", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
+    if (!from.ok) return;
+    const to = validate(req, res, "to", unixSecondsSchema.optional(), present(req.query.to));
+    if (!to.ok) return;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="payflow-charges-${address.value}.csv"`,
+    );
+    res.write(`${CSV_HEADER}\r\n`);
+
+    let after: Parameters<typeof listMerchantChargesAfter>[2] = null;
+    for (;;) {
+      const rows = await listMerchantChargesAfter(
+        db,
+        address.value,
+        after,
+        CSV_PAGE,
+        from.value === undefined ? undefined : from.value * 1000,
+        to.value === undefined ? undefined : to.value * 1000,
+      );
+      if (rows.length === 0) break;
+      let chunk = "";
+      for (const row of rows) {
+        const net = BigInt(row.amount);
+        const fee = BigInt(row.fee);
+        chunk += [
+          new Date(row.created_at).toISOString(),
+          row.mandate_id,
+          row.subscriber,
+          tokenUnits(net + fee),
+          tokenUnits(fee),
+          tokenUnits(net),
+          row.tx_hash,
+        ].join(",") + "\r\n";
+      }
+      // Respect backpressure from a slow client, and stop if it went away.
+      if (!res.write(chunk)) {
+        await new Promise<void>((resolve) => {
+          const done = (): void => {
+            res.off("drain", done);
+            res.off("close", done);
+            resolve();
+          };
+          res.on("drain", done);
+          res.on("close", done);
+        });
+      }
+      if (res.destroyed) return;
+      if (rows.length < CSV_PAGE) break;
+      after = rows[rows.length - 1]!;
+    }
+    res.end();
+  });
+
   /** Projected charges over the next `days`, net of the protocol fee. */
   r.get("/merchants/:address/forecast", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
@@ -262,4 +390,3 @@ export function merchantsRouter(
 
   return r;
 }
-

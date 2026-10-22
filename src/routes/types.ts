@@ -47,6 +47,26 @@ export interface PlanRow extends TokenFields {
   period: number;
   active: number;
   ledger: number;
+  /**
+   * The merchant's self-declared display name (see {@link MerchantProfile});
+   * null when the merchant has not set a profile. Not verified by anyone.
+   */
+  merchantName?: string | null;
+}
+
+/**
+ * A merchant's profile, as the plan registry's `profile_updated` event last
+ * set it. Self-declared: the contract stores the name and the URL without
+ * verifying either, so they are a claim the merchant makes about itself.
+ */
+export interface MerchantProfile {
+  merchant: string;
+  /** Display name, at most 64 bytes on-chain. */
+  name: string;
+  /** Website or terms URL, at most 256 bytes on-chain. Not validated. */
+  url: string;
+  /** The ledger of the profile update the row reflects. */
+  ledger: number;
 }
 
 export interface MandateRow extends TokenFields {
@@ -109,6 +129,30 @@ export interface DueMandateRow {
    * mandates are reported as not funded.
    */
   funded: boolean;
+}
+
+/** A due mandate the last known vault balance cannot cover: one row of a merchant's unpaid report. */
+export interface UnpaidMandateRow {
+  id: number;
+  subscriber: string;
+  /** When the charge fell due, in unix seconds. */
+  next_charge: number;
+  /** The charge, in the token's smallest unit. */
+  amount: string;
+  /** The last indexed vault balance of the plan's token; "0" when none is indexed. */
+  balance: string;
+  /** What the balance is missing: amount − balance. */
+  shortfall: string;
+  /** How long the charge has been due: `now` − `next_charge`, in seconds. */
+  overdue_seconds: number;
+}
+
+export interface MerchantUnpaidResponse {
+  merchant: string;
+  /** The instant the report was built, in unix seconds. */
+  now: number;
+  /** Longest overdue first; ties by mandate id. */
+  unpaid: UnpaidMandateRow[];
 }
 
 export interface PlanPage {
@@ -185,6 +229,30 @@ export interface ProtocolResponse {
   /** Null until a fee_changed event has been indexed. */
   fee_bps: number | null;
   history: ProtocolFeeChange[];
+  /** The latest code version of each contract that has been upgraded. */
+  contract_versions: { contract_id: string; wasm_hash: string; ledger: number }[];
+}
+
+/** One bucket of the protocol fee report. */
+export interface ProtocolFeeBucket {
+  /**
+   * The bucket's label: `2025-01-15` for a day, the Monday's date
+   * (`2025-01-13`) for a week, and `2025-01` for a month. All in UTC.
+   */
+  bucket: string;
+  /** Fees the protocol collected in the bucket, token's smallest unit. */
+  fee: string;
+  /** Charges settled in the bucket. */
+  charges: number;
+}
+
+export interface ProtocolFeesResponse {
+  /** The bucket size the report is grouped by. */
+  bucket: RevenueBucketSize;
+  /** The buckets, oldest first. */
+  buckets: ProtocolFeeBucket[];
+  /** The same figures summed over every bucket in the report. */
+  totals: Omit<ProtocolFeeBucket, "bucket">;
 }
 
 export interface KeeperPassSummary {
@@ -368,6 +436,86 @@ export interface WebhookRegistration {
   /** HMAC-SHA256 key used to sign delivery requests. */
   secret: string;
   active: boolean;
+}
+
+/** A registered webhook as `GET /api/webhooks` lists it: never the secret. */
+export interface WebhookSummary {
+  id: number;
+  merchant: string;
+  url: string;
+  /** The signing secret's last four characters, to tell secrets apart. */
+  secretLast4: string;
+  /** True once deliveries gave up after repeated failures. */
+  failed: boolean;
+  failures: number;
+  /** Unix seconds of the last failed delivery attempt, if any. */
+  lastAttempt: number | null;
+  lastStatus: number | null;
+  /** Unix seconds. */
+  createdAt: number;
+}
+
+export interface WebhookListResponse {
+  merchant: string;
+  webhooks: WebhookSummary[];
+}
+
+/** `POST /api/webhooks/:id/rotate`: the new secret, returned this once. */
+export interface WebhookRotation {
+  id: number;
+  /** HMAC-SHA256 key that signs deliveries from now on. */
+  secret: string;
+  /** Unix seconds until which the previous secret also signs; null when it was dropped at once. */
+  previousSecretExpiresAt: number | null;
+}
+
+/** The state of a delivery after an attempt. */
+export type WebhookDeliveryStatus = "delivered" | "pending" | "failed";
+
+/** `POST /api/webhooks/:id/test`: how the ping's first attempt went. */
+export interface WebhookTestResult {
+  deliveryId: number;
+  /** `pending` means the attempt failed and a retry is scheduled at `nextRetryAt`. */
+  status: WebhookDeliveryStatus;
+  /** The endpoint's HTTP status; null when no response arrived. */
+  statusCode: number | null;
+  latencyMs: number;
+  error: string | null;
+  nextRetryAt: number | null;
+}
+
+/** One delivery attempt, as `GET /api/webhooks/:id/deliveries` lists it. */
+export interface WebhookDelivery {
+  id: number;
+  /** The delivery the attempt belongs to; its retries share it. */
+  deliveryId: number;
+  /** `charge:<tx hash>` or `ping:<uuid>`. */
+  eventId: string;
+  attempt: number;
+  status: WebhookDeliveryStatus;
+  statusCode: number | null;
+  error: string | null;
+  /** Unix seconds of the retry this attempt scheduled; null unless `pending`. */
+  nextRetryAt: number | null;
+  /** Unix seconds. */
+  attemptedAt: number;
+}
+
+export interface WebhookDeliveriesResponse {
+  webhookId: number;
+  deliveries: WebhookDelivery[];
+}
+
+/** `GET /api/auth`: a SEP-10 challenge transaction for the client to sign. */
+export interface AuthChallengeResponse {
+  /** Base64 XDR transaction envelope. */
+  transaction: string;
+  network_passphrase: string;
+}
+
+/** `POST /api/auth`: a SEP-10 JWT, sent as `Authorization: Bearer <token>`. */
+export interface AuthTokenResponse {
+  token: string;
 }
 
 export interface StatsResponse {

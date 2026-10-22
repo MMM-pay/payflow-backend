@@ -18,6 +18,8 @@ export type RpcLike = Pick<
   | "getTransaction"
   /** Read-only contract calls; token metadata (symbol/name/decimals) uses them. */
   | "simulateTransaction"
+  /** Account entries (signers, thresholds) for SEP-10 sign-in. */
+  | "getLedgerEntries"
 >;
 
 /** Where failover currently stands; reported by /health. */
@@ -191,6 +193,15 @@ export class FailoverRpc implements RpcStatus {
     tx: Transaction | FeeBumpTransaction,
   ): Promise<rpc.Api.SimulateTransactionResponse> {
     return this.run("simulateTransaction", (server) => server.simulateTransaction(tx));
+  }
+
+  /**
+   * Ledger entries by key. A missing entry is absent from `entries` rather
+   * than an error, so a caller can tell "does not exist" from an outage —
+   * which `getAccountEntry` cannot, since it turns both into one error.
+   */
+  async getLedgerEntries(...keys: xdr.LedgerKey[]): Promise<rpc.Api.GetLedgerEntriesResponse> {
+    return this.run("getLedgerEntries", (server) => server.getLedgerEntries(...keys));
   }
 }
 

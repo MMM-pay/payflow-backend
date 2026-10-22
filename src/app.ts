@@ -10,7 +10,7 @@ import { SqliteStorage } from "./lib/store/sqlite.ts";
 import type { Storage } from "./lib/store/types.ts";
 import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
-import { buildAdminRoutes, type AdminHooks } from "./routes/admin.ts";
+import { buildAdminRoutes, type AdminHooks, type AdminToken } from "./routes/admin.ts";
 import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
 import { buildOpenApiDocument } from "./routes/openapi.ts";
 import { asReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -18,9 +18,11 @@ import { sendApiError } from "./routes/errors.ts";
 import type { HealthResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import type { WebhookDispatcher } from "./lib/webhooks.ts";
+import type { Sep10Auth } from "./routes/auth.ts";
 import { logger } from "./lib/logger.ts";
 import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
+import { getVersionInfo } from "./lib/version.ts";
 
 /**
  * The shape of a failure that is safe to put in a log line.
@@ -84,6 +86,9 @@ export function errorHandler(
   sendApiError(res, _req, 500, "internal_error");
 }
 
+/** `/api/auth` and `/api/<network>/auth`, with or without a query string. */
+const SEP10_PATH = /^\/api\/(?:[a-z][a-z0-9-]*\/)?auth(?:\?|$)/;
+
 /** Ledgers the indexer may trail the network by before it is considered behind. */
 const MAX_LAG = 120;
 
@@ -101,6 +106,8 @@ export interface NetworkRuntime {
   rpc?: RpcStatus | undefined;
   /** Delivers charge events to registered webhooks. */
   webhooks?: WebhookDispatcher | undefined;
+  /** SEP-10 sign-in (`/api/auth`); absent when it is not configured. */
+  auth?: Sep10Auth | undefined;
   /** Token metadata source; without one the network's native asset still
    * resolves and every other token reports unavailable (never the network). */
   tokens?: TokenMetadataService | undefined;
@@ -246,11 +253,16 @@ export function createApp(
       });
     });
   });
+  const corsOrigin = config.CORS_ORIGIN === "*" ? true : config.CORS_ORIGIN.split(",");
   app.use(
-    cors({
-      origin: config.CORS_ORIGIN === "*" ? true : config.CORS_ORIGIN.split(","),
-      // Browsers hide non-safelisted response headers from scripts unless exposed.
-      exposedHeaders: ["X-Request-Id"],
+    cors((req, callback) => {
+      callback(null, {
+        // SEP-10 requires `Access-Control-Allow-Origin: *` on its endpoints,
+        // errors included, so any wallet can sign in from a browser.
+        origin: SEP10_PATH.test(req.url ?? "") ? "*" : corsOrigin,
+        // Browsers hide non-safelisted response headers from scripts unless exposed.
+        exposedHeaders: ["X-Request-Id"],
+      });
     }),
   );
   app.use(express.json({ limit: "64kb" }));
@@ -332,10 +344,30 @@ export function createApp(
     });
   });
 
+  // Version and build information endpoint.
+  app.get("/version", (_req, res) => {
+    res.json({
+      ...getVersionInfo(),
+      network: config.STELLAR_NETWORK,
+      contracts: {
+        planRegistry: config.PLAN_REGISTRY_ID,
+        vault: config.VAULT_ID,
+        subscription: config.SUBSCRIPTION_ID,
+      },
+    });
+  });
+
   // Operator endpoints are opt-in. Without ADMIN_TOKEN — or without hooks —
   // /admin falls through to the 404 below like any unknown path.
-  if (config.ADMIN_TOKEN && admin) {
-    app.use("/admin", buildAdminRoutes(config.ADMIN_TOKEN, admin));
+  // ADMIN_TOKEN is a full-access token used exactly as written (a colon in it
+  // is just part of the secret); scoped and expiring tokens come from
+  // ADMIN_TOKENS.
+  const adminTokens: AdminToken[] = [
+    ...(config.ADMIN_TOKEN ? [{ token: config.ADMIN_TOKEN }] : []),
+    ...((config.ADMIN_TOKENS ?? []) as AdminToken[]),
+  ];
+  if (adminTokens.length > 0 && admin) {
+    app.use("/admin", buildAdminRoutes(adminTokens, admin));
   }
 
   if (config.KEEPER_ENABLED && admin?.keeperHistory) {
@@ -365,6 +397,7 @@ export function createApp(
         defaultToken: rt.config.defaultToken ?? config.TOKEN_ID,
         tokens: tokenServiceOf(rt),
         webhooks: rt.webhooks,
+        auth: rt.auth,
       })),
     ),
   );

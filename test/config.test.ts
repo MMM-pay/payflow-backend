@@ -87,6 +87,31 @@ describe("metrics configuration", () => {
   });
 });
 
+describe("keeper merchants", () => {
+  const A = Keypair.random().publicKey();
+  const B = Keypair.random().publicKey();
+
+  test("defaults to empty, meaning every merchant", () => {
+    assert.deepEqual(loadConfig({ ...BASE }).KEEPER_MERCHANTS, []);
+    assert.deepEqual(loadConfig({ ...BASE, KEEPER_MERCHANTS: "" }).KEEPER_MERCHANTS, []);
+  });
+
+  test("splits on commas, trimming blanks and duplicates", () => {
+    assert.deepEqual(
+      loadConfig({ ...BASE, KEEPER_MERCHANTS: ` ${A} ,,${B},${A}` }).KEEPER_MERCHANTS,
+      [A, B],
+    );
+  });
+
+  test("rejects anything that is not an account address", () => {
+    assert.throws(() => loadConfig({ ...BASE, KEEPER_MERCHANTS: `${A},nope` }), /KEEPER_MERCHANTS/);
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_MERCHANTS: VALID_CONTRACT_ID }),
+      /KEEPER_MERCHANTS/,
+    );
+  });
+});
+
 describe("keeper channel secrets", () => {
   test("defaults to no channels, so single-key setups are untouched", () => {
     assert.deepEqual(loadConfig({ ...BASE }).KEEPER_CHANNEL_SECRETS, []);
@@ -335,6 +360,22 @@ describe("Stellar identifier validation", () => {
     assert.throws(
       () => loadConfig({ ...BASE, SUBSCRIPTION_ID: 123 as unknown as string }),
       /SUBSCRIPTION_ID: Invalid input/,
+    );
+  });
+});
+
+// zod 4 replaced `z.string().url()` with the top-level `z.url()` format
+// validator, which validates through the WHATWG URL parser. This pins what the
+// migration accepts and rejects at startup.
+describe("zod 4 url validation", () => {
+  test("z.url() accepts the otel endpoint and names it when rejected", () => {
+    assert.equal(
+      loadConfig({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318" }).OTEL_EXPORTER_OTLP_ENDPOINT,
+      "http://localhost:4318",
+    );
+    assert.throws(
+      () => loadConfig({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "definitely not a url" }),
+      /OTEL_EXPORTER_OTLP_ENDPOINT/,
     );
   });
 });

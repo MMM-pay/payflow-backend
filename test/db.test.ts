@@ -73,3 +73,76 @@ describe("summary query indexes", () => {
     db.close();
   });
 });
+
+describe("report query indexes", () => {
+  test("ranking plans by active mandates counts each plan from a covering index", () => {
+    const db = openDatabase(":memory:");
+    // The statement `listPlansBySubscribers` runs, unfiltered and by merchant.
+    const ranked = (where: string, args: unknown[]) =>
+      queryPlan(
+        db,
+        `SELECT * FROM plans ${where}
+          ORDER BY (SELECT COUNT(*) FROM mandates m
+                     WHERE m.plan_id = plans.id AND m.status = 'Active') DESC,
+                   id ASC
+          LIMIT ?`,
+        [...args, 10],
+      );
+    for (const plan of [ranked("", []), ranked("WHERE merchant = ?", ["M"])]) {
+      assert.match(plan, /SEARCH m USING COVERING INDEX mandates_plan_status \(plan_id=\? AND status=\?\)/);
+      assert.doesNotMatch(plan, /SCAN m\b/);
+    }
+    assert.match(ranked("WHERE merchant = ?", ["M"]), /SEARCH plans USING INDEX plans_merchant/);
+    db.close();
+  });
+
+  test("the protocol fee report reads only its window, from a covering index", () => {
+    const db = openDatabase(":memory:");
+    for (const edge of ["MAX", "MIN"]) {
+      const plan = queryPlan(db, `SELECT ${edge}(created_at) AS at FROM charges`);
+      assert.match(plan, /SEARCH charges USING COVERING INDEX charges_created_at_fee/, edge);
+    }
+
+    const window = queryPlan(
+      db,
+      `SELECT CAST(FLOOR(at / 86400.0) AS INTEGER) * 86400 AS bucket,
+              COALESCE(SUM(CAST(fee AS INTEGER)), 0) AS fee,
+              COUNT(*) AS charges
+         FROM (
+           SELECT CAST(created_at / 1000 AS INTEGER) AS at, fee
+             FROM charges
+            WHERE created_at >= ?
+         )
+        GROUP BY bucket
+        ORDER BY bucket`,
+      [0],
+    );
+    assert.match(window, /SEARCH charges USING COVERING INDEX charges_created_at_fee \(created_at>\?\)/);
+    assert.doesNotMatch(window, /SCAN charges\b/);
+    db.close();
+  });
+
+  test("the unpaid report seeks the merchant's due mandates in report order", () => {
+    const db = openDatabase(":memory:");
+    // The keyset page `listMerchantUnpaidMandates` runs.
+    const page = queryPlan(
+      db,
+      `SELECT id, subscriber, merchant, next_charge, amount, plan_id
+         FROM mandates
+        WHERE merchant = ? AND status = 'Active'
+          AND next_charge BETWEEN ? AND ?
+          AND (next_charge > ? OR id > ?)
+          AND (max_charges = 0 OR charges_made < max_charges)
+        ORDER BY next_charge, id
+        LIMIT ?`,
+      ["M", -1, 1, -1, -1, 200],
+    );
+    assert.match(
+      page,
+      /SEARCH mandates USING INDEX mandates_merchant_status_next_charge \(merchant=\? AND status=\? AND next_charge>\? AND next_charge<\?\)/,
+    );
+    // The index already yields (next_charge, id) order: no sort step.
+    assert.doesNotMatch(page, /TEMP B-TREE/);
+    db.close();
+  });
+});

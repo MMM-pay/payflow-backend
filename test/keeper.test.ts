@@ -31,7 +31,7 @@ function keeperConfig(
   },
   order?: "oldest" | "largest",
   fees: { KEEPER_FEE_PERCENTILE?: string; KEEPER_MAX_FEE?: string } = {},
-  toggles: { KEEPER_DRY_RUN?: boolean } = {},
+  toggles: { KEEPER_DRY_RUN?: boolean; KEEPER_BATCH?: boolean; KEEPER_BATCH_SIZE?: number } = {},
 ): Config {
   return {
     PLAN_REGISTRY_ID: CONTRACT,
@@ -41,6 +41,8 @@ function keeperConfig(
     ...(order ? { KEEPER_ORDER: order } : {}),
     KEEPER_FEE_PERCENTILE: "90",
     KEEPER_MAX_FEE: "100000",
+    KEEPER_BATCH: false,
+    KEEPER_BATCH_SIZE: 10,
     ...fees,
     ...toggles,
     ...secrets,
@@ -86,11 +88,12 @@ function insertMandate(
   id: number,
   nextCharge: number,
   amount: string,
+  merchant: string = MERCHANT,
 ): void {
   db.prepare(
     `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
      VALUES (?, ?, ?, 1, ?, 60, ?, 'Active', 1)`,
-  ).run(id, SUBSCRIBER, MERCHANT, amount, nextCharge);
+  ).run(id, SUBSCRIBER, merchant, amount, nextCharge);
 }
 
 /** Collect logger.info messages while running `fn`. */
@@ -255,7 +258,7 @@ async function captureWarnLog(fn: () => Promise<void>): Promise<string[]> {
   return messages;
 }
 
-describe("keeper channel accounts", () => {
+
   /**
    * A fake node that models account sequence numbers the way the real one
    * does: `getAccount` reports the last consumed sequence, `sendTransaction`
@@ -307,13 +310,62 @@ describe("keeper channel accounts", () => {
     };
   }
 
-  function channelState(): {
-    collisions: string[];
-    submitted: { source: string; sequence: string }[];
-    maxInFlight: number;
-  } {
-    return { collisions: [], submitted: [], maxInFlight: 0 };
-  }
+function channelState(): {
+  collisions: string[];
+  submitted: { source: string; sequence: string }[];
+  maxInFlight: number;
+} {
+  return { collisions: [], submitted: [], maxInFlight: 0 };
+}
+
+describe("keeper channel accounts", () => {
+  test("uses one charge_many transaction for multiple due mandates when batching is enabled", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      fakeRpc(new Set([keyA.publicKey()]), submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
+    );
+
+    const results = await keeper.tick(10_000);
+    assert.equal(results.length, 2);
+    assert.ok(results.every((result) => result.status === "settled"));
+    assert.equal(submitted.length, 1, "two mandates should share one transaction");
+    db.close();
+  });
+
+  test("falls back to single charges when charge_many is unsupported", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    const submitted: string[] = [];
+    let prepareCalls = 0;
+    const base = fakeRpc(new Set([keyA.publicKey()]), submitted);
+    const server = {
+      ...base,
+      prepareTransaction: async (tx: Transaction) => {
+        prepareCalls += 1;
+        if (prepareCalls === 1) {
+          throw new Error("trying to invoke non-existent contract function charge_many");
+        }
+        return tx;
+      },
+    } as KeeperRpc;
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_BATCH: true }),
+    );
+
+    const results = await keeper.tick(10_000);
+    assert.equal(results.length, 2);
+    assert.ok(results.every((result) => result.status === "settled"));
+    assert.equal(submitted.length, 2, "unsupported batch must fall back to two charge transactions");
+    db.close();
+  });
 
   test("three channels settle in parallel with no sequence-number collisions", async () => {
     const db = openDatabase(":memory:");
@@ -444,6 +496,73 @@ describe("keeper channel accounts", () => {
     );
     assert.equal(keeper.channelCount, 2, "duplicates collapse into the existing channels");
     assert.deepEqual(keeper.keyPublicKeys, [keyA.publicKey(), keyB.publicKey()]);
+  });
+});
+
+describe("keeper merchant filter (KEEPER_MERCHANTS)", () => {
+  const OTHER_MERCHANT = Keypair.random().publicKey();
+  const THIRD_MERCHANT = Keypair.random().publicKey();
+
+  function merchantKeeper(
+    db: ReturnType<typeof openDatabase>,
+    merchants: string[] | undefined,
+    order?: "oldest" | "largest",
+  ): Keeper {
+    const config = keeperConfig({ KEEPER_SECRET: keyA.secret() }, order);
+    return new Keeper(
+      db,
+      fakeRpc(new Set()),
+      merchants === undefined ? config : ({ ...config, KEEPER_MERCHANTS: merchants } as Config),
+    );
+  }
+
+  function seed(db: ReturnType<typeof openDatabase>): void {
+    insertMandate(db, 1, 1_000, "100", MERCHANT);
+    insertMandate(db, 2, 1_001, "900", OTHER_MERCHANT);
+    insertMandate(db, 3, 1_002, "500", THIRD_MERCHANT);
+  }
+
+  test("an empty list settles every merchant's mandates", async () => {
+    const db = openDatabase(":memory:");
+    seed(db);
+    assert.deepEqual((await merchantKeeper(db, []).findDue(2_000)).map((m) => m.id), [1, 2, 3]);
+    assert.deepEqual((await merchantKeeper(db, undefined).findDue(2_000)).map((m) => m.id), [1, 2, 3]);
+    db.close();
+  });
+
+  test("only the listed merchants' mandates are due", async () => {
+    const db = openDatabase(":memory:");
+    seed(db);
+    assert.deepEqual((await merchantKeeper(db, [MERCHANT]).findDue(2_000)).map((m) => m.id), [1]);
+    assert.deepEqual(
+      (await merchantKeeper(db, [MERCHANT, THIRD_MERCHANT]).findDue(2_000)).map((m) => m.id),
+      [1, 3],
+    );
+    db.close();
+  });
+
+  test("the filter applies to KEEPER_ORDER=largest too", async () => {
+    const db = openDatabase(":memory:");
+    seed(db);
+    assert.deepEqual(
+      (await merchantKeeper(db, [MERCHANT, THIRD_MERCHANT], "largest").findDue(2_000)).map((m) => m.id),
+      [3, 1],
+    );
+    db.close();
+  });
+
+  test("a pass never charges another merchant's mandate", async () => {
+    const db = openDatabase(":memory:");
+    seed(db);
+    const submitted: string[] = [];
+    const keeper = new Keeper(db, fakeRpc(new Set([keyA.publicKey()]), submitted), {
+      ...keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+      KEEPER_MERCHANTS: [OTHER_MERCHANT],
+    } as Config);
+    const results = await keeper.tick(2_000);
+    assert.deepEqual(results.map((r) => r.mandateId), [2]);
+    assert.equal(submitted.length, 1);
+    db.close();
   });
 });
 

@@ -72,10 +72,33 @@ release that ships them numbers them here.
   completed per bucket, and the net.
 - `GET /api/merchants/:address/forecast` — projected charges over the next N
   days, net of fees.
+- `GET /api/protocol/fees` — the protocol's fee revenue per `day`, `week` or
+  `month` bucket of ledger close time (#149).
+- `GET /api/plans?sort=subscribers` — plans ranked by active mandates, ties
+  broken by plan id; refuses `cursor` and returns `nextCursor: null` (#148).
+- `GET /api/merchants/:address/profile` — the merchant's **self-declared**
+  display name and URL; `404 profile_not_found` when none is set. Plan
+  responses gained `merchantName` (the same self-declared name, or `null`)
+  (#147).
+- `GET /api/merchants/:address/unpaid` — due mandates the last known vault
+  balance cannot cover, with `balance`, `shortfall` and `overdue_seconds`,
+  longest overdue first (#146).
 - `GET /api/subscribers/:address/upcoming` — charges due over the next N days,
   with their projected times.
 - `GET /api/mandates?ids=` — up to 100 mandates in one request.
 - `POST /api/webhooks` — register a URL for signed `charged` events.
+- `POST /api/webhooks/:id/rotate` — replace a webhook's signing secret. During
+  the overlap `Payflow-Signature` lists two signatures,
+  `sha256=<new>, sha256=<old>`; receivers that compare the whole header with
+  one signature must accept any listed one instead.
+- `POST /api/webhooks/:id/test` — deliver a signed `ping` event and report the
+  attempt's status code and latency. Receivers see a new `event` value,
+  `ping`.
+- `GET /api/webhooks/:id/deliveries` — the webhook's last 100 delivery
+  attempts.
+- `GET /api/auth` and `POST /api/auth` — SEP-10 sign-in. Every webhook route
+  also accepts the issued JWT as `Authorization: Bearer <token>`; signed
+  messages keep working unchanged.
 - `/api/<network>/...` — every route again, per configured network.
 - `/api/mandates` and `/api/plans` accept `?cursor=` and return `nextCursor`.
 - `/api/stats` reports charge volume and fees; `/api/due` gained `funded`;

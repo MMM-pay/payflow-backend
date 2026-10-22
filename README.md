@@ -54,6 +54,63 @@ replays that range on restart. Every write is designed for that:
 - Mandate updates are guarded by `WHERE charges_made < ?`, so an out-of-order
   event can never move a mandate backwards.
 
+
+### Mandate lifecycle timeline
+
+`GET /api/mandates/:id/timeline` returns `{ "events": [...] }` in ascending
+ledger order (ties ordered by transaction hash and event kind). A missing
+mandate returns 404; an invalid ID returns 400. Each entry contains
+`mandateId`, `txHash`, `kind`, `ledger`, `at` (ledger close time in
+Unix seconds, or null if unavailable), and `details`.
+
+The timeline records every `subscribed`, `charged`, `pause_changed`
+(including both pause and resume), `cancelled`, `mandate_ended`, and
+`mandate_completed` event. Charged amounts and fees in `details` are
+decimal strings in the token's smallest unit, never JavaScript floats.
+History is stored idempotently by mandate, transaction and event kind;
+replaying an indexed range does not duplicate entries. The existing
+`mandate_events` churn aggregation remains unchanged.
+
+```bash
+curl 'http://localhost:8080/api/mandates/1/timeline'
+```
+
+### Raw contract event feed
+
+`GET /api/events` exposes the original contract events saved by the indexer.
+This endpoint depends on the `events` table introduced in **#34**; deploy the
+raw event storage migration before enabling this endpoint. No Soroban RPC call
+is made by the feed.
+
+| Parameter | Meaning |
+|---|---|
+| `contract` | Optional exact contract ID filter |
+| `name` | Optional event name (decoded from topic 0) |
+| `after` | Opaque cursor returned in the previous page's `next` |
+
+Each response contains `{ "events": [...], "next": "..." }`, with at most 50
+events per page; `next` is `null` at the end. The ordering is ascending by
+`(ledger, event_id)`, which is stable across re-indexes and handles multiple
+events in the same ledger. Pass the unchanged `next` value as `after` for
+the next page. Invalid parameters return `400 invalid_request`.
+
+An event contains `contract`, `ledger`, `txHash`, `index`, `name`,
+`topics`, `data`, and `closeTime`. `topics` is an array of base64-encoded
+Soroban XDR values and `data` is a base64-encoded Soroban XDR value. Decode
+them using the Stellar SDK; monetary amounts are never coerced to floating
+point. `name` may be `null` for an unknown topic representation. This is a
+lossless feed, not a JSON-native value projection.
+
+Example:
+
+```bash
+curl 'http://localhost:8080/api/events?contract=CONTRACT_ID&name=charged'
+curl 'http://localhost:8080/api/events?after=CURSOR_FROM_NEXT'
+```
+
+On multi-network deployments, the same feed is also available at
+`/api/<network>/events`; each network reads its own SQLite database.
+
 ## Quick start
 
 ```bash
@@ -188,6 +245,17 @@ in the builder, production dependencies only in the final image.
   other mandates of the pass settle as usual, and a balance that cannot be
   read (RPC down) is not treated as a shortfall: the charge decides, exactly
   as before.
+- **Batch settlement when the contract supports it.** Due mandates are
+  grouped into one `charge_many` transaction of up to `KEEPER_BATCH_SIZE`
+  mandates (default 10) instead of one `charge` each, so a pass pays one fee
+  for the whole group. Support is detected from the contract itself: the
+  first simulation that reports no `charge_many` switches the keeper to
+  single charges for the rest of the process (a `SIGHUP` reload re-detects,
+  for a redeployed contract), and a batch that cannot run — refused in
+  simulation, rejected, or failed on chain — falls back to single charges
+  for that group in that pass. The contract's per-id `Vec<bool>` result
+  still fails and backs off skipped mandates individually, and
+  `KEEPER_BATCH=false` disables batching entirely.
 - **Events are validated against the contract spec.** Every decoded event is
   checked against `src/lib/event_spec.json` before it is projected. A renamed
   or retyped contract field makes the event fail validation: it is logged with
@@ -207,6 +275,24 @@ keyed on the mandate id, so re-running the pass is a no-op once the row
 matches the chain. A failed RPC read is logged and retried on the next pass;
 it never crashes the loop. Corrections are logged and reported on `/health`
 under `indexer.reconciliations` and `indexer.corrections`.
+
+### Rebuilding the projection from scratch
+
+When the database is corrupted, stop the server and run:
+
+```bash
+npm run reindex
+```
+
+For every configured network it moves the SQLite file (with its `-wal` and
+`-shm` files) aside to `<DATABASE_PATH>.bak-<UTC timestamp>`, creates a fresh
+database and catches up from `INDEXER_START_LEDGER`. The old file is never
+deleted; remove the backup yourself once the new projection checks out.
+
+The running server holds `<DATABASE_PATH>.lock` (its PID), and `reindex`
+refuses to run while that process is alive, so it cannot move a database out
+from under a live server. A lock left by a crashed process is detected by its
+dead PID and taken over.
 
 ### Rotating the keeper key without downtime
 
@@ -278,7 +364,7 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
 | `GET` | `/metrics` | Prometheus metrics: the indexer's gauges and the keeper's counters (only when `METRICS_ENABLED=true`) |
 | `GET` | `/api/openapi.json` | The OpenAPI 3.1 description of this API |
-| `GET` | `/api/plans?merchant=&limit=` | Published plans |
+| `GET` | `/api/plans?merchant=&limit=&sort=` | Published plans, each with its merchant's self-declared `merchantName`; `sort=subscribers` ranks them by active mandates (ties by plan id) |
 | `GET` | `/api/plans/:id` | One plan |
 | `GET` | `/api/plans/:id/stats` | Per-plan statistics: active and total mandates, cancellations, total collected, average charges per mandate |
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
@@ -286,12 +372,19 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/mandates/:id/charges` | Settlement history |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
 | `POST` | `/api/webhooks` | Register a URL to receive signed `charged` events; proves control of the merchant address with a signature |
+| `POST` | `/api/webhooks/:id/rotate` | Replace a webhook's signing secret; both secrets sign during the overlap |
+| `POST` | `/api/webhooks/:id/test` | Send a signed `ping` through the normal delivery path; returns status code and latency |
+| `GET` | `/api/webhooks/:id/deliveries` | The webhook's last 100 delivery attempts: event, status code, error, attempt, next retry |
+| `GET` / `POST` | `/api/auth` | SEP-10 challenge, and a JWT for a signed challenge (only when `SEP10_SIGNING_KEY` is set) |
 | `GET` | `/api/vault/:address` | Latest balance per token |
 | `GET` | `/api/vault/:address/events?limit=` | Vault deposit, withdrawal and debit history, newest first |
 | `GET` | `/api/protocol` | Current protocol fee (`fee_bps`) and fee-change history |
+| `GET` | `/api/protocol/fees?bucket=month&limit=` | Protocol fee revenue per `day`, `week` or `month` bucket of ledger close time |
 | `GET` | `/api/keeper` | Last 20 keeper passes, failures, skipped mandates and mandate backoff (only when enabled) |
 | `GET` | `/api/due` | Mandates chargeable right now, each with a `funded` flag |
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
+| `GET` | `/api/merchants/:address/profile` | The merchant's **self-declared** display name and URL, from the plan registry's `set_profile`; not verified by the contract or this API |
+| `GET` | `/api/merchants/:address/unpaid?limit=` | Due mandates the last known vault balance cannot cover (`/api/due`'s `funded: false`), with the shortfall and time overdue, longest overdue first |
 | `GET` | `/api/merchants/:address/subscribers?limit=` | The merchant's distinct subscribers, grouped by lifetime value |
 | `GET` | `/api/merchants/:address/churn?bucket=month&limit=` | Per-bucket churn: mandates started, cancelled, ended and completed, and the net |
 | `GET` | `/api/merchants/:address/revenue?bucket=day&from=&to=` | Revenue over time: gross, fee and net per bucket |
@@ -532,11 +625,60 @@ failed and stops receiving deliveries until re-registered. Undelivered
 deliveries are retried on a short cadence, so a silent indexer still makes
 delivery progress.
 
+`GET /api/webhooks?merchant=<G...>&timestamp=<unix s>&signature=<base64>`
+lists the merchant's webhooks, newest first, signed over
+`payflow-webhook-list:v1:<merchant>:<timestamp>`. Secrets are never returned
+again: each entry shows only `secretLast4`. `DELETE /api/webhooks/:id` removes
+one, with `{ merchant, timestamp, signature }` as a JSON body (or the same
+three query parameters) signed over
+`payflow-webhook-delete:v1:<merchant>:<id>:<timestamp>`; a deleted webhook gets
+no further deliveries and its scheduled retries are dropped. Each action has
+its own message prefix, so a signature for one cannot be replayed as another.
+A wrong, malformed or expired (older than ten minutes) signature is a `401
+unauthorized`.
+
+`POST /api/webhooks/:id/rotate` (signed over
+`payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>`) replaces a webhook's
+secret and returns the new one once. For `WEBHOOK_SECRET_OVERLAP_S` (one day
+by default; `0` retires the old secret at once, for a leak) every delivery
+carries both signatures, `Payflow-Signature: sha256=<new>, sha256=<old>`;
+receivers should accept a request when any listed signature matches a secret
+they hold. After the overlap only the new secret signs.
+
+`POST /api/webhooks/:id/test` (signed over
+`payflow-webhook-test:v1:<merchant>:<id>:<timestamp>`) delivers
+`{ "event": "ping", "webhook_id", "merchant" }` through the normal path — same
+headers, same signatures, same retries — and answers with the attempt's
+`status`, `statusCode`, `latencyMs`, `error` and `nextRetryAt`.
+
+`GET /api/webhooks/:id/deliveries` (signed over
+`payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>`, as query
+parameters) lists the webhook's last 100 delivery attempts, newest first: a
+delivery that failed and was retried shows each attempt, with its status code,
+error and the retry it scheduled. Older attempts are pruned as new ones are
+written.
+
+#### SEP-10 sign-in
+
+Instead of signing a message for every call, a merchant can sign in once with
+[SEP-10](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md):
+`GET /api/auth?account=<G...>` returns a challenge transaction, the wallet
+signs it, and `POST /api/auth` with `{ "transaction": "<signed XDR>" }` (JSON
+or form-encoded) returns `{ "token": "<JWT>" }`. Every webhook route accepts
+that token as `Authorization: Bearer <token>` in place of `merchant`,
+`timestamp` and `signature`. Tokens last `SEP10_JWT_TTL_S` (an hour by
+default), are valid only on the network that issued them, and each challenge
+yields one token. An account that exists must sign with signers meeting its
+medium threshold; one that does not must sign with its master key. Publish
+the server's public key as `SIGNING_KEY` and the endpoint as
+`WEB_AUTH_ENDPOINT` in the home domain's `stellar.toml`.
+
 | `error.code` | HTTP | Where |
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
 | `plan_not_found` | 404 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` with no such plan |
 | `mandate_not_found` | 404 | `GET /api/mandates/:id` or `GET /api/mandates/:id/charges` with no such mandate |
+| `profile_not_found` | 404 | `GET /api/merchants/:address/profile` for a merchant that has not set a profile |
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
 | `too_many_ids` | 400 | `?ids=` lists more than 100 ids |
 | `invalid_request` | 400 | A query or path parameter is not valid; `error.details` says which |
@@ -544,7 +686,7 @@ delivery progress.
 | `token_metadata_unavailable` | 502 | `GET /api/tokens/:id` while the token contract cannot be read |
 | `rate_limited` | 429 | API request exceeded the configured per-IP limit; includes `Retry-After` |
 | `stream_limit` | 503 | `GET /api/stream` when the concurrent stream cap is reached |
-| `unauthorized` | 401 | A `/admin/*` request without a valid bearer token |
+| `unauthorized` | 401 | A `/admin/*` request without a valid bearer token, or a webhook management request with a wrong or expired signature or an invalid or expired SEP-10 token |
 | `reindex_unavailable` | 503 | `POST /admin/reindex` on a process without an indexer |
 | `indexer_unavailable` | 503 | `/admin/indexer/pause`/`resume` on a process without an indexer |
 | `keeper_unavailable` | 503 | A keeper endpoint while `KEEPER_ENABLED=false` |
@@ -699,8 +841,13 @@ examined without API downtime.
 | `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
+| `KEEPER_MERCHANTS` | *(empty)* | Only settle mandates payable to these merchants, comma-separated `G...` addresses. Empty settles every merchant |
 | `KEEPER_FEE_PERCENTILE` | `90` | Soroban inclusion-fee percentile used for charge transactions (`50`, `60`, `70`, `80`, `90`, `95`, or `99`) |
 | `KEEPER_MAX_FEE` | `100000` | Maximum inclusion fee in stroops; congestion retries cannot exceed this cap |
+| `KEEPER_BATCH` | `true` | Use `charge_many` when supported, falling back to single charges when unavailable |
+| `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25) |
+| `KEEPER_BATCH` | `true` | Settle due mandates through the contract's `charge_many` in groups, falling back to single `charge` transactions when the contract does not support it |
+| `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
@@ -718,6 +865,12 @@ examined without API downtime.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
 | `ADMIN_TOKEN` | — | Bearer token for `/admin`. Unset keeps those routes disabled |
+| `WEBHOOK_SECRET_OVERLAP_S` | `86400` | Seconds a rotated webhook secret keeps signing beside the new one (0–604800) |
+| `SEP10_SIGNING_KEY` | — | Secret seed of the SEP-10 server account. Unset keeps `/api/auth` disabled |
+| `SEP10_JWT_SECRET` | — | HMAC key for SEP-10 JWTs, at least 32 characters; required with `SEP10_SIGNING_KEY` |
+| `SEP10_HOME_DOMAIN` | — | Home domain of the challenge (`<home domain> auth`); required with `SEP10_SIGNING_KEY` |
+| `SEP10_WEB_AUTH_DOMAIN` | `SEP10_HOME_DOMAIN` | Domain serving `/api/auth`, the challenge's `web_auth_domain` |
+| `SEP10_JWT_TTL_S` | `3600` | JWT lifetime in seconds (60–86400) |
 
 Setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports OpenTelemetry spans for every
 RPC call (`rpc.<method>`), indexer and keeper pass, and HTTP request. Every

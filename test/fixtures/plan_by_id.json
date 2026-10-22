@@ -8,5 +8,6 @@
   "active": 1,
   "ledger": 1,
   "tokenSymbol": null,
-  "decimals": null
+  "decimals": null,
+  "merchantName": null
 }

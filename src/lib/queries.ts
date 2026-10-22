@@ -14,14 +14,18 @@ import type {
   ProtocolResponse,
   MandateRow,
   MerchantChurnResponse,
+  MerchantProfile,
   MerchantRevenueResponse,
   MerchantSummary,
   PlanRow,
+  ProtocolFeeBucket,
+  ProtocolFeesResponse,
   RevenueBucket,
   RevenueBucketSize,
   StatsResponse,
   SubscriberSummary,
   TokenRevenue,
+  UnpaidMandateRow,
   VaultBalancePage,
   VaultEventPage,
 } from "../routes/types.ts";
@@ -35,6 +39,7 @@ export interface ListCursorFilter {
 
 export interface ListPlansFilter extends ListCursorFilter {
   merchant?: string | undefined;
+  q?: string | undefined;
 }
 
 export interface ListMandatesFilter extends ListCursorFilter {
@@ -72,12 +77,62 @@ export async function listPlans(
   db: Storage,
   filter: ListPlansFilter,
 ): Promise<{ rows: PlanRow[]; nextCursorId: number | null }> {
+  const { where, args } = planFilter(filter);
   return cursorPage<PlanRow>(
     db,
     "FROM plans",
-    filter.merchant ? "WHERE merchant = ?" : "",
-    filter.merchant ? [filter.merchant] : [],
+    where,
+    args,
     filter,
+  );
+}
+
+/** The WHERE clause and bound values of the merchant and name filters a plan listing takes. */
+function planFilter(filter: Omit<ListPlansFilter, "cursor" | "limit">): {
+  where: string;
+  args: unknown[];
+} {
+  const conditions: string[] = [];
+  const args: unknown[] = [];
+
+  if (filter.merchant) {
+    conditions.push("merchant = ?");
+    args.push(filter.merchant);
+  }
+  if (filter.q) {
+    const escaped = filter.q
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    conditions.push("LOWER(name) LIKE LOWER(?) ESCAPE '\\'");
+    args.push(`%${escaped}%`);
+  }
+
+  return { where: conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "", args };
+}
+
+/**
+ * The `limit` most popular plans: the most active mandates first, ties broken
+ * by plan id ascending so the order is total and stable. A plan without an
+ * active mandate still ranks, last, with a count of zero.
+ *
+ * Each plan's count is one covering range lookup on `mandates_plan_status`
+ * (plan_id, status), so the cost is O(P log M + A) for the P plans the
+ * filters keep, M mandates and A of them active; SQLite keeps only the top
+ * `limit` rows while it sorts, so memory is O(limit).
+ */
+export async function listPlansBySubscribers(
+  db: Storage,
+  filter: Omit<ListPlansFilter, "cursor">,
+): Promise<PlanRow[]> {
+  const { where, args } = planFilter(filter);
+  return db.all<PlanRow>(
+      `SELECT * FROM plans ${where}
+        ORDER BY (SELECT COUNT(*) FROM mandates m
+                   WHERE m.plan_id = plans.id AND m.status = 'Active') DESC,
+                 id ASC
+        LIMIT ?`,
+    [...args, filter.limit],
   );
 }
 
@@ -114,6 +169,35 @@ export async function cursorPage<T extends { id: number }>(
 /** Look up a single plan by on-chain id. */
 export async function getPlanById(db: Storage, id: number): Promise<PlanRow | undefined> {
   return db.get<PlanRow>("SELECT * FROM plans WHERE id = ?", [id]);
+}
+
+/** A merchant's self-declared profile, or undefined when it never set one. */
+export async function getMerchantProfile(
+  db: Storage,
+  merchant: string,
+): Promise<MerchantProfile | undefined> {
+  return db.get<MerchantProfile>(
+    "SELECT merchant, name, url, ledger FROM merchant_profiles WHERE merchant = ?",
+    [merchant],
+  );
+}
+
+/**
+ * Batch the self-declared display name for a set of merchants, so naming a
+ * page of plans costs one primary-key read rather than one per row. Addresses
+ * are de-duped first; a merchant without a profile is absent from the map.
+ */
+export async function merchantNamesByAddress(
+  db: Storage,
+  merchants: string[],
+): Promise<Map<string, string>> {
+  const unique = [...new Set(merchants)];
+  if (unique.length === 0) return new Map();
+  const rows = await db.all<{ merchant: string; name: string }>(
+    `SELECT merchant, name FROM merchant_profiles WHERE merchant IN (${unique.map(() => "?").join(",")})`,
+    unique,
+  );
+  return new Map(rows.map((row) => [row.merchant, row.name]));
 }
 
 /** A plan's statistics, grouped from its mandates and their settled charges. */
@@ -250,6 +334,51 @@ export async function listMandateCharges(
   );
 }
 
+/** One settled charge, as the merchant CSV export reads it. */
+export interface MerchantChargeRow {
+  tx_hash: string;
+  mandate_id: number;
+  subscriber: string;
+  amount: string;
+  fee: string;
+  created_at: number;
+}
+
+/** Where a page of `listMerchantChargesAfter` resumes: the last row's sort key. */
+export interface ChargeKey {
+  created_at: number;
+  tx_hash: string;
+  mandate_id: number;
+}
+
+/**
+ * One page of a merchant's charges, oldest first, after `after` in
+ * (created_at, tx_hash, mandate_id) order. Keyset pages over the
+ * `charges_merchant_created_at` index keep every query short, so a long
+ * export never holds the synchronous SQLite for its whole length.
+ * `from`/`to` bound `created_at` in unix milliseconds, half-open.
+ */
+export async function listMerchantChargesAfter(
+  db: Storage,
+  merchant: string,
+  after: ChargeKey | null,
+  limit: number,
+  from = 0,
+  to = Number.MAX_SAFE_INTEGER,
+): Promise<MerchantChargeRow[]> {
+  const key = after ?? { created_at: -1, tx_hash: "", mandate_id: -1 };
+  return db.all<MerchantChargeRow>(
+      `SELECT tx_hash, mandate_id, subscriber, amount, fee, created_at
+         FROM charges
+        WHERE merchant = ?
+          AND created_at >= ? AND created_at < ?
+          AND (created_at, tx_hash, mandate_id) > (?, ?, ?)
+        ORDER BY created_at, tx_hash, mandate_id
+        LIMIT ?`,
+    [merchant, from, to, key.created_at, key.tx_hash, key.mandate_id, limit],
+  );
+}
+
 /** Latest indexed vault balance for each token owned by an address. */
 export async function getVaultBalances(
   db: Storage,
@@ -294,7 +423,95 @@ export async function getProtocolFeeHistory(db: Storage): Promise<ProtocolRespon
          FROM fee_history
         ORDER BY ledger DESC, tx_hash DESC`,
   );
-  return { fee_bps: history[0]?.new_fee_bps ?? null, history };
+  // The newest upgrade per contract; empty until a contract has been upgraded.
+  const contract_versions = await db.all<ProtocolResponse["contract_versions"][number]>(
+      `SELECT u.contract_id, u.new_hash AS wasm_hash, u.ledger
+         FROM contract_upgrades u
+        WHERE u.ledger = (SELECT MAX(ledger) FROM contract_upgrades WHERE contract_id = u.contract_id)
+        ORDER BY contract_id`,
+  );
+  return { fee_bps: history[0]?.new_fee_bps ?? null, history, contract_versions };
+}
+
+/**
+ * The protocol's fee income over time: the sum of every charge's fee, in
+ * calendar buckets of the ledger close time the charge was emitted in.
+ *
+ * `charges` is keyed on (tx_hash, mandate_id), so a replayed ledger cannot
+ * count a fee twice, and `created_at` is the chain's clock, so the report is
+ * the same whether a charge was indexed live or on a backfill. Every sum reads
+ * as bigint, so no amount round-trips through a JavaScript number.
+ *
+ * The report covers the newest `limit` buckets, ending with the one the most
+ * recent charge falls in, and every bucket between the first and the last one
+ * with fees is present, so a chart has no gaps. Only the charges inside that
+ * window are read: the newest and the oldest charge are one index seek each
+ * and the window is one covering range scan of `charges_created_at_fee`, so
+ * the cost is O(log C + W) for C charges and W of them in the window, and
+ * memory is O(limit) buckets.
+ */
+export async function getProtocolFees(
+  db: Storage,
+  bucket: RevenueBucketSize,
+  limit: number,
+): Promise<ProtocolFeesResponse> {
+  const newest = (await db.get<{ at: number | null }>("SELECT MAX(created_at) AS at FROM charges"))?.at ?? null;
+  const oldest = (await db.get<{ at: number | null }>("SELECT MIN(created_at) AS at FROM charges"))?.at ?? null;
+  if (newest === null || oldest === null) {
+    return { bucket, buckets: [], totals: { fee: "0", charges: 0 } };
+  }
+
+  // `created_at` is unix milliseconds; the bucket arithmetic is in seconds.
+  const last = Math.floor(newest / 1000);
+  const first = windowStart(bucket, last, limit);
+  const rows = await db.all<{ created_at: number; fee: string }>(
+    "SELECT created_at, fee FROM charges WHERE created_at >= ?",
+    [first * 1000],
+  );
+  const perBucket = new Map<number, { fee: bigint; charges: number }>();
+  for (const row of rows) {
+    const key = Math.floor(bucketStart(bucket, Math.floor(row.created_at / 1000)).getTime() / 1000);
+    const current = perBucket.get(key) ?? { fee: 0n, charges: 0 };
+    current.fee += BigInt(row.fee);
+    current.charges += 1;
+    perBucket.set(key, current);
+  }
+
+  // The window ends at the newest charge's bucket and starts `limit` buckets
+  // earlier, or at the oldest charge's bucket when the history is shorter, so
+  // the gap-filled range never exceeds the limit.
+  const from = Math.max(first, Math.floor(oldest / 1000));
+  const buckets: ProtocolFeeBucket[] = bucketStarts(bucket, from, last).map((start) => {
+    const entry = perBucket.get(Math.floor(start.getTime() / 1000));
+    return {
+      bucket: bucketLabel(bucket, start),
+      fee: String(entry?.fee ?? 0n),
+      charges: entry?.charges ?? 0,
+    };
+  });
+
+  let fee = 0n;
+  let charges = 0;
+  for (const b of buckets) {
+    fee += BigInt(b.fee);
+    charges += b.charges;
+  }
+  return { bucket, buckets, totals: { fee: String(fee), charges } };
+}
+
+/**
+ * The start, in unix seconds, of the oldest of the `count` buckets that end
+ * with the one `at` (unix seconds) falls in. Months step on the calendar, so
+ * a window of months always starts on the first of a month.
+ */
+function windowStart(bucket: RevenueBucketSize, at: number, count: number): number {
+  const last = bucketStart(bucket, at);
+  const back = count - 1;
+  if (bucket === "month") {
+    return Math.floor(Date.UTC(last.getUTCFullYear(), last.getUTCMonth() - back, 1) / 1000);
+  }
+  const step = bucket === "day" ? 86_400 : 604_800;
+  return Math.floor(last.getTime() / 1000) - back * step;
 }
 
 /** List active mandates currently eligible for settlement at `now`. */
@@ -377,6 +594,97 @@ export async function listLatestVaultBalances(
     balances.set(row.user, perToken);
   }
   return balances;
+}
+
+/**
+ * The last indexed vault balance each due mandate would be paid from, in row
+ * order: the subscriber's balance of the mandate's plan token, or undefined
+ * when none is indexed. A mandate carries no token of its own — it inherits
+ * its plan's — so a batch of rows costs two reads, not two per row.
+ */
+export async function lastKnownBalances(
+  db: Storage,
+  rows: DueMandateRecord[],
+): Promise<Array<string | undefined>> {
+  const tokens = await planTokensByIds(db, rows.map((row) => row.plan_id));
+  const balances = await listLatestVaultBalances(db, rows.map((row) => row.subscriber));
+  return rows.map((row) => {
+    const token = tokens.get(row.plan_id);
+    return token ? balances.get(row.subscriber)?.get(token) : undefined;
+  });
+}
+
+/**
+ * Whether the last known vault balance covers a charge: the `funded` flag of
+ * `/due`. Amounts are compared as bigints: a balance is a decimal string in
+ * the token's smallest unit and must never round-trip through a JavaScript
+ * number. A subscriber the projection has never seen holds nothing.
+ */
+export function isFunded(balance: string | undefined, amount: string): boolean {
+  return balance !== undefined && BigInt(balance) >= BigInt(amount);
+}
+
+/** Due mandates read per step of the unpaid report; keeps each batch's `IN (...)` lists small. */
+const UNPAID_PAGE = 200;
+
+/**
+ * A merchant's due mandates whose last known vault balance cannot cover the
+ * charge, longest overdue first (ties by mandate id), at most `limit` of them.
+ *
+ * The due predicate is the one `/due` uses and the funded test is
+ * {@link isFunded}, so a mandate is here exactly when `/due` reports it with
+ * `funded: false`. The due mandates are walked in keyset pages over
+ * `mandates_merchant_status_next_charge`, already in report order, and the
+ * walk stops as soon as `limit` unpaid ones are found: the cost is O(D) for
+ * the D due mandates read before then, never a scan of the merchant's whole
+ * history, and memory is O(page + limit).
+ */
+export async function listMerchantUnpaidMandates(
+  db: Storage,
+  merchant: string,
+  now: number,
+  limit: number,
+): Promise<UnpaidMandateRow[]> {
+  // The keyset is spelled as a closed range on next_charge plus a tiebreak on
+  // id, not as a row value: SQLite's planner (with no ANALYZE statistics)
+  // then seeks the merchant's own index on both bounds instead of walking the
+  // protocol-wide `mandates_due` index. test/db.test.ts pins the plan.
+  const sql =
+    `SELECT id, subscriber, merchant, next_charge, amount, plan_id
+       FROM mandates
+      WHERE merchant = ? AND status = 'Active'
+        AND next_charge BETWEEN ? AND ?
+        AND (next_charge > ? OR id > ?)
+        AND (max_charges = 0 OR charges_made < max_charges)
+      ORDER BY next_charge, id
+      LIMIT ?`;
+  const unpaid: UnpaidMandateRow[] = [];
+  let after = { next_charge: -1, id: -1 };
+  for (;;) {
+    const rows = await db.all<DueMandateRecord>(
+      sql,
+      [merchant, after.next_charge, now, after.next_charge, after.id, UNPAID_PAGE],
+    );
+    const balances = await lastKnownBalances(db, rows);
+    for (const [i, row] of rows.entries()) {
+      const balance = balances[i];
+      if (isFunded(balance, row.amount)) continue;
+      // No indexed balance means the vault holds nothing of the token.
+      const held = BigInt(balance ?? "0");
+      unpaid.push({
+        id: row.id,
+        subscriber: row.subscriber,
+        next_charge: row.next_charge,
+        amount: row.amount,
+        balance: String(held),
+        shortfall: String(BigInt(row.amount) - held),
+        overdue_seconds: now - row.next_charge,
+      });
+      if (unpaid.length === limit) return unpaid;
+    }
+    if (rows.length < UNPAID_PAGE) return unpaid;
+    after = rows[rows.length - 1]!;
+  }
 }
 
 /** Revenue per token: sums from charges and active mandates, joined via plans. */
@@ -831,4 +1139,83 @@ export async function getProtocolStats(
     activeMerchants,
     lastIndexedLedger: cursor?.last_ledger ?? 0,
   };
+}
+
+/** Raw event archive row, as stored by indexer issue #34. */
+export interface RawContractEventRow {
+  event_id: string;
+  contract_id: string;
+  ledger: number;
+  tx_hash: string;
+  event_index: string;
+  topics: string;
+  data: string;
+  close_time: number | null;
+}
+
+/**
+ * Read one bounded archive batch in ledger/event order. Separate static SQL
+ * statements avoid dynamic SQL interpolation and preserve parameter binding.
+ */
+export async function listRawContractEvents(
+  db: Storage,
+  ledger: number,
+  eventId: string,
+  contract: string | undefined,
+  limit: number,
+): Promise<RawContractEventRow[]> {
+  if (contract === undefined) {
+    return db.all<RawContractEventRow>(
+      "SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time FROM events WHERE (ledger, event_id) > (?, ?) ORDER BY ledger, event_id LIMIT ?",
+      [ledger, eventId, limit],
+    );
+  }
+  return db.all<RawContractEventRow>(
+    "SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time FROM events WHERE (ledger, event_id) > (?, ?) AND contract_id = ? ORDER BY ledger, event_id LIMIT ?",
+    [ledger, eventId, contract, limit],
+  );
+}
+
+/** Full event history, independent of the aggregate mandate_events churn log. */
+export interface MandateTimelineRow {
+  mandate_id: number;
+  tx_hash: string;
+  kind: string;
+  ledger: number;
+  at: number | null;
+  details: string;
+}
+
+export function listMandateTimeline(db: Storage, mandateId: number): Promise<MandateTimelineRow[]> {
+  return db.all<MandateTimelineRow>(
+    "SELECT mandate_id, tx_hash, kind, ledger, at, details FROM mandate_timeline WHERE mandate_id = ? ORDER BY ledger ASC, tx_hash ASC, kind ASC",
+    [mandateId],
+  );
+}
+
+/** Contract upgrade history. */
+export interface ContractUpgradeRow {
+  contract_id: string;
+  tx_hash: string;
+  ledger: number;
+  close_time: number;
+  new_hash: string;
+  old_hash: string | null;
+}
+
+export async function listContractUpgrades(
+  db: Storage,
+  contractId?: string,
+  limit: number = 100,
+): Promise<ContractUpgradeRow[]> {
+  if (contractId === undefined) {
+    return db.all<ContractUpgradeRow>(
+      "SELECT contract_id, tx_hash, ledger, close_time, new_hash, old_hash FROM contract_upgrades ORDER BY ledger DESC LIMIT ?",
+      [limit],
+    );
+  }
+  return db.all<ContractUpgradeRow>(
+    "SELECT contract_id, tx_hash, ledger, close_time, new_hash, old_hash FROM contract_upgrades WHERE contract_id = ? ORDER BY ledger DESC LIMIT ?",
+    [contractId, limit],
+  );
 }
