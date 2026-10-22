@@ -382,7 +382,16 @@ export function getProtocolFeeHistory(db: DatabaseSync): ProtocolResponse {
         ORDER BY ledger DESC, rowid DESC`,
     )
     .all() as unknown as ProtocolResponse["history"];
-  return { fee_bps: history[0]?.new_fee_bps ?? null, history };
+  // The newest upgrade per contract; empty until a contract has been upgraded.
+  const contract_versions = db
+    .prepare(
+      `SELECT contract_id, new_hash AS wasm_hash, ledger
+         FROM contract_upgrades u
+        WHERE ledger = (SELECT MAX(ledger) FROM contract_upgrades WHERE contract_id = u.contract_id)
+        ORDER BY contract_id`,
+    )
+    .all() as unknown as ProtocolResponse["contract_versions"];
+  return { fee_bps: history[0]?.new_fee_bps ?? null, history, contract_versions };
 }
 
 /**

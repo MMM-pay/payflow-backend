@@ -26,7 +26,9 @@ export type AdminScope = "reindex" | "keeper" | "indexer" | "*";
 /** Admin token with optional expiry and scoping. */
 export interface AdminToken {
   token: string;
+  /** Operations the token may perform; all when omitted. */
   scopes?: AdminScope[];
+  /** Unix seconds after which the token is refused. */
   expiresAt?: number;
 }
 
@@ -62,7 +64,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   }
 
   function isExpired(t: AdminToken): boolean {
-    return t.expiresAt !== undefined && t.expiresAt < Date.now();
+    return t.expiresAt !== undefined && t.expiresAt * 1000 <= Date.now();
   }
 
   r.use((req, res, next) => {

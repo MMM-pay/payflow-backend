@@ -8,7 +8,7 @@ import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
 import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
-import { buildAdminRoutes, type AdminHooks, type AdminToken, type AdminScope } from "./routes/admin.ts";
+import { buildAdminRoutes, type AdminHooks, type AdminToken } from "./routes/admin.ts";
 import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
 import { buildOpenApiDocument } from "./routes/openapi.ts";
 import { asReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -89,37 +89,6 @@ const SEP10_PATH = /^\/api\/(?:[a-z][a-z0-9-]*\/)?auth(?:\?|$)/;
 
 /** Ledgers the indexer may trail the network by before it is considered behind. */
 const MAX_LAG = 120;
-
-/**
- * Parse admin token with optional scopes and expiry.
- * Format: `token` or `token:scope1,scope2:expiry_timestamp`
- */
-function parseAdminToken(input: string): AdminToken {
-  const parts = input.split(":");
-  const token = parts[0] ?? "";
-  if (parts.length === 1) return { token };
-
-  const scopes: AdminScope[] = [];
-  let expiresAt: number | undefined;
-
-  const scopesStr = parts[1];
-  if (scopesStr) {
-    for (const scope of scopesStr.split(",")) {
-      const trimmed = scope.trim();
-      if (trimmed === "*" || trimmed === "reindex" || trimmed === "keeper" || trimmed === "indexer") {
-        scopes.push(trimmed as AdminScope);
-      }
-    }
-  }
-
-  const expiryStr = parts[2];
-  if (expiryStr) {
-    const expiry = parseInt(expiryStr, 10);
-    if (!isNaN(expiry)) expiresAt = expiry;
-  }
-
-  return { token, ...(scopes.length > 0 ? { scopes } : {}), ...(expiresAt ? { expiresAt } : {}) };
-}
 
 /** Ledgers the projection trails the network by; null until the first pass. */
 function lagOf(indexer: IndexerStatus | undefined): number | null {
@@ -375,16 +344,28 @@ export function createApp(
 
   // Version and build information endpoint.
   app.get("/version", (_req, res) => {
-    res.json(getVersionInfo());
+    res.json({
+      ...getVersionInfo(),
+      network: config.STELLAR_NETWORK,
+      contracts: {
+        planRegistry: config.PLAN_REGISTRY_ID,
+        vault: config.VAULT_ID,
+        subscription: config.SUBSCRIPTION_ID,
+      },
+    });
   });
 
   // Operator endpoints are opt-in. Without ADMIN_TOKEN — or without hooks —
   // /admin falls through to the 404 below like any unknown path.
-  if (config.ADMIN_TOKEN && admin) {
-    const adminToken = config.ADMIN_TOKEN.includes(":")
-      ? [parseAdminToken(config.ADMIN_TOKEN)]
-      : config.ADMIN_TOKEN;
-    app.use("/admin", buildAdminRoutes(adminToken, admin));
+  // ADMIN_TOKEN is a full-access token used exactly as written (a colon in it
+  // is just part of the secret); scoped and expiring tokens come from
+  // ADMIN_TOKENS.
+  const adminTokens: AdminToken[] = [
+    ...(config.ADMIN_TOKEN ? [{ token: config.ADMIN_TOKEN }] : []),
+    ...((config.ADMIN_TOKENS ?? []) as AdminToken[]),
+  ];
+  if (adminTokens.length > 0 && admin) {
+    app.use("/admin", buildAdminRoutes(adminTokens, admin));
   }
 
   if (config.KEEPER_ENABLED && admin?.keeperHistory) {

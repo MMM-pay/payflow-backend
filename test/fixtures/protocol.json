@@ -7,5 +7,6 @@
       "new_fee_bps": 125,
       "ledger": 1
     }
-  ]
+  ],
+  "contract_versions": []
 }

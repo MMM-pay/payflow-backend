@@ -1,26 +1,35 @@
+import { readFileSync } from "node:fs";
+
 /**
- * Build-time version and commit information.
- * Populated by build process; at runtime exports package.json version.
+ * Version information for `GET /version`.
+ *
+ * The version is read from package.json once at startup. The commit comes
+ * from the environment the deployment sets: `GIT_COMMIT`, or the variables
+ * Render and GitHub Actions provide. Nothing here is secret.
  */
-
-let buildVersion = "0.2.0";
-let buildCommit = "unknown";
-let buildTime = new Date().toISOString();
-
 export interface VersionInfo {
   version: string;
   commit: string;
-  buildTime: string;
   nodeVersion: string;
-  typescript: boolean;
+  startedAt: string;
 }
 
+function packageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+      version?: string;
+    };
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+const VERSION = packageVersion();
+const COMMIT =
+  process.env.GIT_COMMIT ?? process.env.RENDER_GIT_COMMIT ?? process.env.GITHUB_SHA ?? "unknown";
+const STARTED_AT = new Date().toISOString();
+
 export function getVersionInfo(): VersionInfo {
-  return {
-    version: buildVersion,
-    commit: buildCommit,
-    buildTime,
-    nodeVersion: process.version,
-    typescript: true,
-  };
+  return { version: VERSION, commit: COMMIT, nodeVersion: process.version, startedAt: STARTED_AT };
 }

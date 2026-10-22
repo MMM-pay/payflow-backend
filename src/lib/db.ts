@@ -334,7 +334,7 @@ export function saveContractUpgrade(db: DatabaseSync, upgrade: ContractUpgrade):
 export function clearProjections(db: DatabaseSync): void {
   // Do not remove cursor, raw events, or operational webhook configuration.
   for (const table of [
-    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline",
+    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline", "contract_upgrades",
   ]) {
     db.exec(`DELETE FROM ${table}`);
   }

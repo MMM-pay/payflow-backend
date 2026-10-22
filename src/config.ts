@@ -38,6 +38,14 @@ const optionalSecret = z
     "must be a valid Stellar secret seed",
   );
 
+const adminTokensSchema = z.array(
+  z.object({
+    token: z.string().min(16, "each admin token needs at least 16 characters"),
+    scopes: z.array(z.enum(["reindex", "keeper", "indexer", "*"])).nonempty().optional(),
+    expiresAt: z.number().int().positive().optional(),
+  }),
+);
+
 const schema = z.object({
   STELLAR_NETWORK: z.string().default("testnet"),
   /** One or more RPC endpoints; the client fails over between them. */
@@ -199,6 +207,25 @@ const schema = z.object({
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
 
   ADMIN_TOKEN: z.string().optional(),
+  /**
+   * Scoped operator tokens, as a JSON array of
+   * `{ "token": "...", "scopes": ["reindex" | "keeper" | "indexer" | "*"], "expiresAt": <unix seconds> }`.
+   * `scopes` defaults to all; `expiresAt` is optional. `ADMIN_TOKEN` keeps
+   * working as a full-access token with no expiry.
+   */
+  ADMIN_TOKENS: z
+    .string()
+    .optional()
+    .transform((raw, ctx) => {
+      if (!raw || !raw.trim()) return [];
+      try {
+        const parsed = adminTokensSchema.parse(JSON.parse(raw));
+        return parsed;
+      } catch (err) {
+        ctx.addIssue({ code: "custom", message: `ADMIN_TOKENS must be a JSON array of tokens (${err instanceof Error ? err.message.slice(0, 120) : "invalid"})` });
+        return z.NEVER;
+      }
+    }),
 
   /**
    * How long a rotated webhook secret keeps signing deliveries beside the new

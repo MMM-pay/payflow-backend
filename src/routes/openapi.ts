@@ -1097,6 +1097,44 @@ function operationSuffix(root: string): string {
 /** The paths that do not belong to the read API. */
 function servicePaths(): Record<string, PathItemObject> {
   return {
+    "/version": {
+      get: {
+        tags: ["service"],
+        summary: "Version and build information",
+        description:
+          "The package version, the git commit the deployment was built from (when the host provides it), the Node.js version, when the process started, and the network and contracts it serves. Contains no secrets.",
+        operationId: "getVersion",
+        responses: {
+          "200": {
+            description: "Version information.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    version: { type: "string" },
+                    commit: { type: "string" },
+                    nodeVersion: { type: "string" },
+                    startedAt: { type: "string", format: "date-time" },
+                    network: { type: "string" },
+                    contracts: {
+                      type: "object",
+                      properties: {
+                        planRegistry: { type: "string" },
+                        vault: { type: "string" },
+                        subscription: { type: "string" },
+                      },
+                      required: ["planRegistry", "vault", "subscription"],
+                    },
+                  },
+                  required: ["version", "commit", "nodeVersion", "startedAt", "network", "contracts"],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     "/health": {
       get: {
         tags: ["service"],
@@ -1840,8 +1878,21 @@ function componentSchemas(): Record<string, SchemaObject> {
             required: ["tx_hash", "old_fee_bps", "new_fee_bps", "ledger"],
           },
         },
+        contract_versions: {
+          type: "array",
+          description: "The latest code version (wasm hash, hex) of each contract that has been upgraded.",
+          items: {
+            type: "object",
+            properties: {
+              contract_id: { type: "string" },
+              wasm_hash: { type: "string" },
+              ledger: { type: "integer" },
+            },
+            required: ["contract_id", "wasm_hash", "ledger"],
+          },
+        },
       },
-      required: ["fee_bps", "history"],
+      required: ["fee_bps", "history", "contract_versions"],
     },
     Stats: {
       type: "object",

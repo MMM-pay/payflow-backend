@@ -577,6 +577,15 @@ export class Indexer {
       case "debit":
         this.onVaultEvent(e);
         return "applied";
+      case "upgraded": {
+        // Emitted by a contract's admin-gated upgrade with the new wasm hash.
+        const raw = e.data.new_wasm_hash;
+        const hash =
+          raw instanceof Uint8Array ? Buffer.from(raw).toString("hex") : typeof raw === "string" ? raw : "";
+        if (!hash) return "unknown";
+        this.recordContractUpgrade(e.contractId, e.txHash, e.ledger, e.closeTime ?? null, hash);
+        return "applied";
+      }
       default:
         logger.debug({ name: e.name }, "unhandled event");
         return "unknown";

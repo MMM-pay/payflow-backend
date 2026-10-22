@@ -185,6 +185,8 @@ export interface ProtocolResponse {
   /** Null until a fee_changed event has been indexed. */
   fee_bps: number | null;
   history: ProtocolFeeChange[];
+  /** The latest code version of each contract that has been upgraded. */
+  contract_versions: { contract_id: string; wasm_hash: string; ledger: number }[];
 }
 
 export interface KeeperPassSummary {
