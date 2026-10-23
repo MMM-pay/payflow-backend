@@ -21,6 +21,7 @@
     "indexer": "node --experimental-strip-types src/cmd/indexer.ts",
     "keeper": "node --experimental-strip-types src/cmd/keeper.ts",
     "cli": "node --experimental-strip-types src/cmd/cli.ts",
+    "seed": "node --experimental-strip-types src/cmd/seed.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "test:coverage": "node --experimental-strip-types --experimental-test-coverage --test-coverage-include=src/** --test-coverage-lines=94 --test-reporter=tap --test-reporter=lcov --test-reporter-destination=stdout --test-reporter-destination=lcov.info --test test/*.test.ts",
     "typecheck": "npm run typecheck:src && npm run typecheck:test",
