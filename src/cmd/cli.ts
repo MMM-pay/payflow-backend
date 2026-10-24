@@ -36,7 +36,7 @@
 import { pathToFileURL } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
 import { networkConfigs, loadConfig, type Config, type NetworkConfig } from "../config.ts";
-import { openDatabase, readCursor, writeCursor } from "../lib/db.ts";
+import { openDatabase, readCursor, writeCursor, backupDatabase } from "../lib/db.ts";
 import { HttpArchive, makeRpc, type RpcLike } from "../lib/stellar.ts";
 import {
   countDueMandates,
@@ -262,6 +262,18 @@ const COMMAND_LIST: CommandSpec[] = [
       "Moving the cursor forward is refused as well: the ledgers in between",
       "would never be applied, and the indexer would not notice the gap it",
       "leaves. --skip-ahead accepts it.",
+    ],
+  },
+  {
+    name: "backup",
+    summary: "Back up the SQLite database to a file",
+    usage: "backup <path>",
+    positionals: [{ name: "<path>", description: "Destination file for the backup" }],
+    options: [],
+    notes: [
+      "Writes a transactionally consistent snapshot of the database to",
+      "`<path>` using SQLite's VACUUM INTO. The running service keeps serving",
+      "requests while the backup is taken.",
     ],
   },
 ];
@@ -1032,6 +1044,20 @@ async function reindexCommand(context: CommandContext): Promise<number> {
   }
 }
 
+async function backupCommand(context: CommandContext): Promise<number> {
+  const { deps, args, write } = context;
+  const openDb = deps.openDb ?? openDatabase;
+  const db = openDb(databasePath(context.network, args.options));
+  try {
+    const path = args.positionals[0] as string;
+    backupDatabase(db, path);
+    write(`backed up ${context.network.name} to ${path}`);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 /** Run one command. */
 async function runCommand(context: CommandContext): Promise<number> {
   switch (context.spec.name) {
@@ -1045,6 +1071,8 @@ async function runCommand(context: CommandContext): Promise<number> {
       return chargeCommand(context);
     case "reindex":
       return reindexCommand(context);
+    case "backup":
+      return backupCommand(context);
     default:
       throw new CliError(`unknown command '${context.spec.name}'`);
   }
