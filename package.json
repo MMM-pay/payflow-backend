@@ -29,6 +29,7 @@
     "typecheck:src": "tsc --noEmit -p tsconfig.json",
     "typecheck:test": "tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint src test",
+    "schema": "node --experimental-strip-types src/cmd/schema.ts",
     "rebuild:projections": "node --experimental-strip-types src/cmd/rebuild-projections.ts",
     "reindex": "node --experimental-strip-types src/cmd/reindex.ts"
   },

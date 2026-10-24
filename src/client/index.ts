@@ -77,6 +77,13 @@ export type {
   VaultEventRow,
 } from "../routes/types.ts";
 
+/**
+ * The canonical, versioned API root. The service also answers the same routes
+ * under `/api`, but a client built against this version names the version it
+ * expects so a later breaking change cannot silently reach it.
+ */
+const API_PATH = "/api/v1";
+
 export interface PlansQuery {
   merchant?: string;
   /** Opaque cursor from a previous page; fetch the page after it. */
@@ -164,47 +171,47 @@ export class PayflowClient {
   }
 
   plans(query: PlansQuery = {}): Promise<PlanPage> {
-    return this.get<PlanPage>("/api/plans", query);
+    return this.get<PlanPage>(`${API_PATH}/plans`, query);
   }
 
   plan(id: number): Promise<PlanRow> {
-    return this.get<PlanRow>(`/api/plans/${id}`);
+    return this.get<PlanRow>(`${API_PATH}/plans/${id}`);
   }
 
   planStats(id: number): Promise<PlanStatsResponse> {
-    return this.get<PlanStatsResponse>(`/api/plans/${id}/stats`);
+    return this.get<PlanStatsResponse>(`${API_PATH}/plans/${id}/stats`);
   }
 
   mandates(query: MandatesQuery = {}): Promise<MandatePage> {
-    return this.get<MandatePage>("/api/mandates", query);
+    return this.get<MandatePage>(`${API_PATH}/mandates`, query);
   }
 
   mandate(id: number): Promise<MandateRow> {
-    return this.get<MandateRow>(`/api/mandates/${id}`);
+    return this.get<MandateRow>(`${API_PATH}/mandates/${id}`);
   }
 
   charges(mandateId: number, query: ChargesQuery = {}): Promise<ChargePage> {
-    return this.get<ChargePage>(`/api/mandates/${mandateId}/charges`, query);
+    return this.get<ChargePage>(`${API_PATH}/mandates/${mandateId}/charges`, query);
   }
 
   due(query: PageQuery = {}): Promise<DuePage> {
-    return this.get<DuePage>("/api/due", query);
+    return this.get<DuePage>(`${API_PATH}/due`, query);
   }
 
   merchantSummary(address: string): Promise<MerchantSummary> {
-    return this.get<MerchantSummary>(`/api/merchants/${encodeURIComponent(address)}/summary`);
+    return this.get<MerchantSummary>(`${API_PATH}/merchants/${encodeURIComponent(address)}/summary`);
   }
 
   merchantForecast(address: string, days?: number): Promise<ForecastResponse> {
     return this.get<ForecastResponse>(
-      `/api/merchants/${encodeURIComponent(address)}/forecast`,
+      `${API_PATH}/merchants/${encodeURIComponent(address)}/forecast`,
       days !== undefined ? { days } : undefined,
     );
   }
 
   merchantSubscribers(address: string, query: PageQuery = {}): Promise<MerchantSubscribersResponse> {
     return this.get<MerchantSubscribersResponse>(
-      `/api/merchants/${encodeURIComponent(address)}/subscribers`,
+      `${API_PATH}/merchants/${encodeURIComponent(address)}/subscribers`,
       query,
     );
   }
@@ -215,7 +222,7 @@ export class PayflowClient {
     query: { bucket?: ChurnBucketSize; limit?: number } = {},
   ): Promise<MerchantChurnResponse> {
     return this.get<MerchantChurnResponse>(
-      `/api/merchants/${encodeURIComponent(address)}/churn`,
+      `${API_PATH}/merchants/${encodeURIComponent(address)}/churn`,
       query,
     );
   }
@@ -231,35 +238,35 @@ export class PayflowClient {
     query: { bucket?: ChurnBucketSize; from?: number; to?: number; limit?: number } = {},
   ): Promise<MerchantRevenueResponse> {
     return this.get<MerchantRevenueResponse>(
-      `/api/merchants/${encodeURIComponent(address)}/revenue`,
+      `${API_PATH}/merchants/${encodeURIComponent(address)}/revenue`,
       query,
     );
   }
 
   subscriberSummary(address: string): Promise<SubscriberSummary> {
-    return this.get<SubscriberSummary>(`/api/subscribers/${encodeURIComponent(address)}/summary`);
+    return this.get<SubscriberSummary>(`${API_PATH}/subscribers/${encodeURIComponent(address)}/summary`);
   }
 
   stats(): Promise<StatsResponse> {
-    return this.get<StatsResponse>("/api/stats");
+    return this.get<StatsResponse>(`${API_PATH}/stats`);
   }
 
   protocol(): Promise<ProtocolResponse> {
-    return this.get<ProtocolResponse>("/api/protocol");
+    return this.get<ProtocolResponse>(`${API_PATH}/protocol`);
   }
 
   vault(address: string): Promise<VaultBalancePage> {
-    return this.get<VaultBalancePage>(`/api/vault/${encodeURIComponent(address)}`);
+    return this.get<VaultBalancePage>(`${API_PATH}/vault/${encodeURIComponent(address)}`);
   }
 
   vaultEvents(address: string, query: PageQuery = {}): Promise<VaultEventPage> {
     return this.get<VaultEventPage>(
-      `/api/vault/${encodeURIComponent(address)}/events`,
+      `${API_PATH}/vault/${encodeURIComponent(address)}/events`,
       query,
     );
   }
 
   keeper(): Promise<KeeperHistoryResponse> {
-    return this.get<KeeperHistoryResponse>("/api/keeper");
+    return this.get<KeeperHistoryResponse>(`${API_PATH}/keeper`);
   }
 }

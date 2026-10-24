@@ -96,8 +96,21 @@ export function errorHandler(
   sendApiError(res, _req, 500, "internal_error");
 }
 
-/** `/api/auth` and `/api/<network>/auth`, with or without a query string. */
-const SEP10_PATH = /^\/api\/(?:[a-z][a-z0-9-]*\/)?auth(?:\?|$)/;
+/**
+ * The canonical, versioned root of the read API.
+ *
+ * Every route is served here, and the same router is mounted at `/api` below
+ * so an existing client that was written before versioning keeps working. A
+ * breaking change can then be made in `/api/v2` without touching `/api/v1`,
+ * and `/api` keeps naming v1 until it is retired under the deprecation policy
+ * in API_CHANGELOG.md.
+ */
+const API_V1 = "/api/v1";
+/** The unversioned root, an alias of `API_V1`. */
+const API_ALIAS = "/api";
+
+/** `/api/auth`, `/api/v1/auth` and `/api/<network>/auth`, with or without a query string. */
+const SEP10_PATH = /^\/api\/(?:v1\/)?(?:[a-z][a-z0-9-]*\/)?auth(?:\?|$)/;
 
 /** Ledgers the indexer may trail the network by before it is considered behind. */
 const MAX_LAG = 120;
@@ -315,7 +328,7 @@ export function createApp(
   const openApiDocument = buildOpenApiDocument({
     networks: runtimes.map((rt) => rt.config.name),
   });
-  app.get("/api/openapi.json", (_req, res) => {
+  app.get([`${API_V1}/openapi.json`, `${API_ALIAS}/openapi.json`], (_req, res) => {
     res.setHeader("Cache-Control", "public, max-age=60");
     res.json(openApiDocument);
   });
@@ -413,7 +426,7 @@ export function createApp(
   }
 
   if (config.KEEPER_ENABLED && admin?.keeperHistory) {
-    app.get("/api/keeper", (_req, res) => {
+    app.get([`${API_V1}/keeper`, `${API_ALIAS}/keeper`], (_req, res) => {
       res.json({ passes: admin.keeperHistory?.() ?? [] });
     });
   }
@@ -428,21 +441,23 @@ export function createApp(
       networkPassphrase: rt.config.networkPassphrase,
     });
 
-  app.use(
-    "/api",
-    buildApiRouter(
-      runtimes.map((rt) => ({
-        name: rt.config.name,
-        db: rt.db,
-        events: rt.events,
-        summaryCache: rt.summaryCache,
-        defaultToken: rt.config.defaultToken ?? config.TOKEN_ID,
-        tokens: tokenServiceOf(rt),
-        webhooks: rt.webhooks,
-        auth: rt.auth,
-      })),
-    ),
+  // One router, mounted twice: `/api/v1/...` is the canonical surface and
+  // `/api/...` is the same router under the unversioned alias. The versioned
+  // mount comes first so `/api` never has to answer a versioned path itself.
+  const apiRouter = buildApiRouter(
+    runtimes.map((rt) => ({
+      name: rt.config.name,
+      db: rt.db,
+      events: rt.events,
+      summaryCache: rt.summaryCache,
+      defaultToken: rt.config.defaultToken ?? config.TOKEN_ID,
+      tokens: tokenServiceOf(rt),
+      webhooks: rt.webhooks,
+      auth: rt.auth,
+    })),
   );
+  app.use(API_V1, apiRouter);
+  app.use(API_ALIAS, apiRouter);
 
   // Anything no route answered: an unknown path, or a method the API does not
   // expose on a known one.

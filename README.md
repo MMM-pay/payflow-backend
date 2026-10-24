@@ -116,7 +116,7 @@ On multi-network deployments, the same feed is also available at
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 477 tests, no network needed
+npm test                  # 642 tests, no network needed
 npm run test:coverage     # the same tests, with a coverage report and a threshold
 npm run dev
 ```
@@ -344,8 +344,11 @@ transaction would sequence against the one main account and serialize again.
 
 ## API
 
-Base path `/api`. All amounts are strings in the token's smallest unit
-(stroops for XLM) to avoid JavaScript float precision loss.
+Base path `/api/v1`. `/api` answers the same routes as an alias, so a client
+written before versioning keeps working, and a breaking change lands in
+`/api/v2` instead of altering the versioned surface underneath an existing
+client. All amounts are strings in the token's smallest unit (stroops for XLM)
+to avoid JavaScript float precision loss.
 
 `/health` is a **liveness** probe and always answers 200, so a slow backfill
 does not get the service restarted. `/ready` is a **readiness** probe: it
@@ -355,8 +358,9 @@ while the projection trails the network by more than 120 ledgers, and 200
 checks at `/ready` and liveness checks at `/health`.
 
 When extra networks are configured (see below), every route also answers under
-`/api/<network>/...` — `/api/mainnet/plans`, `/api/testnet/stats` — while
-`/api/...` keeps serving the default network unchanged.
+`/api/v1/<network>/...` — `/api/v1/mainnet/plans`, `/api/v1/testnet/stats` —
+while `/api/v1/...` keeps serving the default network unchanged. The
+unversioned `/api/<network>/...` paths remain as aliases.
 
 | Method | Path | Returns |
 |---|---|---|
@@ -423,11 +427,13 @@ no merchant.
 
 ### The OpenAPI description
 
-`GET /api/openapi.json` serves an [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0)
-document describing every route above, with the parameters each one takes, the
-responses it answers and the schema of each body. Amounts are documented as
-decimal strings in the token's smallest unit, so a generated client knows not
-to read them as numbers.
+`GET /api/v1/openapi.json` (also at `GET /api/openapi.json`) serves an
+[OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0) document describing every
+route above, with the parameters each one takes, the responses it answers and
+the schema of each body. Both the versioned paths and their unversioned
+aliases are documented. Amounts are documented as decimal strings in the
+token's smallest unit, so a generated client knows not to read them as
+numbers.
 
 The document is served by the instance it belongs to, so it lists the routes
 that instance actually has: the operator endpoints (`/admin/...`), the metrics
@@ -447,6 +453,13 @@ helmet's default (`script-src 'self'`, `style-src 'self' https:
 
 A test compares the document with the routes Express registers, so a route
 that is added without being documented fails the build.
+
+The same document is the consumer contract. `npm run schema` writes it to
+`api-schema.json`, and CI publishes that file as the `api-schema` artifact, so
+the frontend or any other consumer can validate its fixtures against exactly
+the schemas this service is tested against. `test/consumer.test.ts` does that
+for the golden response fixtures here; a field the document does not describe,
+or a required field that disappears, fails before it reaches a consumer.
 
 The document's `externalDocs` points at
 [API_CHANGELOG.md](API_CHANGELOG.md), which records what changed in the API
@@ -803,7 +816,8 @@ try {
 Every endpoint is covered: `health`, `plans`, `plan`, `planStats`, `mandates`,
 `mandate`, `charges`, `due`, `merchantSummary`, `merchantForecast`,
 `merchantSubscribers`, `merchantChurn`, `merchantRevenue`, `subscriberSummary`,
-`stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`.
+`stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`. The client calls the
+versioned `/api/v1` paths; `health` stays at the service root.
 
 The client is published independently as
 [`@mmm-pay/payflow-client`](https://www.npmjs.com/package/@mmm-pay/payflow-client).
@@ -884,8 +898,6 @@ examined without API downtime.
 | `KEEPER_MERCHANTS` | *(empty)* | Only settle mandates payable to these merchants, comma-separated `G...` addresses. Empty settles every merchant |
 | `KEEPER_FEE_PERCENTILE` | `90` | Soroban inclusion-fee percentile used for charge transactions (`50`, `60`, `70`, `80`, `90`, `95`, or `99`) |
 | `KEEPER_MAX_FEE` | `100000` | Maximum inclusion fee in stroops; congestion retries cannot exceed this cap |
-| `KEEPER_BATCH` | `true` | Use `charge_many` when supported, falling back to single charges when unavailable |
-| `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25) |
 | `KEEPER_BATCH` | `true` | Settle due mandates through the contract's `charge_many` in groups, falling back to single `charge` transactions when the contract does not support it |
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
@@ -958,9 +970,10 @@ Each network runs its own indexer with its own cursor and its own SQLite
 database — derived from `DATABASE_PATH` (`./payflow.db` becomes
 `./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise — so
 ledger numbers, replay windows and outages on one network never affect the
-other. Unprefixed `/api/...` routes always serve the default network
-(`STELLAR_NETWORK`); everything is also reachable under `/api/<name>/...`. The
-keeper settles the default network only.
+other. The unprefixed `/api/v1/...` routes always serve the default network
+(`STELLAR_NETWORK`), and everything is also reachable under
+`/api/v1/<name>/...`; the unversioned `/api/...` and `/api/<name>/...` paths
+are aliases. The keeper settles the default network only.
 
 
 ## Deployment

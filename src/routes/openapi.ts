@@ -100,6 +100,11 @@ export interface OpenApiDocument {
 /** The API version, as `package.json` has it. */
 const API_VERSION = "0.2.0";
 
+/** The canonical, versioned root of the read API. */
+const API_V1 = "/api/v1";
+/** The unversioned root, an alias of `API_V1` for existing clients. */
+const API_ALIAS = "/api";
+
 /**
  * The human-readable API reference, served at `/api/docs`.
  *
@@ -340,8 +345,9 @@ const unauthorizedProof = (): ResponseObject =>
 /**
  * The paths of the read API, mounted under `root`.
  *
- * `root` is `/api` for the default network and `/api/<name>` for every extra
- * network the instance serves.
+ * `root` is `/api/v1` for the default network and `/api/v1/<name>` for every
+ * extra network the instance serves. The unversioned `/api` paths are built
+ * from the same function, so the two surfaces cannot drift apart.
  */
 function apiPaths(root: string): Record<string, PathItemObject> {
   const p = (path: string): string => `${root}${path}`;
@@ -1304,16 +1310,23 @@ function apiPaths(root: string): Record<string, PathItemObject> {
 }
 
 /**
- * A suffix that keeps the operation ids unique across the networks.
+ * A suffix that keeps the operation ids unique across the networks and API
+ * versions.
  *
- * The same route is served under `/api/...` and under `/api/<network>/...`;
- * OpenAPI operation ids must be unique within a document.
+ * The same route is served under `/api/v1/...` and `/api/...`, and under
+ * `/api/v1/<network>/...` and `/api/<network>/...`; OpenAPI operation ids
+ * must be unique within a document. The unversioned paths keep the ids they
+ * had before versioning, and the versioned copies carry a `V1` suffix, so an
+ * existing generated client does not have to be regenerated.
  */
 function operationSuffix(root: string): string {
-  if (root === "/api") return "";
-  const name = root.split("/").filter(Boolean).pop() ?? "";
-  if (name === "") return "";
-  return `${name[0]!.toUpperCase()}${name.slice(1)}`;
+  const rest = root.split("/").filter(Boolean);
+  if (rest[0] === "api") rest.shift();
+  const versioned = rest[0] === "v1";
+  if (versioned) rest.shift();
+  const name = rest[0] ?? "";
+  const base = name === "" ? "" : `${name[0]!.toUpperCase()}${name.slice(1)}`;
+  return versioned ? `${base}V1` : base;
 }
 
 /** The paths that do not belong to the read API. */
@@ -1962,13 +1975,25 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["bucket", "started", "cancelled", "ended", "completed", "net"],
     },
+    /** The whole period's counts: a bucket's fields without its label. */
+    ChurnTotals: {
+      type: "object",
+      properties: {
+        started: { type: "integer" },
+        cancelled: { type: "integer" },
+        ended: { type: "integer" },
+        completed: { type: "integer" },
+        net: { type: "integer", description: "Started minus the departures." },
+      },
+      required: ["started", "cancelled", "ended", "completed", "net"],
+    },
     MerchantChurn: {
       type: "object",
       properties: {
         merchant: { type: "string", description: ADDRESS_DESCRIPTION },
         bucket: { type: "string", enum: ["day", "week", "month"] },
         buckets: { type: "array", items: { $ref: "#/components/schemas/ChurnBucket" } },
-        totals: { $ref: "#/components/schemas/ChurnBucket" },
+        totals: { $ref: "#/components/schemas/ChurnTotals" },
       },
       required: ["merchant", "bucket", "buckets", "totals"],
     },
@@ -2013,6 +2038,17 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["bucket", "gross", "fee", "net", "charges"],
     },
+    /** The whole period's money: a bucket's amounts without its label. */
+    RevenueTotals: {
+      type: "object",
+      properties: {
+        gross: amount(),
+        fee: amount(),
+        net: amount(),
+        charges: { type: "integer" },
+      },
+      required: ["gross", "fee", "net", "charges"],
+    },
     MerchantRevenue: {
       type: "object",
       properties: {
@@ -2021,7 +2057,7 @@ function componentSchemas(): Record<string, SchemaObject> {
         from: { type: ["integer", "null"], description: "Start of the range, in unix seconds." },
         to: { type: ["integer", "null"], description: "End of the range (exclusive), in unix seconds." },
         buckets: { type: "array", items: { $ref: "#/components/schemas/RevenueBucket" } },
-        totals: { $ref: "#/components/schemas/RevenueBucket" },
+        totals: { $ref: "#/components/schemas/RevenueTotals" },
       },
       required: ["merchant", "bucket", "from", "to", "buckets", "totals"],
     },
@@ -2290,12 +2326,21 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["bucket", "fee", "charges"],
     },
+    /** The whole period's fee revenue: a bucket's amounts without its label. */
+    ProtocolFeeTotals: {
+      type: "object",
+      properties: {
+        fee: amount(),
+        charges: { type: "integer" },
+      },
+      required: ["fee", "charges"],
+    },
     ProtocolFees: {
       type: "object",
       properties: {
         bucket: { type: "string", enum: ["day", "week", "month"] },
         buckets: { type: "array", items: { $ref: "#/components/schemas/ProtocolFeeBucket" } },
-        totals: { $ref: "#/components/schemas/ProtocolFeeBucket" },
+        totals: { $ref: "#/components/schemas/ProtocolFeeTotals" },
       },
       required: ["bucket", "buckets", "totals"],
     },
@@ -2434,12 +2479,21 @@ function componentSchemas(): Record<string, SchemaObject> {
  * extra network the instance serves, the same paths under `/api/<name>/`.
  */
 export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
+  const service = servicePaths();
+  const legacyOpenApi = service[`${API_ALIAS}/openapi.json`];
   const paths: Record<string, PathItemObject> = {
-    ...servicePaths(),
-    ...apiPaths("/api"),
+    ...service,
+    // The document is served under both roots too, with a distinct operation
+    // id so the alias is visible to a generated client.
+    [`${API_V1}/openapi.json`]: {
+      get: { ...legacyOpenApi!.get!, operationId: "getOpenApiV1" },
+    },
+    ...apiPaths(API_V1),
+    ...apiPaths(API_ALIAS),
   };
   for (const network of options.networks) {
-    Object.assign(paths, apiPaths(`/api/${network}`));
+    Object.assign(paths, apiPaths(`${API_V1}/${network}`));
+    Object.assign(paths, apiPaths(`${API_ALIAS}/${network}`));
   }
 
   return {
@@ -2451,11 +2505,18 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       description:
         "The API serves a projection of the Payflow contracts' events: plans, mandates, the charges settled against them and the vault balances behind them.\n\n" +
         "Every amount is a decimal string in the token's smallest unit (stroops for XLM), never a JSON number, so no precision is lost. Every non-2xx response uses the same envelope, `{ \"error\": { \"code\", \"message\", \"requestId\" } }`, where `code` is stable per condition.\n\n" +
-        "When the instance serves more than one network, the same paths are also reachable under `/api/<network>/...`.\n\n" +
+        "The API is versioned: `/api/v1/...` is the canonical surface and `/api/...` is an alias of it, answered by the same router from the same projection. A breaking change goes into the next version instead of altering `/api/v1`.\n\n" +
+        "When the instance serves more than one network, the same paths are also reachable under `/api/v1/<network>/...` and `/api/<network>/...`.\n\n" +
         "What changed in the API between releases, and how long a deprecated field or route keeps working before it is removed, is recorded in [API_CHANGELOG.md](API_CHANGELOG.md).",
       license: { name: "Apache-2.0", identifier: "Apache-2.0" },
     },
-    servers: [{ url: "/", description: "This service." }],
+    servers: [
+      {
+        url: "/",
+        description:
+          "This service. API paths are absolute: /api/v1/... is the canonical versioned API and /api/... is an alias of it.",
+      },
+    ],
     tags: [
       { name: "plans", description: "Published plans." },
       { name: "mandates", description: "Subscriptions and their settlement history." },

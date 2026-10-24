@@ -1,0 +1,28 @@
+{
+  "name": "Payflow Backend",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:22",
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "Payflow API",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "github.vscode-github-actions",
+        "ms-azuretools.vscode-docker",
+        "qwtel.sqlite-viewer"
+      ],
+      "settings": {
+        "typescript.tsdk": "node_modules/typescript/lib",
+        "editor.formatOnSave": false,
+        "files.eol": "\n"
+      }
+    }
+  },
+  "remoteUser": "node"
+}
