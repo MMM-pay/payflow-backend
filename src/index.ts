@@ -1,5 +1,5 @@
 import { loadConfig, networkConfigs } from "./config.ts";
-import { openDatabase } from "./lib/db.ts";
+import { openDatabase, pruneOldEvents, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -120,23 +120,96 @@ const runKeeperPass = keeper
 
 const adminHooks: AdminHooks = {
   reindex: async () => {
-    const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
-    return results[0]!;
+    const db = defaultRuntime.db;
+    try {
+      const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
+      logAuditEvent(db, {
+        action: "reindex",
+        success: true,
+        details: { cursor: results[0]?.cursor },
+      });
+      return results[0]!;
+    } catch (err) {
+      logAuditEvent(db, {
+        action: "reindex",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   },
   // Runtime indexer control: hold every network's loop back without taking the
   // API down. While paused, each tick is a no-op, so the cursor and projection
   // are preserved and /health reports `indexer.paused: true`.
   pauseIndexer: () => {
+    const db = defaultRuntime.db;
     for (const rt of runtimes) rt.indexer.pause();
+    logAuditEvent(db, {
+      action: "indexer_paused",
+      success: true,
+    });
     return null;
   },
   resumeIndexer: () => {
+    const db = defaultRuntime.db;
     for (const rt of runtimes) rt.indexer.resume();
+    logAuditEvent(db, {
+      action: "indexer_resumed",
+      success: true,
+    });
     return null;
+  },
+  pruneData: async (daysToKeep: number) => {
+    const db = defaultRuntime.db;
+    try {
+      const deleted = pruneOldEvents(db, daysToKeep);
+      logAuditEvent(db, {
+        action: "data_pruned",
+        details: { deleted, daysToKeep },
+        success: true,
+      });
+      return { deleted };
+    } catch (err) {
+      logAuditEvent(db, {
+        action: "data_pruned",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+        details: { daysToKeep },
+      });
+      throw err;
+    }
+  },
+  getAuditLogs: (limit: number) => {
+    const db = defaultRuntime.db;
+    return db.prepare(`SELECT id, action, subject, details, success, error_msg as errorMsg,
+      created_at as createdAt FROM audit_logs ORDER BY created_at DESC LIMIT ?`).all(limit);
+  },
+  getPastDueMandates: () => {
+    const db = defaultRuntime.db;
+    return getPastDueMandatesFromDb(db);
   },
 };
 if (keeper && runKeeperPass) {
-  adminHooks.keeperPass = () => runKeeperPass();
+  adminHooks.keeperPass = async () => {
+    const db = defaultRuntime.db;
+    try {
+      const result = await runKeeperPass();
+      const settled = (result as unknown[]).filter((r: unknown) => (r as { status: string }).status === "settled").length;
+      logAuditEvent(db, {
+        action: "keeper_pass",
+        success: true,
+        details: { settled, attempted: result.length },
+      });
+      return result;
+    } catch (err) {
+      logAuditEvent(db, {
+        action: "keeper_pass",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+  };
   adminHooks.keeperBackoff = () => keeper.backoffList();
   adminHooks.keeperHistory = () => keeper.passHistory();
 }

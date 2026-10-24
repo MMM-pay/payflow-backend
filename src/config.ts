@@ -182,6 +182,12 @@ const schema = z.object({
    */
   INDEXER_FETCH_CONCURRENCY: z.coerce.number().int().positive().max(16).default(4),
 
+  /**
+   * Days to retain raw contract events before pruning. Events older than this
+   * are removed by the prune operation. Set to 0 to keep all events indefinitely.
+   */
+  DATA_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(30),
+
   PORT: z.coerce.number().int().positive().default(8080),
   API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   API_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
