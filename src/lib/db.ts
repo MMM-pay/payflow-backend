@@ -428,10 +428,11 @@ export function logAuditEvent(db: DatabaseSync, entry: AuditLogEntry): void {
     (action, subject, details, success, error_msg, created_at)
     VALUES (?, ?, ?, ?, ?, ?)`).run(
     entry.action,
-    entry.subject,
+    // SQLite takes NULL, not undefined, for an absent value.
+    entry.subject ?? null,
     JSON.stringify(entry.details ?? {}),
     entry.success ? 1 : 0,
-    entry.errorMsg,
+    entry.errorMsg ?? null,
     Math.floor(Date.now() / 1000),
   );
 }
@@ -439,7 +440,8 @@ export function logAuditEvent(db: DatabaseSync, entry: AuditLogEntry): void {
 export function pruneOldEvents(db: DatabaseSync, daysToKeep: number = 30): number {
   const cutoffTime = Math.floor((Date.now() - daysToKeep * 24 * 60 * 60 * 1000) / 1000);
   const result = db.prepare("DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ?").run(cutoffTime);
-  return result.changes;
+  // node:sqlite reports `changes` as a bigint on large deletes.
+  return Number(result.changes);
 }
 
 export function markMandateAsPastDue(db: DatabaseSync, mandateId: number): void {
