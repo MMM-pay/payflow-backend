@@ -26,6 +26,9 @@ export type ApiErrorCode =
   | "keeper_pass_failed"
   | "rate_limited"
   | "stream_limit"
+  | "prune_unavailable"
+  | "prune_failed"
+  | "audit_unavailable"
   | "internal_error";
 
 /**
@@ -83,6 +86,9 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   token_metadata_unavailable: "The token contract's metadata could not be read; try again.",
   unauthorized: "A valid bearer token is required for this endpoint.",
   reindex_unavailable: "Reindexing is not available on this instance.",
+  prune_unavailable: "Data pruning is not available on this instance.",
+  prune_failed: "The prune could not be completed.",
+  audit_unavailable: "The audit log is not available on this instance.",
   keeper_unavailable: "The keeper is not available on this instance.",
   indexer_unavailable: "Runtime indexer control is not available on this instance.",
   reindex_failed: "The reindex action failed.",

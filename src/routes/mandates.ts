@@ -1,8 +1,10 @@
 import { Router } from "express";
 import type { Storage } from "../lib/store/types.ts";
 import {
-  getVaultBalances,
   getMandateById,
+  isFunded,
+  lastKnownBalances,
+  listChargeAttempts,
   listDueMandates,
   listMandateCharges,
   listMandateTimeline,
@@ -15,6 +17,7 @@ import { sendApiError } from "./errors.ts";
 import {
   addressSchema,
   cursorSchema,
+  dateBoundSchema,
   idSchema,
   limitSchema,
   mandateStatusSchema,
@@ -22,6 +25,7 @@ import {
   validate,
 } from "./validate.ts";
 import type {
+  ChargeAttemptPage,
   ChargePage,
   DueMandateRow,
   DuePage,
@@ -162,50 +166,88 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
     if (!id.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
+    const from = validate(
+      req,
+      res,
+      "from",
+      dateBoundSchema("from").optional(),
+      present(req.query.from),
+    );
+    if (!from.ok) return;
+    const to = validate(req, res, "to", dateBoundSchema("to").optional(), present(req.query.to));
+    if (!to.ok) return;
+    if (from.value !== undefined && to.value !== undefined && from.value > to.value) {
+      sendApiError(res, req, 400, "invalid_request", "The date range is not valid.", [
+        { path: "from", message: "must not be after `to`" },
+      ]);
+      return;
+    }
 
     if (!(await getMandateById(db, id.value))) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
     }
-    const charges = await listMandateCharges(db, id.value, limitOf(limit.value));
+    const charges = await listMandateCharges(
+      db,
+      id.value,
+      limitOf(limit.value),
+      from.value,
+      to.value,
+    );
     const body: ChargePage = { charges };
     res.json(body);
   });
 
-  /** Mandates chargeable right now, per the indexed projection. */
+  /**
+   * The keeper's attempts to charge the mandate, newest first: when, how it
+   * ended, the error code and transaction hash, and the backoff that
+   * followed. Answers "why wasn't I charged?" for 90 days back.
+   */
+  r.get("/mandates/:id/attempts", async (req, res) => {
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    if (!(await getMandateById(db, id.value))) {
+      sendApiError(res, req, 404, "mandate_not_found");
+      return;
+    }
+
+    const body: ChargeAttemptPage = {
+      attempts: await listChargeAttempts(db, id.value, limitOf(limit.value)),
+    };
+    res.json(body);
+  });
+
+  /**
+   * Mandates chargeable right now, per the indexed projection.
+   *
+   * Each one carries `funded`: whether the last known vault balance covers
+   * the charge. The balance is the one the indexer last saw, so it can be
+   * behind the chain — the keeper reads it from the contract before it
+   * settles — but it is enough to tell a mandate that is merely due from one
+   * that is waiting for a top-up.
+   */
   r.get("/due", async (req, res) => {
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
     const now = Math.floor(Date.now() / 1000);
-    const due = await listDueMandates(db, now, limitOf(limit.value));
-    const planTokens = await planTokensByIds(db, due.map((mandate) => mandate.plan_id));
-    const balances = new Map<string, bigint>();
-    const subscribers = [...new Set(due.map((mandate) => mandate.subscriber))];
-    await Promise.all(
-      subscribers.map(async (subscriber) => {
-        const vaultBalances = await getVaultBalances(db, subscriber);
-        for (const balance of vaultBalances) {
-          balances.set(`${subscriber}|${balance.token}`, BigInt(balance.balance));
-        }
-      }),
-    );
-    const body: DuePage = {
-      now,
-      due: due.map((mandate) => {
-        const token = planTokens.get(mandate.plan_id);
-        const balance = token ? balances.get(`${mandate.subscriber}|${token}`) : undefined;
-        const row: DueMandateRow = {
-          id: mandate.id,
-          subscriber: mandate.subscriber,
-          merchant: mandate.merchant,
-          next_charge: mandate.next_charge,
-          amount: mandate.amount,
-          funded: balance !== undefined && balance >= BigInt(mandate.amount),
-        };
-        return row;
-      }),
-    };
+    const rows = await listDueMandates(db, now, limitOf(limit.value));
+    // The vault balance is per (subscriber, token), and a mandate inherits its
+    // plan's token; the merchant unpaid report shares this funded test.
+    const balances = await lastKnownBalances(db, rows);
+
+    const due: DueMandateRow[] = rows.map((row, i) => ({
+      id: row.id,
+      subscriber: row.subscriber,
+      merchant: row.merchant,
+      next_charge: row.next_charge,
+      amount: row.amount,
+      funded: isFunded(balances[i], row.amount),
+    }));
+    const body: DuePage = { now, due };
     res.json(body);
   });
 

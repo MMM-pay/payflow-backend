@@ -1,0 +1,39 @@
+{
+  "name": "@mmm-pay/payflow-client",
+  "version": "0.1.0",
+  "description": "Typed, dependency-free client for the Payflow REST API.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/client/index.js",
+  "types": "./dist/client/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js",
+      "default": "./dist/client/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MMM-pay/payflow-backend.git",
+    "directory": "client"
+  },
+  "homepage": "https://github.com/MMM-pay/payflow-backend#typed-api-client",
+  "bugs": {
+    "url": "https://github.com/MMM-pay/payflow-backend/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

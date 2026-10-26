@@ -283,6 +283,56 @@ describe("http api", () => {
     assert.equal((body.charges as unknown[]).length, 1);
   });
 
+  test("mandate charge history filters by unix seconds or an ISO date, inclusively", async () => {
+    const row = db.prepare("SELECT created_at FROM charges WHERE tx_hash = ?").get("tx1") as {
+      created_at: number;
+    };
+    const second = Math.floor(row.created_at / 1000);
+    const iso = new Date(second * 1000).toISOString();
+
+    const seconds = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${second}&to=${second}`,
+    );
+    assert.equal(seconds.status, 200);
+    assert.equal(seconds.body.charges.length, 1, "bounds include their own second");
+
+    const byIso = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${encodeURIComponent(iso)}&to=${encodeURIComponent(iso)}`,
+    );
+    assert.equal(byIso.status, 200);
+    assert.equal(byIso.body.charges.length, 1);
+
+    const byDay = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${iso.slice(0, 10)}&to=${iso.slice(0, 10)}`,
+    );
+    assert.equal(byDay.status, 200);
+    assert.equal(byDay.body.charges.length, 1, "a date-only bound covers that UTC day");
+
+    const outside = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${second + 1}`,
+    );
+    assert.equal(outside.status, 200);
+    assert.equal(outside.body.charges.length, 0);
+  });
+
+  test("an invalid charge-date range is 400 and names the parameter", async () => {
+    const second = 1_700_000_000;
+    const reversed = await get<{
+      error: { code: string; details?: { path: string; message: string }[] };
+    }>(`/api/mandates/1/charges?from=${second}&to=${second - 1}`);
+    assert.equal(reversed.status, 400);
+    assert.equal(reversed.body.error.code, "invalid_request");
+    assert.equal(reversed.body.error.details?.[0]?.path, "from");
+    assert.match(reversed.body.error.details?.[0]?.message ?? "", /after/);
+
+    const malformed = await get<{
+      error: { code: string; details?: { path: string; message: string }[] };
+    }>("/api/mandates/1/charges?from=not-a-date");
+    assert.equal(malformed.status, 400);
+    assert.equal(malformed.body.error.code, "invalid_request");
+    assert.equal(malformed.body.error.details?.[0]?.path, "from");
+  });
+
   test("vault balances use the latest event per token without losing precision", async () => {
     const { status: code, body } = await get(`/api/vault/${SUBSCRIBER}`);
     assert.equal(code, 200);
@@ -458,6 +508,8 @@ describe("http api", () => {
         mandateCount: 1,
         chargeCount: 1,
         totalCollected: "9900000",
+        // Net of the 100000 fee the subscriber's 10000000 charge paid.
+        ltv: "9900000",
       },
     ]);
   });
@@ -465,7 +517,7 @@ describe("http api", () => {
   test("subscriber with mandates but no settled charges still appears at zero", async () => {
     const { body } = await get(`/api/merchants/${YEARLY_MERCHANT}/subscribers`);
     assert.deepEqual(body.subscribers, [
-      { subscriber: SUBSCRIBER, mandateCount: 1, chargeCount: 0, totalCollected: "0" },
+      { subscriber: SUBSCRIBER, mandateCount: 1, chargeCount: 0, totalCollected: "0", ltv: "0" },
     ]);
   });
 

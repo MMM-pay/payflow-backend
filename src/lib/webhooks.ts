@@ -99,6 +99,38 @@ function signatureHeader(payload: string, webhook: WebhookRow, now: number): str
     .join(", ");
 }
 
+/** What every keeper streak event says about the mandate it is about. */
+interface ChargeStreakBase {
+  mandateId: number;
+  subscriber: string;
+  merchant: string;
+  /** Consecutive failed attempts: the streak so far, or the one that just ended. */
+  failures: number;
+  /** The `charge_attempts` row that changed the streak; names the event. */
+  attemptId: number;
+}
+
+/**
+ * A change in a mandate's run of failed charges, as the keeper reports it
+ * (#145): `charge.failing` when the streak reaches its threshold,
+ * `charge.recovered` when a charge settles after one. The keeper raises each
+ * once per streak, so the merchant hears about an emptied vault before the
+ * missing revenue shows.
+ */
+export type ChargeStreakEvent =
+  | (ChargeStreakBase & {
+      kind: "charge.failing";
+      /** What the vault is missing, decimal string; null when it was not read. */
+      shortfall: string | null;
+      /** Unix seconds of the keeper's next attempt. */
+      nextRetryAt: number;
+      errorCode: string | null;
+    })
+  | (ChargeStreakBase & {
+      kind: "charge.recovered";
+      txHash: string | null;
+    });
+
 export interface WebhookDispatcherOptions {
   db: Storage | DatabaseSync;
   events?: EventEmitter | undefined;
@@ -108,7 +140,8 @@ export interface WebhookDispatcherOptions {
 }
 
 /**
- * Delivers `charged` events to merchant-registered webhooks.
+ * Delivers `charged` events, and the keeper's `charge.failing` and
+ * `charge.recovered` streak events, to merchant-registered webhooks.
  *
  * Delivery is at-least-once: every charge event creates a pending delivery
  * per active webhook, carried by an idempotency key that is reused across
@@ -426,7 +459,6 @@ export class WebhookDispatcher {
     if (webhooks.length === 0) return;
 
     const eventId = `charge:${e.txHash}`;
-    const idempotencyKey = randomUUID();
     const payload = JSON.stringify({
       event: e.name,
       mandate_id: num(mandateId),
@@ -437,6 +469,39 @@ export class WebhookDispatcher {
       ledger: e.ledger,
     } as Record<string, unknown>);
 
+    await this.broadcast(webhooks, eventId, payload);
+  }
+
+  /**
+   * React to a keeper streak event: every active webhook for the mandate's
+   * merchant gets a `charge.failing` or `charge.recovered` delivery through
+   * the same path, signatures and retries as a charge. The keeper raises each
+   * event once per streak; the event id names the attempt that raised it, so
+   * every retry of the delivery carries the same id.
+   */
+  async onChargeStreak(e: ChargeStreakEvent): Promise<void> {
+    const webhooks = await this.listWebhooks(e.merchant);
+    if (webhooks.length === 0) return;
+
+    const common = {
+      event: e.kind,
+      mandate_id: e.mandateId,
+      subscriber: e.subscriber,
+      merchant: e.merchant,
+      failures: e.failures,
+    };
+    const payload = JSON.stringify(
+      e.kind === "charge.failing"
+        ? { ...common, shortfall: e.shortfall, next_retry_at: e.nextRetryAt, error_code: e.errorCode }
+        : { ...common, tx_hash: e.txHash },
+    );
+
+    await this.broadcast(webhooks, `${e.kind}:${e.mandateId}:${e.attemptId}`, payload);
+  }
+
+  /** One pending delivery and a first attempt per webhook, under one idempotency key. */
+  private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
+    const idempotencyKey = randomUUID();
     for (const webhook of webhooks) {
       await this.attempt(await this.enqueue(webhook.id, eventId, idempotencyKey, payload), webhook);
     }

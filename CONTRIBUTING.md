@@ -11,6 +11,9 @@ npm test
 Node 22.5+ is required — the service uses the built-in `node:sqlite` module and
 native TypeScript execution.
 
+A dev container is checked in for GitHub Codespaces and VS Code: it uses
+Node 22, runs `npm ci`, and installs the Stellar CLI when it is created, so no
+host setup is needed. Open the repository in a Codespace and run `npm test`.
 The same service runs in a container, with the projection on a named volume:
 
 ```bash

@@ -5,5 +5,7 @@
   "cancellations": 0,
   "totalCollected": "9900000",
   "totalCharges": 1,
-  "averageChargesPerMandate": 1
+  "averageChargesPerMandate": 1,
+  "averageLtv": "9900000",
+  "medianLtv": "9900000"
 }

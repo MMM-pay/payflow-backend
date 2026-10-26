@@ -14,9 +14,16 @@
  *
  * - The endpoint is opt-in (`METRICS_ENABLED=true`): the counters are always
  *   kept up to date, but nothing is served until an operator asks for it.
- * - An amount is never a number. These metrics count events, ledgers and
- *   passes, never money, so every value here is a plain count.
+ * - An amount is never a number. Counters and count gauges are plain numbers,
+ *   but money — the MRR gauge — is carried as the decimal string the
+ *   projection computed and rendered verbatim: a JavaScript number would
+ *   silently round any figure above 2^53, and Prometheus prints a gauge's
+ *   value as text anyway.
  */
+
+import type { Storage } from "./store/types.ts";
+import { SECONDS_PER_MONTH } from "../routes/helpers.ts";
+import { logger } from "./logger.ts";
 
 /** Prometheus metric types this service uses. */
 export type MetricType = "counter" | "gauge";
@@ -65,6 +72,24 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     type: "gauge",
   },
   {
+    key: "active_mandates",
+    name: "payflow_active_mandates",
+    help: "Mandates whose status is active in the projection.",
+    type: "gauge",
+  },
+  {
+    key: "active_merchants",
+    name: "payflow_active_merchants",
+    help: "Merchants with at least one active mandate in the projection.",
+    type: "gauge",
+  },
+  {
+    key: "mrr",
+    name: "payflow_mrr",
+    help: "Monthly recurring revenue of the active mandates, normalised to a 30-day month, in the token's smallest unit.",
+    type: "gauge",
+  },
+  {
     key: "events_applied",
     name: "payflow_events_applied_total",
     help: "Contract events applied to the projection since the process started.",
@@ -90,10 +115,17 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
   },
 ];
 
+/**
+ * A sample's value: a plain count, or — for a gauge that carries money —
+ * the amount's decimal string, kept as the projection computed it so not a
+ * single digit is lost to floating-point rounding.
+ */
+type SampleValue = number | string;
+
 interface Sample {
   definition: MetricDefinition;
   labels: MetricLabels;
-  value: number;
+  value: SampleValue;
 }
 
 /** Escape a label value for the exposition format. */
@@ -151,7 +183,9 @@ export class MetricsRegistry {
     const id = sampleKey(definition, labels);
     const existing = this.samples.get(id);
     if (existing) {
-      existing.value += value;
+      // Counters are always plain numbers; a string amount only ever appears
+      // on a gauge set through setAmount, which increment is never used for.
+      if (typeof existing.value === "number") existing.value += value;
       return;
     }
     this.samples.set(id, { definition, labels: { ...labels }, value });
@@ -165,8 +199,24 @@ export class MetricsRegistry {
     this.samples.set(id, { definition, labels: { ...labels }, value });
   }
 
+  /**
+   * Set a gauge that carries an amount of money.
+   *
+   * The amount arrives as the decimal string (or bigint) the projection
+   * computed and is stored verbatim — it never becomes a JavaScript number,
+   * which would round anything above 2^53. This is the deliberate departure
+   * from {@link set} noted in the file's header: Prometheus prints a gauge's
+   * value as text, so the exact digits survive all the way to the scrape.
+   */
+  setAmount(key: string, value: string | bigint, labels: MetricLabels = {}): void {
+    const definition = this.definitions.get(key);
+    if (!definition) return;
+    const id = sampleKey(definition, labels);
+    this.samples.set(id, { definition, labels: { ...labels }, value: value.toString() });
+  }
+
   /** The current value of one sample, for tests and for the API's own use. */
-  value(key: string, labels: MetricLabels = {}): number | undefined {
+  value(key: string, labels: MetricLabels = {}): number | string | undefined {
     const definition = this.definitions.get(key);
     if (!definition) return undefined;
     return this.samples.get(sampleKey(definition, labels))?.value;
@@ -234,4 +284,83 @@ export function publishIndexerMetrics(progress: IndexerProgress, network: string
   metrics.set("indexer_cursor", progress.cursor, labels);
   metrics.set("indexer_latest_ledger", progress.latest, labels);
   metrics.set("indexer_lag", Math.max(0, progress.latest - progress.cursor), labels);
+}
+
+/** What the business gauges are read from: one pass over the projection. */
+export interface BusinessMetrics {
+  /** Mandates whose status is `Active`. */
+  activeMandates: number;
+  /** Distinct merchants holding at least one active mandate. */
+  activeMerchants: number;
+  /**
+   * Monthly recurring revenue: every active mandate with a positive period
+   * normalised to a 30-day month. An amount is money, so it is the decimal
+   * string of an exact sum — never a JavaScript number.
+   */
+  mrr: string;
+}
+
+/**
+ * Read the projection's business numbers in one short, indexed statement.
+ *
+ * One scan of the active mandates serves all three gauges — the
+ * `mandates_due(status, next_charge)` index answers the status filter, and
+ * there is no join, no sort and no per-merchant grouping, because
+ * `node:sqlite` is synchronous and runs on the API's event loop.
+ *
+ * The MRR uses the same arithmetic `/api/merchants/:address/summary`
+ * reports — `amount × 2592000 / period` per active mandate with a positive
+ * period, truncated per mandate — so a dashboard and the API agree. It is
+ * summed here in bigint rather than in SQL: SQLite's `SUM` silently
+ * promotes the result to a double as soon as `amount × 2592000` leaves int64
+ * range (any mandate over ~35,500 units of the token), which would round the
+ * very figures this gauge exists to chart. Money stays a string, end to end.
+ */
+export async function readBusinessMetrics(db: Storage): Promise<BusinessMetrics> {
+  const rows = await db.all<{ merchant: string; amount: string; period: number }>(
+    "SELECT merchant, amount, period FROM mandates WHERE status = 'Active'",
+  );
+
+  const month = BigInt(SECONDS_PER_MONTH);
+  const merchants = new Set<string>();
+  let mrr = 0n;
+  for (const row of rows) {
+    merchants.add(row.merchant);
+    if (row.period <= 0) continue;
+    // `String(...)` keeps the decimal digits exact for BigInt; a mandate
+    // billed every 0 seconds contributes nothing, like the API's summary.
+    mrr += (BigInt(String(row.amount)) * month) / BigInt(row.period);
+  }
+  return {
+    activeMandates: rows.length,
+    activeMerchants: merchants.size,
+    mrr: mrr.toString(),
+  };
+}
+
+/**
+ * Publish the projection's business gauges for one network.
+ *
+ * The indexer calls this after every pass, so the series follow the
+ * projection as it grows; the metrics endpoint calls it again before it
+ * renders, so a scrape sees the projection as it stands (and a deployment
+ * whose API serves without an indexer still reports its own database).
+ *
+ * The gauges are labelled by `network` only — never by merchant, plan or
+ * token — so the series count stays bounded however the business grows.
+ *
+ * A projection that cannot be read (a locked or corrupt database) is logged
+ * and left for the next refresh: one bad scrape of business numbers must not
+ * take the indexer loop down with it.
+ */
+export async function publishBusinessMetrics(db: Storage, network: string): Promise<void> {
+  try {
+    const business = await readBusinessMetrics(db);
+    const labels = { network };
+    metrics.set("active_mandates", business.activeMandates, labels);
+    metrics.set("active_merchants", business.activeMerchants, labels);
+    metrics.setAmount("mrr", business.mrr, labels);
+  } catch (err) {
+    logger.warn({ err, network }, "could not refresh the business metrics");
+  }
 }

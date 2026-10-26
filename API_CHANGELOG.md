@@ -60,7 +60,20 @@ release that ships them numbers them here.
 
 ### Added
 
+- `/api/v1/...` — every route under a versioned root (#173). `/api/...`
+  keeps answering the same routes as an alias, from the same router and the
+  same projection, so existing clients are unaffected. A breaking change
+  goes into `/api/v2` rather than altering `/api/v1`.
+- `GET /api/v1/openapi.json` — the same OpenAPI document as
+  `GET /api/openapi.json`, and the document now lists both the versioned
+  paths and their unversioned aliases.
+- The JSON Schema contract as a CI artifact (#174). `npm run schema` writes
+  the OpenAPI document to `api-schema.json`, which CI publishes as
+  `api-schema`; a consumer validates its fixtures against the same schemas
+  `test/consumer.test.ts` checks the golden responses against.
 - `GET /api/openapi.json` — an OpenAPI 3.1 description of every route.
+- `GET /api/docs` — a human-readable rendering of that description, with the
+  ReDoc bundle self-hosted so it works offline.
 - `GET /ready` — a readiness probe answering `503` while the projection trails
   the network by more than 120 ledgers. `/health` stays a liveness probe.
 - `GET /metrics` — Prometheus metrics, only when `METRICS_ENABLED=true`.
@@ -85,7 +98,14 @@ release that ships them numbers them here.
   longest overdue first (#146).
 - `GET /api/subscribers/:address/upcoming` — charges due over the next N days,
   with their projected times.
+- `GET /api/subscribers/:address/charges.csv` — the subscriber's settled
+  payments as a CSV download: date, merchant, plan, amount, fee and tx hash.
+  `from`/`to` accept unix seconds.
 - `GET /api/mandates?ids=` — up to 100 mandates in one request.
+- `GET /api/mandates/:id/charges?from=&to=` — bound the settlement history by
+  ledger close time. Each bound accepts unix seconds or an ISO 8601
+  date/date-time; a date-only bound covers its whole UTC day. Both are
+  inclusive. An invalid value or `from > to` is `400 invalid_request`.
 - `POST /api/webhooks` — register a URL for signed `charged` events.
 - `POST /api/webhooks/:id/rotate` — replace a webhook's signing secret. During
   the overlap `Payflow-Signature` lists two signatures,
@@ -99,6 +119,21 @@ release that ships them numbers them here.
 - `GET /api/auth` and `POST /api/auth` — SEP-10 sign-in. Every webhook route
   also accepts the issued JWT as `Authorization: Bearer <token>`; signed
   messages keep working unchanged.
+- `GET /api/merchants/:address/cohorts` — per signup cohort (`day`, `week` or
+  `month` of ledger close time), the mandates still active after 1, 2, 3...
+  buckets, as `active` and `share` (#142).
+- `GET /api/plans/:id/stats` gained `averageLtv` and `medianLtv`, and
+  `GET /api/merchants/:address/subscribers` gained `ltv` per subscriber:
+  lifetime value net of the protocol fee, as decimal strings. `ltv` equals
+  `totalCollected`, which already summed the merchant's net amounts (#143).
+- `GET /api/mandates/:id/attempts` — the keeper's charge attempts for the
+  mandate over the last 90 days, newest first: `result` (`settled`, `failed`
+  or `skipped`), `errorCode`, `txHash`, `shortfall` on a skipped attempt, and
+  the backoff that followed (#144).
+- Webhooks receive two new `event` values from the keeper: `charge.failing`
+  on a mandate's third consecutive failed attempt (with `shortfall`,
+  `next_retry_at` and `error_code`) and `charge.recovered` when it next
+  settles (with `tx_hash`), each once per streak (#145).
 - `/api/<network>/...` — every route again, per configured network.
 - `/api/mandates` and `/api/plans` accept `?cursor=` and return `nextCursor`.
 - `/api/stats` reports charge volume and fees; `/api/due` gained `funded`;
@@ -107,6 +142,9 @@ release that ships them numbers them here.
 
 ### Changed
 
+- **The typed client calls `/api/v1`.** Response types and behaviour are
+  unchanged; only the path prefix moves. A client still calling `/api` keeps
+  working through the alias (#173).
 - **Parameters the API does not accept are now refused.** `400
   invalid_request`, with `error.details` naming the parameter, instead of an
   empty page: a mistyped address (checksum included), an unknown `status`, a
@@ -116,6 +154,14 @@ release that ships them numbers them here.
 - **`charges.created_at` is the ledger's close time** in unix milliseconds, not
   the moment the indexer saw the charge. Rows written earlier keep the value
   they were given.
+
+### Fixed
+
+- **The documented totals of the churn, revenue and protocol-fee reports no
+  longer claim a `bucket` field.** The runtime responses never carried one;
+  the response schemas reused the per-bucket schema, so a consumer validating
+  against the document saw a required field that could not exist. Found by
+  the new consumer contract test (#174).
 
 ## [0.2.0] - 2026-10-09
 

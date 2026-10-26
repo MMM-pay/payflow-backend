@@ -79,6 +79,60 @@ export const unixSecondsSchema = z
   .transform(Number)
   .refine((value) => Number.isSafeInteger(value), "must be a unix timestamp in seconds");
 
+/** A date-only ISO 8601 string, interpreted as midnight UTC. */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** An ISO 8601 date-time, with an explicit `Z` or numeric offset. */
+const ISO_DATE_TIME =
+  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+
+/**
+ * A date bound for a range query: unix seconds or an ISO 8601 date/date-time.
+ *
+ * `2026-10-01` starts or ends that UTC day depending on which end of the range
+ * it bounds, so a date-only `from` and `to` cover the whole day inclusively. A
+ * date-time must carry `Z` or a numeric offset, so the result never depends on
+ * the server's timezone. The value is returned as unix seconds so callers
+ * compare and bind one unit.
+ */
+export function dateBoundSchema(end: "from" | "to") {
+  return z.string().transform((value, ctx) => {
+    const text = value.trim();
+    if (/^\d+$/.test(text)) {
+      const seconds = Number(text);
+      // The largest instant a JavaScript Date can represent, and small enough
+      // that converting it to milliseconds stays a safe integer.
+      if (Number.isSafeInteger(seconds) && seconds <= 8_640_000_000_000) return seconds;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "must be a unix timestamp in seconds or an ISO 8601 date/date-time",
+      });
+      return z.NEVER;
+    }
+
+    const dateOnly = ISO_DATE.test(text);
+    const iso = dateOnly
+      ? `${text}T00:00:00Z`
+      : ISO_DATE_TIME.test(text)
+        ? text
+        : null;
+    const millis = iso === null ? Number.NaN : Date.parse(iso);
+    if (
+      iso === null ||
+      !Number.isFinite(millis) ||
+      (dateOnly && new Date(millis).toISOString().slice(0, 10) !== text)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "must be a unix timestamp in seconds or an ISO 8601 date/date-time",
+      });
+      return z.NEVER;
+    }
+    const seconds = Math.floor(millis / 1000);
+    return end === "to" && dateOnly ? seconds + 86_399 : seconds;
+  });
+}
+
 /** A calendar bucket size: the periods the churn and revenue reports use. */
 export const bucketSchema = z.enum(["day", "week", "month"]);
 

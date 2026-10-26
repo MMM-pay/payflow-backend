@@ -173,6 +173,7 @@ describe("typed api client", () => {
         mandateCount: 1,
         chargeCount: 1,
         totalCollected: "9900000",
+        ltv: "9900000",
       },
     ]);
 

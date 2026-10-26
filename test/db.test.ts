@@ -27,6 +27,8 @@ describe("summary query indexes", () => {
     assert.ok(names.includes("mandates_merchant_status_period_amount"));
     assert.ok(names.includes("charges_merchant_amount"));
     assert.ok(names.includes("charges_subscriber_amount_fee"));
+    assert.ok(names.includes("charges_mandate_created_at"));
+    assert.ok(names.includes("charges_subscriber_created_at"));
     db.close();
   });
 

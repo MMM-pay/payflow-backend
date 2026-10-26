@@ -16,6 +16,7 @@ import { simulationSource } from "./lib/simulate.ts";
 import { asStorage } from "./lib/store/index.ts";
 import type { Storage } from "./lib/store/types.ts";
 import { planTokensByIds } from "./lib/queries.ts";
+import type { ChargeStreakEvent } from "./lib/webhooks.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
 
 export interface DueMandate {
@@ -57,6 +58,32 @@ const DEFAULT_BATCH_SIZE = 10;
 /** Per-mandate failure text when `charge_many` answers `false` for an id. */
 const BATCH_SKIPPED_ERROR =
   "charge_many skipped this mandate (not due, not active, or unfunded)";
+/** Consecutive failed attempts that make a mandate `charge.failing` (#145). */
+const FAILING_STREAK = 3;
+/** How long a charge attempt is kept in `charge_attempts` (#144). */
+const ATTEMPT_RETENTION_S = 90 * 24 * 60 * 60;
+
+/**
+ * The code of a submission stellar-core rejected (`txBadSeq`,
+ * `txInsufficientFee`, ...): the arm of the `TransactionResult` the RPC
+ * returns as `errorResultXdr` and the SDK decodes into `errorResult`, whose
+ * `result.type` names it. Undefined when there is none to read.
+ */
+function resultCode(errorResult: unknown): string | undefined {
+  const type = (errorResult as xdr.TransactionResult | undefined)?.result?.type;
+  return typeof type === "string" ? type : undefined;
+}
+
+/**
+ * The Soroban host error inside a failure message, as the host prints it:
+ * `Error(Contract, #3)` for a contract's own error, `Error(Budget,
+ * LimitExceeded)` or `Error(Auth, InvalidAction)` for the host's. A refused
+ * simulation surfaces this way through `prepareTransaction`.
+ */
+function hostErrorCode(message: string): string | undefined {
+  const match = /Error\((\w+), ?(#\d+|\w+)\)/.exec(message);
+  return match ? `Error(${match[1]}, ${match[2]})` : undefined;
+}
 
 /**
  * Errors that mean the *signing key* cannot pay for the transaction — a
@@ -111,6 +138,33 @@ export interface SettleResult {
   status: "settled" | "failed" | "simulated";
   txHash?: string;
   error?: string;
+  /**
+   * A short, stable code for a `failed` result, recorded in
+   * `charge_attempts`: the RPC status (`TRY_AGAIN_LATER`, `FAILED`,
+   * `NOT_FOUND`), the transaction result code, the host error, or
+   * `SUBMIT_FAILED` when none of those could be read.
+   */
+  errorCode?: string;
+}
+
+/** One charge attempt as `charge_attempts` records it (#144). */
+interface ChargeAttempt {
+  result: "settled" | "failed" | "skipped";
+  errorCode: string | null;
+  txHash: string | null;
+  /** What the vault was missing, for a `skipped` attempt; decimal string. */
+  shortfall: string | null;
+}
+
+/** A settle result as an attempt; null for a dry run, which records nothing. */
+function attemptOf(result: SettleResult): ChargeAttempt | null {
+  if (result.status === "simulated") return null;
+  return {
+    result: result.status,
+    errorCode: result.errorCode ?? null,
+    txHash: result.txHash ?? null,
+    shortfall: null,
+  };
 }
 
 /** What one `charge_many` attempt produced, before the fallback is decided. */
@@ -212,6 +266,20 @@ export interface Channel {
  * history, no metrics. Each mandate answers `simulated`, carrying the
  * simulation's error when the charge would fail, so an operator can
  * rehearse a first run on a new deployment before it costs a fee.
+ *
+ * ### Charge attempts (#144) and failing streaks (#145)
+ *
+ * Every real attempt is a row in `charge_attempts` — a mandate skipped for a
+ * vault shortfall included, since that is the failure merchants most need to
+ * see — carrying the mandate's failure streak and next retry. The in-memory
+ * backoff is a cache of the newest row per mandate: it is rebuilt from the
+ * table on construction, so a restart (or the next scheduled one-shot run)
+ * resumes the backoff instead of hammering every failing mandate again.
+ *
+ * When a streak reaches {@link FAILING_STREAK} the merchant is sent
+ * `charge.failing`, and when a charge then settles, `charge.recovered`. The
+ * streak only grows until a settlement resets it, so each fires once per
+ * streak, and because the streak is restored, a restart does not re-fire it.
  */
 export class Keeper {
   private readonly db: Storage;
@@ -221,8 +289,11 @@ export class Keeper {
    * Mandates whose last charge failed, with when to try again. Without this,
    * the oldest due mandates are retried first on every pass, so a batch's
    * worth of underfunded vaults would block every other mandate forever.
+   * Restored from `charge_attempts` on construction.
    */
   private readonly backoff = new Map<number, { failures: number; retryAt: number }>();
+  /** Told when a mandate starts or ends a failing streak; see the class notes. */
+  private readonly onStreak: ((event: ChargeStreakEvent) => Promise<void>) | undefined;
   /**
    * Signing lanes, primary first: `channels[0]` is `KEEPER_SECRET` (with
    * `KEEPER_SECRET_NEXT` as its standby in the same lane), every entry from
@@ -244,15 +315,50 @@ export class Keeper {
    */
   private batchEntryMissing = false;
   private readonly passes: KeeperPassSummary[] = [];
+  /** Resolves when the persisted backoff has been loaded into memory. */
+  readonly ready: Promise<void>;
 
-  constructor(db: Storage | DatabaseSync, server: KeeperRpc, config: Config) {
+  constructor(
+    db: Storage | DatabaseSync,
+    server: KeeperRpc,
+    config: Config,
+    onStreak?: (event: ChargeStreakEvent) => Promise<void>,
+  ) {
     this.db = asStorage(db);
     this.server = server;
     this.config = config;
+    this.onStreak = onStreak;
     if (!config.KEEPER_SECRET) {
       throw new Error("Keeper requires KEEPER_SECRET");
     }
     this.buildChannels(config);
+    // The backoff a previous process left behind is read once per start; the
+    // pass methods await `ready` so a first pass never runs ahead of it.
+    this.ready = this.restoreBackoff();
+    // A caller that only reads the channels (the CLI's `status`) never awaits
+    // `ready`; mark the rejection handled so a database closed underneath it
+    // cannot surface as an unhandled rejection. Passes still await it and see
+    // the error.
+    void this.ready.catch(() => undefined);
+  }
+
+  /**
+   * Resume the backoff a previous process left behind: a mandate's newest
+   * attempt carries its streak and next retry, so only mandates still in a
+   * failing streak come back. One pass over the (mandate_id, id) index, once
+   * per start; SQLite takes the bare columns from the row holding MAX(id).
+   */
+  private async restoreBackoff(): Promise<void> {
+    const rows = await this.db.all<{ mandate_id: number; failures: number; retry_at: number }>(
+      `SELECT mandate_id, failures, retry_at
+         FROM (SELECT mandate_id, failures, retry_at, MAX(id)
+                 FROM charge_attempts
+                GROUP BY mandate_id)
+        WHERE failures > 0`,
+    );
+    for (const row of rows) {
+      this.backoff.set(row.mandate_id, { failures: row.failures, retryAt: row.retry_at });
+    }
   }
 
   /** The primary channel (`KEEPER_SECRET` lane); never undefined. */
@@ -334,6 +440,8 @@ export class Keeper {
    * returned; empty means every merchant.
    */
   async findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): Promise<DueMandate[]> {
+    // Nothing settles before the persisted backoff is back in memory.
+    await this.ready;
     const due: DueMandate[] = [];
     // Read past the backing-off mandates so they cannot fill the batch.
     for (const m of await this.queryDue(now, limit + this.backoff.size)) {
@@ -423,6 +531,18 @@ export class Keeper {
     // Backoff follows each result's own status (see `record`), so a
     // simulation is never recorded as a real failure from either direction.
     const dryRun = this.config.KEEPER_DRY_RUN;
+    // A skip is how an emptied vault shows up, so it is an attempt like any
+    // other: it is recorded, counts toward the failing streak and backs off.
+    if (!dryRun && skipped.length > 0) {
+      const byId = new Map(due.map((mandate) => [mandate.id, mandate]));
+      for (const skip of skipped) {
+        await this.record(
+          byId.get(skip.mandateId)!,
+          { result: "skipped", errorCode: "INSUFFICIENT_BALANCE", txHash: null, shortfall: skip.shortfall },
+          now,
+        );
+      }
+    }
     if (dryRun && chargeable.length > 0) {
       logger.info(
         { mandates: chargeable.length },
@@ -450,10 +570,13 @@ export class Keeper {
           const group = chargeable.slice(slot, slot + size);
           cursor += group.length;
           const results = await this.settleGroup(group, fee ?? BigInt(BASE_FEE), channel);
-          results.forEach((result, offset) => {
-            this.record(result, now);
+          for (const [offset, result] of results.entries()) {
+            // A simulation is neither a settlement nor a failure: a dry run
+            // leaves the backoff and the attempt log exactly as they were.
+            const attempt = attemptOf(result);
+            if (attempt) await this.record(group[offset]!, attempt, now);
             ordered.push({ slot: slot + offset, result });
-          });
+          }
         }
       }),
     );
@@ -465,6 +588,11 @@ export class Keeper {
     if (dryRun) return results;
     this.announceRetirement(results);
     this.recordPass(now, results, skipped);
+    // The attempted_at index makes this a range delete, cheap on every pass.
+    await this.db.run(
+      "DELETE FROM charge_attempts WHERE attempted_at < ?",
+      [now - ATTEMPT_RETENTION_S],
+    );
     metrics.increment("keeper_passes");
     for (const result of results) {
       if (result.status === "settled") metrics.increment("charges_settled");
@@ -765,17 +893,68 @@ export class Keeper {
       .sort((a, b) => a.retryAt - b.retryAt);
   }
 
-  private record(result: SettleResult, now: number): void {
-    // A simulated result is neither a settlement nor a failure: a dry run
-    // must leave the backoff exactly as it was.
-    if (result.status === "simulated") return;
-    if (result.status === "settled") {
-      this.backoff.delete(result.mandateId);
-      return;
+  /**
+   * Apply one attempt: advance or reset the mandate's backoff, append the
+   * attempt to `charge_attempts` with the resulting streak, and tell the
+   * merchant when the streak reaches {@link FAILING_STREAK} or ends after it.
+   * One indexed insert; nothing here waits on the network.
+   */
+  private async record(mandate: DueMandate, attempt: ChargeAttempt, now: number): Promise<void> {
+    const streak = this.backoff.get(mandate.id)?.failures ?? 0;
+    const failures = attempt.result === "settled" ? 0 : streak + 1;
+    const retryAt =
+      failures === 0
+        ? null
+        : now + Math.min(BACKOFF_BASE_S * 2 ** (failures - 1), BACKOFF_MAX_S);
+    if (retryAt === null) this.backoff.delete(mandate.id);
+    else this.backoff.set(mandate.id, { failures, retryAt });
+
+    const inserted = await this.db.get<{ id: number }>(
+      `INSERT INTO charge_attempts
+         (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING id`,
+      [
+        mandate.id,
+        now,
+        attempt.result,
+        attempt.errorCode,
+        attempt.txHash,
+        attempt.shortfall,
+        failures,
+        retryAt,
+      ],
+    );
+    const attemptId = inserted!.id;
+
+    const subject = {
+      mandateId: mandate.id,
+      subscriber: mandate.subscriber,
+      merchant: mandate.merchant,
+      attemptId: Number(attemptId),
+    };
+    if (failures === FAILING_STREAK && retryAt !== null) {
+      this.notify({
+        ...subject,
+        kind: "charge.failing",
+        failures,
+        shortfall: attempt.shortfall,
+        nextRetryAt: retryAt,
+        errorCode: attempt.errorCode,
+      });
+    } else if (failures === 0 && streak >= FAILING_STREAK) {
+      this.notify({ ...subject, kind: "charge.recovered", failures: streak, txHash: attempt.txHash });
     }
-    const failures = (this.backoff.get(result.mandateId)?.failures ?? 0) + 1;
-    const delay = Math.min(BACKOFF_BASE_S * 2 ** (failures - 1), BACKOFF_MAX_S);
-    this.backoff.set(result.mandateId, { failures, retryAt: now + delay });
+  }
+
+  /** Hand a streak event to the listener; its failure is logged, never thrown into the pass. */
+  private notify(event: ChargeStreakEvent): void {
+    this.onStreak?.(event).catch((err: unknown) =>
+      logger.error(
+        { mandateId: event.mandateId, kind: event.kind, err: err instanceof Error ? err.message : String(err) },
+        "charge streak notification failed",
+      ),
+    );
   }
 
   /**
@@ -832,7 +1011,7 @@ export class Keeper {
         );
         return this.config.KEEPER_DRY_RUN
           ? { mandateId, status: "simulated", error }
-          : { mandateId, status: "failed", error };
+          : { mandateId, status: "failed", error, errorCode: hostErrorCode(error) ?? "SUBMIT_FAILED" };
       }
     }
   }
@@ -872,7 +1051,7 @@ export class Keeper {
 
     const sent = await this.server.sendTransaction(prepared);
     if (sent.status === "TRY_AGAIN_LATER") {
-      return { mandateId, status: "failed", error: sent.status };
+      return { mandateId, status: "failed", error: sent.status, errorCode: sent.status };
     }
     if (sent.status === "ERROR") {
       return {
@@ -884,6 +1063,7 @@ export class Keeper {
               ? sent.errorResult
               : JSON.stringify(sent.errorResult ?? sent.status),
           ),
+        errorCode: resultCode(sent.errorResult) ?? sent.status,
       };
     }
 
@@ -892,7 +1072,13 @@ export class Keeper {
       logger.info({ mandateId, txHash: sent.hash }, "mandate settled");
       return { mandateId, status: "settled", txHash: sent.hash };
     }
-    return { mandateId, status: "failed", txHash: sent.hash, error: confirmed.status };
+    return {
+      mandateId,
+      status: "failed",
+      txHash: sent.hash,
+      error: confirmed.status,
+      errorCode: confirmed.status,
+    };
   }
 
   /** Settle a group, falling back to individual charges if batching is unavailable. */
@@ -993,7 +1179,13 @@ export class Keeper {
         kind: "results",
         results: mandateIds.map((mandateId, index) =>
           outcomes && !outcomes[index]
-            ? { mandateId, status: "failed", txHash: sent.hash, error: BATCH_SKIPPED_ERROR }
+            ? {
+                mandateId,
+                status: "failed",
+                txHash: sent.hash,
+                error: BATCH_SKIPPED_ERROR,
+                errorCode: "CHARGE_MANY_SKIPPED",
+              }
             : { mandateId, status: "settled", txHash: sent.hash },
         ),
       };
@@ -1018,6 +1210,7 @@ export class Keeper {
         status: "failed",
         txHash: sent.hash,
         error: confirmed.status,
+        errorCode: confirmed.status,
       })),
     };
   }

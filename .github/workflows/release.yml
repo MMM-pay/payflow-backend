@@ -4,9 +4,13 @@ name: Release
 # GHCR with the version tag, so operators can pull an image instead of
 # building one. The package is created on first push and starts private;
 # make it public in the package settings if anonymous pulls are wanted.
+#
+# On a client-v* tag, publish @mmm-pay/payflow-client to npm with provenance.
+# The client has its own version and changelog under `client/`, so it is
+# released independently of the backend image.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "client-v*"]
 
 # The job reads the tagged source and publishes the image. `packages: write`
 # is what lets the token push to the organisation's container registry.
@@ -16,9 +20,15 @@ permissions:
   contents: read
   packages: write
 
+# SBOM (Software Bill of Materials) published with each release for security scanning
+env:
+  SBOM_ARTIFACT_NAME: "sbom"
+  SBOM_FORMAT: "cyclonedx+json"
+
 jobs:
   image:
     name: image
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # Read the tagged source, and publish the image to GHCR. Nothing else.
     permissions:
@@ -47,3 +57,56 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  npm:
+    name: npm
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    runs-on: ubuntu-latest
+    # Read the tagged source and mint an OIDC token for npm provenance.
+    # NPM_TOKEN is the only credential that can publish the package.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run build:client
+      - name: the tag names the client version
+        run: |
+          expected="${GITHUB_REF_NAME#client-v}"
+          actual="$(node -p "require('./client/package.json').version")"
+          test "$expected" = "$actual"
+      - run: npm publish ./client --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  sbom:
+    name: sbom
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Generate and publish a Software Bill of Materials (SBOM) with each release
+    # for security scanning and vulnerability tracking.
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@60edb5dd545a775178fac7f3be8f6738d61b5f2e # v4.0.2
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run build
+      # Generate CycloneDX SBOM for Node.js dependencies
+      - run: npx cyclonedx-npm --output-file sbom.json --output-format json
+      - name: Create SBOM Release Asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          gh release upload "$VERSION" sbom.json --clobber

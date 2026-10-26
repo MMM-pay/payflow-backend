@@ -39,8 +39,30 @@ const charged = (
   closeTime,
 });
 
+const subscribed = (mandate: bigint, merchant: string, plan: bigint): DecodedEvent => ({
+  name: "subscribed",
+  contractId: "C",
+  ledger: 1,
+  txHash: `sub-${mandate}`,
+  topics: [mandate, SUBSCRIBER, merchant],
+  data: {
+    plan_id: plan,
+    amount: 10_000_000n,
+    period: 2_592_000n,
+    next_charge: 0n,
+    max_charges: 0n,
+    fee_bps: 100n,
+  },
+  closeTime: MAR_MID,
+});
+
 before(async () => {
   const ix = new Indexer(db, {} as never, {} as never);
+  // The subscriber CSV reads the plan from the mandate row, so project the
+  // subscriptions before their charges.
+  ix.apply(subscribed(1n, MERCHANT, 7n));
+  ix.apply(subscribed(2n, MERCHANT, 8n));
+  ix.apply(subscribed(3n, OTHER_MERCHANT, 9n));
   // The subscriber pays 10_000_000, the protocol keeps 100_000 and the
   // merchant 9_900_000.
   ix.apply(charged(1n, MERCHANT, 9_900_000n, 100_000n, "tx-a", MAR_MID));
@@ -116,6 +138,76 @@ describe("GET /api/merchants/:address/charges.csv", () => {
       const addr = s.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
       const lines = (await (await fetch(`http://127.0.0.1:${port}/api/merchants/${MERCHANT}/charges.csv`)).text())
+        .trim()
+        .split("\r\n");
+      assert.equal(lines.length, 1 + 1_234);
+      assert.equal(new Set(lines).size, lines.length, "no row repeats at a page boundary");
+    } finally {
+      s.close();
+      big.close();
+    }
+  });
+});
+
+describe("GET /api/subscribers/:address/charges.csv", () => {
+  test("is a CSV download with a header row and one row per payment", async () => {
+    const res = await fetch(`${base}/api/subscribers/${SUBSCRIBER}/charges.csv`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /^text\/csv/);
+    assert.equal(
+      res.headers.get("content-disposition"),
+      `attachment; filename="payflow-charges-${SUBSCRIBER}.csv"`,
+    );
+    const lines = (await res.text()).split("\r\n");
+    assert.deepEqual(lines, [
+      "date,merchant,plan,amount,fee,tx_hash",
+      `2025-03-10T12:00:00.000Z,${MERCHANT},7,1.0000000,0.0100000,tx-a`,
+      `2025-03-10T12:00:00.000Z,${OTHER_MERCHANT},9,0.0000001,0.0000000,tx-c`,
+      `2025-03-11T12:00:00.000Z,${MERCHANT},8,900719925.4741000,0.0000007,tx-b`,
+      "",
+    ]);
+  });
+
+  test("from/to bound the range, half-open", async () => {
+    const res = await fetch(
+      `${base}/api/subscribers/${SUBSCRIBER}/charges.csv?from=${MAR_MID}&to=${MAR_NEXT}`,
+    );
+    const lines = (await res.text()).trim().split("\r\n");
+    assert.equal(lines.length, 3);
+    assert.match(lines[1]!, /,tx-a$/);
+    assert.match(lines[2]!, /,tx-c$/);
+  });
+
+  test("a subscriber with no charges gets just the header", async () => {
+    const res = await fetch(`${base}/api/subscribers/${testAddress(43)}/charges.csv`);
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), "date,merchant,plan,amount,fee,tx_hash\r\n");
+  });
+
+  test("an invalid address is a 400, not a CSV", async () => {
+    const res = await fetch(`${base}/api/subscribers/nope/charges.csv`);
+    assert.equal(res.status, 400);
+    assert.match(res.headers.get("content-type") ?? "", /json/);
+  });
+
+  test("streams across pages", async () => {
+    const big = openDatabase(":memory:");
+    const ix = new Indexer(big, {} as never, {} as never);
+    for (let i = 0; i < 1_234; i += 1) {
+      ix.apply(charged(BigInt(i + 1), MERCHANT, 10n, 0n, `tx-${i}`, MAR_MID + i));
+    }
+    const app = createApp(big, config);
+    const s = await new Promise<Server>((resolve) => {
+      const srv = app.listen(0, () => resolve(srv));
+    });
+    try {
+      const addr = s.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      const lines = (
+        await (
+          await fetch(`http://127.0.0.1:${port}/api/subscribers/${SUBSCRIBER}/charges.csv`)
+        ).text()
+      )
         .trim()
         .split("\r\n");
       assert.equal(lines.length, 1 + 1_234);

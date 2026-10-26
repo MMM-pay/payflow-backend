@@ -5,15 +5,18 @@ import {
   bucketStart,
   nextBucketStart,
 } from "./churn.ts";
-import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "../routes/helpers.ts";
+import { MAX_CHURN_BUCKETS, SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "../routes/helpers.ts";
 import type {
+  ChargeAttemptRow,
   ChargeRow,
   ChurnBucket,
   ChurnBucketSize,
+  CohortRetention,
   DueMandateRecord,
   ProtocolResponse,
   MandateRow,
   MerchantChurnResponse,
+  MerchantCohortsResponse,
   MerchantProfile,
   MerchantRevenueResponse,
   MerchantSummary,
@@ -208,11 +211,21 @@ export interface PlanStatsAggregate {
   cancellations: number;
   totalCollected: bigint;
   totalCharges: number;
+  /** Mean lifetime value (net of fee) per subscriber of the plan; floored. */
+  averageLtv: bigint;
+  /** Median lifetime value per subscriber; the floored mean of the middle two when even. */
+  medianLtv: bigint;
 }
 
 /**
  * Per-plan statistics: active and total mandates, cancellations, gross amount
  * collected and the average number of settled charges per mandate.
+ *
+ * Lifetime value (#143) is what one subscriber has paid the merchant through
+ * the plan, net of the protocol fee — the sum of their charges' `amount`,
+ * across every mandate they hold on it. Every subscriber with a mandate
+ * counts, one who was never charged at zero, so the figures describe the
+ * subscribers the plan acquired rather than only the ones that paid.
  *
  * Starts from mandates so a plan with no settled charges still appears with a
  * total collected of `0`. The collected sum reads as bigint, so no amount
@@ -246,15 +259,51 @@ export async function getPlanStats(
     ),
   ]);
 
+  // One value per subscriber, ranked once so the median is read in the same
+  // statement: `(n + 1) / 2` and `n / 2 + 1` name the same row when n is odd
+  // and the middle two when it is even. Mandates come from the
+  // (plan_id, status) index and charges from the mandate_id index; the rank
+  // sorts S subscribers, O(S log S), and only one row reaches JavaScript.
+  const ltv = await db.get<{
+    subscribers: number | bigint;
+    middle_sum: number | bigint;
+    middle_count: number | bigint;
+  }>(
+    `WITH ltv AS (
+       SELECT COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS value
+         FROM mandates m
+         LEFT JOIN charges c ON c.mandate_id = m.id
+        WHERE m.plan_id = ?
+        GROUP BY m.subscriber
+     ),
+     ranked AS (
+       SELECT value, ROW_NUMBER() OVER (ORDER BY value) AS rn, COUNT(*) OVER () AS n
+         FROM ltv
+     )
+     SELECT COUNT(*) AS subscribers,
+            COALESCE(SUM(CASE WHEN rn IN ((n + 1) / 2, n / 2 + 1) THEN value END), 0) AS middle_sum,
+            COUNT(CASE WHEN rn IN ((n + 1) / 2, n / 2 + 1) THEN 1 END) AS middle_count
+       FROM ranked`,
+    [planId],
+  );
+
   const total = Number(mandateCounts?.total_mandates ?? 0);
+  const totalCollected = BigInt(revenue?.total_collected ?? 0);
+  const subscribers = BigInt(ltv?.subscribers ?? 0);
+  const middleSum = BigInt(ltv?.middle_sum ?? 0);
+  const middleCount = BigInt(ltv?.middle_count ?? 0);
   return {
     planId,
     activeMandates: Number(mandateCounts?.active_mandates ?? 0),
     totalMandates: total,
     cancellations: Number(mandateCounts?.cancellations ?? 0),
-    totalCollected: BigInt(revenue?.total_collected ?? 0),
+    totalCollected,
     // Charges settled is a count, never an amount; safe to coerce to a number.
     totalCharges: Number(revenue?.total_charges ?? 0),
+    // The subscribers' values sum to the plan's net collected total, so the
+    // mean divides that instead of summing the same charges again.
+    averageLtv: subscribers === 0n ? 0n : totalCollected / subscribers,
+    medianLtv: middleCount === 0n ? 0n : middleSum / middleCount,
   };
 }
 
@@ -322,16 +371,79 @@ export async function getMandateMerchant(db: Storage, id: number): Promise<strin
   return (await db.get<{ merchant: string }>("SELECT merchant FROM mandates WHERE id = ?", [id]))?.merchant;
 }
 
-/** List charge events for a mandate ordered by ledger descending. */
+/**
+ * List charge events for a mandate ordered by ledger descending.
+ *
+ * `from` and `to` bound the charge's ledger close time in unix seconds and
+ * are both inclusive: `to` covers the whole second, so a charge stored at
+ * `to * 1000 + 1` milliseconds is inside the range. Without them the whole
+ * history is returned.
+ */
 export async function listMandateCharges(
   db: Storage,
   mandateId: number,
   limit: number,
+  from?: number,
+  to?: number,
 ): Promise<ChargeRow[]> {
-    return db.all<ChargeRow>(
-      "SELECT * FROM charges WHERE mandate_id = ? ORDER BY ledger DESC, tx_hash DESC LIMIT ?",
+  const where = ["mandate_id = ?"];
+  const args: unknown[] = [mandateId];
+  if (from !== undefined) {
+    // `created_at` is unix milliseconds; the range is in seconds.
+    where.push("created_at >= ?");
+    args.push(from * 1000);
+  }
+  if (to !== undefined) {
+    where.push("created_at < ?");
+    args.push((to + 1) * 1000);
+  }
+  args.push(limit);
+  // The predicates are fixed fragments and the values are bound parameters,
+  // so no request data reaches the SQL text.
+  return db.all<ChargeRow>(
+    `SELECT * FROM charges WHERE ${where.join(" AND ")} ORDER BY ledger DESC LIMIT ?`,
+    args,
+  );
+}
+
+/**
+ * A mandate's keeper charge attempts, newest first (#144). One range read on
+ * the (mandate_id, id) index, O(log A + limit) however long the log is.
+ */
+export async function listChargeAttempts(
+  db: Storage,
+  mandateId: number,
+  limit: number,
+): Promise<ChargeAttemptRow[]> {
+  const rows = await db.all<{
+    id: number;
+    mandate_id: number;
+    attempted_at: number;
+    result: ChargeAttemptRow["result"];
+    error_code: string | null;
+    tx_hash: string | null;
+    shortfall: string | null;
+    failures: number;
+    retry_at: number | null;
+  }>(
+    `SELECT id, mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at
+       FROM charge_attempts
+      WHERE mandate_id = ?
+      ORDER BY id DESC
+      LIMIT ?`,
     [mandateId, limit],
   );
+  return rows.map((row) => ({
+    id: row.id,
+    mandateId: row.mandate_id,
+    attemptedAt: row.attempted_at,
+    result: row.result,
+    errorCode: row.error_code,
+    txHash: row.tx_hash,
+    ...(row.shortfall === null ? {} : { shortfall: row.shortfall }),
+    failures: row.failures,
+    retryAt: row.retry_at,
+  }));
 }
 
 /** One settled charge, as the merchant CSV export reads it. */
@@ -376,6 +488,48 @@ export async function listMerchantChargesAfter(
         ORDER BY created_at, tx_hash, mandate_id
         LIMIT ?`,
     [merchant, from, to, key.created_at, key.tx_hash, key.mandate_id, limit],
+  );
+}
+
+/** One settled charge, as the subscriber CSV export reads it. */
+export interface SubscriberChargeRow {
+  tx_hash: string;
+  mandate_id: number;
+  merchant: string;
+  plan_id: number | null;
+  amount: string;
+  fee: string;
+  created_at: number;
+}
+
+/**
+ * One page of a subscriber's charges, oldest first, after `after` in
+ * (created_at, tx_hash, mandate_id) order. Keyset pages over the
+ * `charges_subscriber_created_at` index keep every query short, so a long
+ * export never holds the connection for its whole length. `plan_id`
+ * comes from the mandate; it is null only if a charge arrived before its
+ * mandate was projected. `from`/`to` bound `created_at` in unix milliseconds,
+ * half-open.
+ */
+export async function listSubscriberChargesAfter(
+  db: Storage,
+  subscriber: string,
+  after: ChargeKey | null,
+  limit: number,
+  from = 0,
+  to = Number.MAX_SAFE_INTEGER,
+): Promise<SubscriberChargeRow[]> {
+  const key = after ?? { created_at: -1, tx_hash: "", mandate_id: -1 };
+  return db.all<SubscriberChargeRow>(
+    `SELECT c.tx_hash, c.mandate_id, c.merchant, m.plan_id, c.amount, c.fee, c.created_at
+       FROM charges c
+       LEFT JOIN mandates m ON m.id = c.mandate_id
+      WHERE c.subscriber = ?
+        AND c.created_at >= ? AND c.created_at < ?
+        AND (c.created_at, c.tx_hash, c.mandate_id) > (?, ?, ?)
+      ORDER BY c.created_at, c.tx_hash, c.mandate_id
+      LIMIT ?`,
+    [subscriber, from, to, key.created_at, key.tx_hash, key.mandate_id, limit],
   );
 }
 
@@ -903,6 +1057,77 @@ export async function getMerchantChurn(
   );
 
   return { merchant, bucket, buckets, totals };
+}
+
+/**
+ * A merchant's cohort retention (#142): mandates grouped by the bucket they
+ * started in, and for each cohort how many were still active after 1, 2,
+ * 3... buckets.
+ *
+ * Both ends come from `mandate_events`, stamped with ledger close times: a
+ * mandate is active after k periods when it has no departure (cancelled,
+ * ended or completed) before the start of the k-th bucket after its cohort's.
+ * A period is reported once that bucket has begun by `now`, and at most
+ * MAX_CHURN_BUCKETS of them per cohort; `limit` keeps the most recent cohorts.
+ *
+ * SQLite groups the mandates by (cohort, departure bucket) in one statement —
+ * starts from the (merchant, kind, at) index, each departure by primary key —
+ * so R ≤ C × (D + 1) rows reach JavaScript rather than one per mandate. The
+ * walk is then O(R + limit × periods) with O(R) memory.
+ */
+export async function getMerchantCohorts(
+  db: Storage,
+  merchant: string,
+  bucket: ChurnBucketSize,
+  limit: number,
+  now: number,
+): Promise<MerchantCohortsResponse> {
+  // The bucket expression is a vetted static fragment chosen by the
+  // bucket size, never request data; the address is bound as a parameter.
+  const bucketExpr = bucketSql(db, bucket);
+  const rows = await db.all<{ cohort: number; departed: number | null; n: number }>(
+    `SELECT cohort, ${bucketExpr} AS departed, COUNT(*) AS n
+       FROM (SELECT ${bucketExpr} AS cohort, departed_at AS at
+               FROM (SELECT s.at AS at, d.at AS departed_at
+                       FROM mandate_events s
+                       LEFT JOIN mandate_events d
+                         ON d.mandate_id = s.mandate_id AND d.slot = 'departure'
+                      WHERE s.merchant = ? AND s.kind = 'started'))
+      GROUP BY cohort, departed`,
+    [merchant],
+  );
+
+  const cohorts = new Map<number, { size: number; departures: Map<number, number> }>();
+  for (const row of rows) {
+    let entry = cohorts.get(row.cohort);
+    if (!entry) {
+      entry = { size: 0, departures: new Map() };
+      cohorts.set(row.cohort, entry);
+    }
+    entry.size += row.n;
+    if (row.departed !== null) entry.departures.set(row.departed, row.n);
+  }
+
+  const starts = [...cohorts.keys()].sort((a, b) => a - b).slice(-limit);
+  return {
+    merchant,
+    bucket,
+    cohorts: starts.map((start) => {
+      const { size, departures } = cohorts.get(start)!;
+      const retention: CohortRetention[] = [];
+      let departed = 0;
+      let period = new Date(start * 1000);
+      for (let k = 1; k <= MAX_CHURN_BUCKETS; k += 1) {
+        // Departures in the bucket that is ending count against period k.
+        departed += departures.get(period.getTime() / 1000) ?? 0;
+        period = nextBucketStart(bucket, period);
+        if (period.getTime() > now * 1000) break;
+        const active = size - departed;
+        retention.push({ period: k, active, share: active / size });
+      }
+      return { cohort: bucketLabel(bucket, new Date(start * 1000)), size, retention };
+    }),
+  };
 }
 
 /** Every bucket start between two instants, oldest first. */

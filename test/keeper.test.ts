@@ -7,12 +7,14 @@ import {
   Transaction,
   nativeToScVal,
   scValToNative,
+  xdr,
 } from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
 import { loadConfig } from "../src/config.ts";
 import { logger } from "../src/lib/logger.ts";
+import type { ChargeStreakEvent } from "../src/lib/webhooks.ts";
 import type { Config } from "../src/config.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
@@ -779,7 +781,32 @@ describe("keeper settle transaction paths", () => {
       mandateId: 7,
       status: "failed",
       error: "contract rejected",
+      errorCode: "ERROR",
     });
+  });
+
+  test("send ERROR carries the transaction result code stellar-core rejected it with", async () => {
+    // A TransactionResult of txBAD_SEQ, as the RPC returns it in errorResultXdr.
+    const errorResult = xdr.TransactionResult.fromXDR("AAAAAAAAAGT////7AAAAAA==", "base64");
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()])),
+      sendTransaction: async () => ({ status: "ERROR", errorResult }),
+    } as unknown as KeeperRpc;
+    const result = await settleKeeper(server).settle(7);
+    assert.equal(result.status, "failed");
+    assert.equal(result.errorCode, "txBadSeq");
+  });
+
+  test("a refused simulation carries the host error as its code", async () => {
+    const server = {
+      getAccount: async () => new Account(keyA.publicKey(), "1"),
+      prepareTransaction: async () => {
+        throw new Error("HostError: Error(Contract, #3)\n\nEvent log (newest first): ...");
+      },
+    } as unknown as KeeperRpc;
+    const result = await settleKeeper(server).settle(10);
+    assert.equal(result.status, "failed");
+    assert.equal(result.errorCode, "Error(Contract, #3)");
   });
 
   test("a transaction that remains NOT_FOUND returns a failed result", async (t) => {
@@ -826,6 +853,7 @@ describe("keeper settle transaction paths", () => {
       mandateId: 10,
       status: "failed",
       error: "simulation rejected",
+      errorCode: "SUBMIT_FAILED",
     });
   });
 
@@ -1158,6 +1186,325 @@ describe("keeper dry run", () => {
     assert.equal(submitted.length, 2, "one transaction per mandate");
     assert.equal(keeper.passHistory().length, 1, "real passes still record history");
     assert.match(results[0]!.txHash ?? "", /^[0-9a-f]{64}$/);
+    db.close();
+  });
+});
+
+/** A node whose simulations refuse every charge while `state.failing` holds, and settle it after. */
+function switchableRpc(state: { failing: boolean }): KeeperRpc {
+  const settles = fakeRpc(new Set([keyA.publicKey()]));
+  return {
+    ...settles,
+    prepareTransaction: async (tx: Transaction) => {
+      if (state.failing) throw new Error("HostError: Error(Contract, #3)");
+      return settles.prepareTransaction(tx);
+    },
+  } as KeeperRpc;
+}
+
+interface AttemptRecord {
+  mandate_id: number;
+  attempted_at: number;
+  result: string;
+  error_code: string | null;
+  tx_hash: string | null;
+  shortfall: string | null;
+  failures: number;
+  retry_at: number | null;
+}
+
+function attemptsOf(db: ReturnType<typeof openDatabase>): AttemptRecord[] {
+  return db
+    .prepare(
+      `SELECT mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at
+         FROM charge_attempts ORDER BY id`,
+    )
+    .all() as unknown as AttemptRecord[];
+}
+
+/** Issue #144: every attempt is persisted, and the backoff outlives the process. */
+describe("keeper charge attempts", () => {
+  test("records each attempt's time, result, error code and transaction hash", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const state = { failing: true };
+    const keeper = new Keeper(db, switchableRpc(state), keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+
+    await keeper.tick(10_000);
+    state.failing = false;
+    await keeper.tick(10_060);
+
+    const [failed, settled] = attemptsOf(db);
+    assert.deepEqual({ ...failed }, {
+      mandate_id: 1,
+      attempted_at: 10_000,
+      result: "failed",
+      error_code: "Error(Contract, #3)",
+      tx_hash: null,
+      shortfall: null,
+      failures: 1,
+      retry_at: 10_060,
+    });
+    assert.equal(settled!.result, "settled");
+    assert.equal(settled!.attempted_at, 10_060);
+    assert.equal(settled!.error_code, null);
+    assert.match(settled!.tx_hash ?? "", /^[0-9a-f]{64}$/);
+    assert.equal(settled!.failures, 0, "a settlement ends the streak");
+    assert.equal(settled!.retry_at, null);
+    db.close();
+  });
+
+  test("backoff survives a restart", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    const state = { failing: true };
+    const config = keeperConfig({ KEEPER_SECRET: keyA.secret() });
+    const before = new Keeper(db, switchableRpc(state), config);
+    await before.tick(10_000);
+    await before.tick(10_060);
+
+    // A new process on the same database resumes where the old one stopped.
+    const after = new Keeper(db, switchableRpc(state), config);
+    await after.ready;
+    assert.deepEqual(after.backoffList(10_100), before.backoffList(10_100));
+    assert.equal(after.retryIn(1, 10_100), 80, "the second failure's 120 s wait still holds");
+    assert.deepEqual(await after.findDue(10_100), [], "a backing-off mandate is not retried early");
+
+    // The streak continues rather than starting over at one failure.
+    await after.tick(10_180);
+    assert.deepEqual(after.backoffList(10_180).map((b) => b.failures), [3, 3]);
+    assert.equal(after.retryIn(1, 10_180), 240);
+    db.close();
+  });
+
+  test("a settled mandate is not restored into backoff", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const state = { failing: true };
+    const config = keeperConfig({ KEEPER_SECRET: keyA.secret() });
+    const keeper = new Keeper(db, switchableRpc(state), config);
+    await keeper.tick(10_000);
+    state.failing = false;
+    await keeper.tick(10_060);
+
+    const restarted = new Keeper(db, switchableRpc(state), config);
+    await restarted.ready;
+    assert.deepEqual(restarted.backoffList(10_060), []);
+    db.close();
+  });
+
+  test("attempts older than 90 days are pruned", async () => {
+    const db = openDatabase(":memory:");
+    const now = 100_000_000;
+    const ninetyDays = 90 * 24 * 60 * 60;
+    const insert = db.prepare(
+      `INSERT INTO charge_attempts (mandate_id, attempted_at, result, failures)
+       VALUES (?, ?, 'settled', 0)`,
+    );
+    insert.run(1, now - ninetyDays - 1);
+    insert.run(2, now - ninetyDays);
+    const keeper = new Keeper(db, fakeRpc(new Set([keyA.publicKey()])), keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+
+    await keeper.tick(now);
+
+    assert.deepEqual(
+      attemptsOf(db).map((a) => a.mandate_id),
+      [2],
+      "only the attempt from beyond 90 days is gone",
+    );
+    db.close();
+  });
+
+  test("a dry run records no attempt", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const keeper = new Keeper(
+      db,
+      switchableRpc({ failing: true }),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_DRY_RUN: true }),
+    );
+
+    await keeper.tick(10_000);
+
+    assert.deepEqual(attemptsOf(db), []);
+    db.close();
+  });
+});
+
+/** Issue #145: the merchant hears about a failing mandate once per streak. */
+describe("keeper failing streaks", () => {
+  const TOKEN = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+
+  function streakKeeper(
+    db: ReturnType<typeof openDatabase>,
+    server: KeeperRpc,
+    events: ChargeStreakEvent[],
+  ): Keeper {
+    return new Keeper(db, server, keeperConfig({ KEEPER_SECRET: keyA.secret() }), async (event) => {
+      events.push(event);
+    });
+  }
+
+  /**
+   * Run passes at each mandate's retry time, so every pass makes one attempt:
+   * the waits double from 60 s (10_000, 10_060, 10_180, 10_420, 10_900...).
+   */
+  async function passes(keeper: Keeper, count: number, from = 10_000): Promise<number> {
+    let now = from;
+    for (let i = 0; i < count; i += 1) {
+      await keeper.tick(now);
+      now += keeper.retryIn(1, now);
+    }
+    return now;
+  }
+
+  test("charge.failing fires once, on the third consecutive failure", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const events: ChargeStreakEvent[] = [];
+    const keeper = streakKeeper(db, switchableRpc({ failing: true }), events);
+
+    await passes(keeper, 2);
+    assert.deepEqual(events, [], "two failures are not yet a streak");
+    await passes(keeper, 1, 10_180);
+    await passes(keeper, 2, 10_420);
+
+    const thirdAttemptId = (
+      db.prepare("SELECT id FROM charge_attempts WHERE failures = 3").get() as { id: number }
+    ).id;
+    assert.deepEqual(events, [
+      {
+        mandateId: 1,
+        subscriber: SUBSCRIBER,
+        merchant: MERCHANT,
+        attemptId: thirdAttemptId,
+        kind: "charge.failing",
+        failures: 3,
+        shortfall: null,
+        nextRetryAt: 10_420,
+        errorCode: "Error(Contract, #3)",
+      },
+    ], "the fourth and fifth failures do not fire it again");
+    db.close();
+  });
+
+  test("charge.recovered fires once when a failing mandate settles", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const state = { failing: true };
+    const events: ChargeStreakEvent[] = [];
+    const keeper = streakKeeper(db, switchableRpc(state), events);
+
+    const next = await passes(keeper, 4);
+    state.failing = false;
+    await keeper.tick(next);
+    // Settled: the mandate is due again only after its next charge, so a
+    // second pass at the same instant finds nothing to recover from.
+    await keeper.tick(next);
+
+    const recovered = events.filter((e) => e.kind === "charge.recovered");
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0]!.mandateId, 1);
+    assert.equal(recovered[0]!.failures, 4, "it reports the length of the streak that ended");
+    assert.match((recovered[0] as { txHash: string }).txHash, /^[0-9a-f]{64}$/);
+    db.close();
+  });
+
+  test("a streak that ends before the threshold raises nothing", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const state = { failing: true };
+    const events: ChargeStreakEvent[] = [];
+    const keeper = streakKeeper(db, switchableRpc(state), events);
+
+    const next = await passes(keeper, 2);
+    state.failing = false;
+    await keeper.tick(next);
+
+    assert.deepEqual(events, []);
+    db.close();
+  });
+
+  test("a restart mid-streak neither repeats charge.failing nor forgets to recover", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const state = { failing: true };
+    const first: ChargeStreakEvent[] = [];
+    let next = await passes(streakKeeper(db, switchableRpc(state), first), 3);
+    assert.deepEqual(first.map((e) => e.kind), ["charge.failing"]);
+
+    const second: ChargeStreakEvent[] = [];
+    const restarted = streakKeeper(db, switchableRpc(state), second);
+    next = await passes(restarted, 1, next);
+    state.failing = false;
+    await restarted.tick(next);
+
+    assert.deepEqual(second.map((e) => e.kind), ["charge.recovered"]);
+    db.close();
+  });
+
+  test("a vault shortfall counts toward the streak and rides on charge.failing", async () => {
+    const db = openDatabase(":memory:");
+    db.prepare(
+      `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
+       VALUES (1, ?, 'p', ?, '1000', 60, 1, 1)`,
+    ).run(MERCHANT, TOKEN);
+    insertMandate(db, 1, 1_000, "1000");
+    const submitted: string[] = [];
+    const server = {
+      ...fakeRpc(new Set([keyA.publicKey()]), submitted),
+      simulateTransaction: async () => ({ result: { retval: nativeToScVal(400n, { type: "i128" }) } }),
+    } as unknown as KeeperRpc;
+    const events: ChargeStreakEvent[] = [];
+    const keeper = streakKeeper(db, server, events);
+
+    await passes(keeper, 3);
+
+    assert.equal(submitted.length, 0, "nothing was submitted for an empty vault");
+    const skipped = attemptsOf(db);
+    assert.deepEqual(
+      skipped.map((a) => [a.result, a.error_code, a.shortfall, a.failures]),
+      [
+        ["skipped", "INSUFFICIENT_BALANCE", "600", 1],
+        ["skipped", "INSUFFICIENT_BALANCE", "600", 2],
+        ["skipped", "INSUFFICIENT_BALANCE", "600", 3],
+      ],
+    );
+    assert.equal(events.length, 1);
+    const failing = events[0]!;
+    assert.equal(failing.kind, "charge.failing");
+    assert.equal((failing as { shortfall: string | null }).shortfall, "600");
+    assert.equal((failing as { nextRetryAt: number }).nextRetryAt, 10_420);
+    db.close();
+  });
+
+  test("a listener that rejects is logged, never thrown into the pass", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const keeper = new Keeper(
+      db,
+      switchableRpc({ failing: true }),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+      async () => {
+        throw new Error("webhook store unavailable");
+      },
+    );
+
+    const errors: string[] = [];
+    const original = logger.error;
+    (logger as { error: unknown }).error = (...args: unknown[]) => {
+      errors.push(String(args[1]));
+    };
+    try {
+      await passes(keeper, 3);
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      (logger as { error: unknown }).error = original;
+    }
+
+    assert.deepEqual(errors, ["charge streak notification failed"]);
+    assert.equal(keeper.backoffList(10_420)[0]!.failures, 3, "the pass completed");
     db.close();
   });
 });

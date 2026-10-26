@@ -117,6 +117,10 @@ describe("SEP-10 sign-in", () => {
 
   before(async () => {
     // Every line the service logs during these tests, to prove no key is in one.
+    // The suite asserts on what was logged, so it raises the level itself: CI
+    // runs a job with LOG_LEVEL=fatal, which would otherwise silence every
+    // line and leave the capture — and this proof — empty.
+    logger.level = "info";
     stream.write = function (line: string) {
       logged.push(String(line));
       return write.call(this, line);

@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
-import { Keypair, StrKey } from "@stellar/stellar-sdk";
+import { Account, Keypair, StrKey, rpc, type Transaction } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
+import { Keeper, type KeeperRpc } from "../src/keeper.ts";
 import { WebhookDispatcher } from "../src/lib/webhooks.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
@@ -481,5 +482,161 @@ describe("webhooks", () => {
       const res = await fetch(`${base}/api/webhooks/${hook.id}?${query}`, { method: "DELETE" });
       assert.equal(res.status, 204);
     });
+  });
+});
+
+/** Issue #145: the keeper's streak events reach the merchant's webhooks. */
+describe("charge streak webhooks", () => {
+  const merchant = Keypair.random().publicKey();
+  const secret = "streak-secret";
+  const received: Array<{ url: string; signature: string | null; raw: string }> = [];
+  const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    received.push({
+      url: String(input),
+      signature: new Headers(init?.headers).get("Payflow-Signature"),
+      raw: String(init?.body),
+    });
+    return new Response("ok", { status: 200 });
+  };
+  const dispatcherFor = (db: ReturnType<typeof openDatabase>): WebhookDispatcher =>
+    new WebhookDispatcher({ db, fetchImpl: fetchImpl as typeof fetch });
+
+  test("charge.failing carries the mandate, shortfall and next retry, signed like a charge", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    const dispatcher = dispatcherFor(db);
+    const hook = await dispatcher.register(merchant, "https://merchant.example/streaks", secret);
+
+    await dispatcher.onChargeStreak({
+      kind: "charge.failing",
+      mandateId: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 3,
+      attemptId: 42,
+      shortfall: "600",
+      nextRetryAt: 10_420,
+      errorCode: "INSUFFICIENT_BALANCE",
+    });
+
+    assert.equal(received.length, 1);
+    const [delivery] = received;
+    assert.deepEqual(JSON.parse(delivery!.raw), {
+      event: "charge.failing",
+      mandate_id: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 3,
+      shortfall: "600",
+      next_retry_at: 10_420,
+      error_code: "INSUFFICIENT_BALANCE",
+    });
+    assert.equal(
+      delivery!.signature,
+      `sha256=${createHmac("sha256", secret).update(delivery!.raw).digest("hex")}`,
+    );
+    assert.equal((await dispatcher.history(merchant, hook.id))![0]!.eventId, "charge.failing:7:42");
+    db.close();
+  });
+
+  test("charge.recovered carries the settling transaction", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    const dispatcher = dispatcherFor(db);
+    dispatcher.register(merchant, "https://merchant.example/streaks", secret);
+
+    await dispatcher.onChargeStreak({
+      kind: "charge.recovered",
+      mandateId: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 4,
+      attemptId: 43,
+      txHash: "ab".repeat(32),
+    });
+
+    assert.deepEqual(JSON.parse(received[0]!.raw), {
+      event: "charge.recovered",
+      mandate_id: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 4,
+      tx_hash: "ab".repeat(32),
+    });
+    db.close();
+  });
+
+  test("a merchant without webhooks is sent nothing", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    await dispatcherFor(db).onChargeStreak({
+      kind: "charge.recovered",
+      mandateId: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 3,
+      attemptId: 1,
+      txHash: null,
+    });
+    assert.equal(received.length, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM webhook_deliveries").get() as { n: number }).n, 0);
+    db.close();
+  });
+
+  test("a failing then settling mandate is delivered each event once per streak", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    const dispatcher = dispatcherFor(db);
+    dispatcher.register(merchant, "https://merchant.example/streaks", secret);
+    db.prepare(
+      `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
+       VALUES (1, ?, ?, 1, '10', 60, 1000, 'Active', 1)`,
+    ).run(SUBSCRIBER, merchant);
+
+    const key = Keypair.random();
+    const state = { failing: true };
+    const server = {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "100" } }),
+      getAccount: async () => new Account(key.publicKey(), "1"),
+      prepareTransaction: async (tx: Transaction) => {
+        if (state.failing) throw new Error("HostError: Error(Contract, #3)");
+        return tx;
+      },
+      sendTransaction: async (tx: Transaction) => ({
+        status: "PENDING",
+        hash: Buffer.from(tx.hash()).toString("hex"),
+      }),
+      getTransaction: async () => ({ status: rpc.Api.GetTransactionStatus.SUCCESS }),
+    } as unknown as KeeperRpc;
+    const keeper = new Keeper(
+      db,
+      server,
+      {
+        SUBSCRIPTION_ID: StrKey.encodeContract(Buffer.alloc(32)),
+        NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+        KEEPER_SECRET: key.secret(),
+        KEEPER_MAX_FEE: "100000",
+      } as unknown as Config,
+      (event) => dispatcher.onChargeStreak(event),
+    );
+
+    // Five failed passes, each at the mandate's retry time, then a settlement
+    // and one more pass that finds nothing due.
+    let now = 10_000;
+    for (let pass = 0; pass < 5; pass += 1) {
+      await keeper.tick(now);
+      now += keeper.retryIn(1, now);
+    }
+    state.failing = false;
+    await keeper.tick(now);
+    await keeper.tick(now);
+    await waitFor(() => received.length >= 2);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(
+      received.map((r) => (JSON.parse(r.raw) as { event: string }).event),
+      ["charge.failing", "charge.recovered"],
+    );
+    db.close();
   });
 });

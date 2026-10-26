@@ -8,6 +8,7 @@ import {
   listMerchantSubscribers,
   listMerchantUnpaidMandates,
   getMerchantChurn,
+  getMerchantCohorts,
   getMerchantRevenue,
 } from "../lib/queries.ts";
 import { churnBucketSize } from "../lib/churn.ts";
@@ -15,6 +16,7 @@ import { sendApiError } from "./errors.ts";
 import type {
   ForecastResponse,
   MerchantChurnResponse,
+  MerchantCohortsResponse,
   MerchantProfile,
   MerchantRevenueResponse,
   MerchantSubscribersResponse,
@@ -108,7 +110,7 @@ export function tokenUnits(raw: bigint): string {
 const CSV_HEADER = "date,mandate,subscriber,gross,fee,net,tx_hash";
 /** Longest forecast horizon, to keep the arithmetic bounded. */
 const MAX_FORECAST_DAYS = 365;
-/** Buckets reported by the churn endpoint when the caller does not say. */
+/** Buckets reported by the churn endpoint, and cohorts by the cohort endpoint, when the caller does not say. */
 const DEFAULT_CHURN_BUCKETS = 12;
 
 function daysOf(raw: unknown, fallback = 30): number {
@@ -210,9 +212,38 @@ export function merchantsRouter(
     const body: MerchantSubscribersResponse = {
       merchant: address.value,
       subscribers: subscribers.map(
-        (sub) => ({ ...sub, totalCollected: sub.totalCollected.toString() }),
+        (sub) => {
+          // A charge's amount is the merchant's share, so the collected sum
+          // is already the lifetime value net of fee.
+          const ltv = sub.totalCollected.toString();
+          return { ...sub, totalCollected: ltv, ltv };
+        },
       ),
     };
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/cohorts?bucket=month`: mandates grouped by the
+   * bucket they started in, with the share still active after each later
+   * bucket. Both the cohort and the departures follow ledger close times;
+   * `limit` keeps the most recent cohorts.
+   */
+  r.get("/merchants/:address/cohorts", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
+    if (!bucket.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const body: MerchantCohortsResponse = await getMerchantCohorts(
+      db,
+      address.value,
+      churnBucketSize(bucket.value),
+      Math.min(limitOf(limit.value, DEFAULT_CHURN_BUCKETS), MAX_CHURN_BUCKETS),
+      Math.floor(Date.now() / 1000),
+    );
     res.json(body);
   });
 

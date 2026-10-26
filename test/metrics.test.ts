@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
+import type { DatabaseSync } from "node:sqlite";
 import { nativeToScVal, type rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
-import { metrics, MetricsRegistry } from "../src/lib/metrics.ts";
+import { metrics, MetricsRegistry, publishBusinessMetrics } from "../src/lib/metrics.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 
 /**
@@ -18,6 +20,9 @@ import type { Config, NetworkConfig } from "../src/config.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const TOKEN = "CDQ5EJTVXXX2CBMHWP3BGGUDHSK6D4I25IF5XXH3QGL2TNTBMJUOFKDB";
+/** A second merchant. Addresses are stored as text and never validated here. */
+const SECOND_MERCHANT = "G" + "2".repeat(55);
+const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
 
 const testnet: NetworkConfig = {
   name: "testnet",
@@ -176,6 +181,9 @@ describe("GET /metrics", () => {
       "payflow_indexer_cursor",
       "payflow_indexer_latest_ledger",
       "payflow_indexer_lag",
+      "payflow_active_mandates",
+      "payflow_active_merchants",
+      "payflow_mrr",
       "payflow_events_applied_total",
       "payflow_charges_settled_total",
       "payflow_charges_failed_total",
@@ -183,6 +191,15 @@ describe("GET /metrics", () => {
     ]) {
       assert.ok(body.includes(name), `${name} is published`);
     }
+  });
+
+  test("the business gauges are refreshed from the projection before the render", async () => {
+    const body = await (await fetch(`${base}/metrics`)).text();
+    // This network's database holds no mandates, and the scrape still
+    // carries a sample per gauge — not just the family's HELP line.
+    assert.match(body, /payflow_active_mandates\{network="testnet"\} 0/);
+    assert.match(body, /payflow_active_merchants\{network="testnet"\} 0/);
+    assert.match(body, /payflow_mrr\{network="testnet"\} 0/);
   });
 
   test("the gauges carry the indexer's own numbers", async () => {
@@ -203,6 +220,138 @@ describe("the metrics the loops publish", () => {
     assert.equal(metrics.value("indexer_latest_ledger", { network: "testnet" }), 20_000);
     assert.equal(metrics.value("indexer_lag", { network: "testnet" }), 11_999);
     assert.equal(metrics.value("events_applied", { network: "testnet" }), 1);
+    metrics.reset();
+  });
+});
+
+/**
+ * A projection with two merchants' mandates, written directly: these gauges
+ * only read the `mandates` table, so the indexer's event writer is not in
+ * the way of an exact expected value.
+ *
+ * Mandate 3's figure is deliberate: its MRR is 2^53 + 1, which a JavaScript
+ * number cannot hold — a gauge that stored it as a number would publish a
+ * rounded digit string.
+ */
+function seededBusinessDb(): DatabaseSync {
+  const db = openDatabase(":memory:");
+  insertMandate(db, 1, MERCHANT, "1000", 2_592_000, "Active"); // mrr 1000
+  insertMandate(db, 2, MERCHANT, "2000", 1_296_000, "Active"); // mrr 4000
+  insertMandate(db, 3, SECOND_MERCHANT, "9007199254740993", 2_592_000, "Active"); // mrr 2^53 + 1
+  insertMandate(db, 4, SECOND_MERCHANT, "7777", 2_592_000, "Cancelled"); // neither active nor recurring
+  insertMandate(db, 5, SECOND_MERCHANT, "500", 0, "Active"); // active, but billed with no period
+  return db;
+}
+
+/** One mandate row: the gauges' only input. */
+function insertMandate(
+  db: DatabaseSync,
+  id: number,
+  merchant: string,
+  amount: string,
+  period: number,
+  status: string,
+): void {
+  db.prepare(
+    `INSERT INTO mandates
+       (id, subscriber, merchant, plan_id, amount, period, next_charge,
+        last_charge, charges_made, max_charges, fee_bps, status, ledger)
+     VALUES (?, ?, ?, 1, ?, ?, 0, 0, 0, 0, 0, ?, 10)`,
+  ).run(id, SUBSCRIBER, merchant, amount, period, status);
+}
+
+/** The seeded projection's MRR: 1000 + 4000 + (2^53 + 1). */
+const SEEDED_MRR = "9007199254745993";
+
+describe("the business gauges", () => {
+  test("active mandates, active merchants and MRR are read from the projection", async () => {
+    metrics.reset();
+    await publishBusinessMetrics(asStorage(seededBusinessDb()), "testnet");
+    assert.equal(metrics.value("active_mandates", { network: "testnet" }), 4);
+    assert.equal(metrics.value("active_merchants", { network: "testnet" }), 2);
+    assert.equal(metrics.value("mrr", { network: "testnet" }), SEEDED_MRR);
+    metrics.reset();
+  });
+
+  test("MRR is an amount: the exact decimal string, never a JavaScript number", async () => {
+    metrics.reset();
+    await publishBusinessMetrics(asStorage(seededBusinessDb()), "testnet");
+    const mrr = metrics.value("mrr", { network: "testnet" });
+    assert.equal(typeof mrr, "string");
+    assert.equal(mrr, SEEDED_MRR);
+    // A number would round this figure: 2^53 + 1 is odd, so its nearest
+    // double is 2 digits away and the published digits would be wrong.
+    assert.notEqual(String(Number(mrr)), mrr);
+    assert.match(
+      metrics.render(),
+      /^payflow_mrr\{network="testnet"\} 9007199254745993$/m,
+    );
+    metrics.reset();
+  });
+
+  test("cardinality stays bounded: no per-merchant labels, one sample per network", async () => {
+    metrics.reset();
+    const db = seededBusinessDb();
+    await publishBusinessMetrics(asStorage(db), "testnet");
+    // The business grows: ten more merchants, each with an active mandate.
+    for (let i = 0; i < 10; i += 1) {
+      insertMandate(db, 100 + i, `GM${i}`, "1000", 2_592_000, "Active");
+    }
+    await publishBusinessMetrics(asStorage(db), "testnet");
+    await publishBusinessMetrics(asStorage(db), "mainnet");
+
+    const rendered = metrics.render();
+    const businessLines = rendered
+      .split("\n")
+      .filter((line) => /^payflow_(active_mandates|active_merchants|mrr)/.test(line));
+    // Three metrics × two networks: growth adds no series, and a merchant's
+    // address is never a label — it would multiply cardinality by merchants.
+    assert.equal(businessLines.length, 6);
+    for (const line of businessLines) {
+      assert.match(line, /^\S+\{network="(testnet|mainnet)"\} \S+$/);
+    }
+    assert.ok(!rendered.includes(SECOND_MERCHANT));
+    assert.equal(metrics.value("active_merchants", { network: "testnet" }), 12);
+    metrics.reset();
+  });
+
+  test("a projection that cannot be read keeps the last gauges instead of throwing", async () => {
+    metrics.reset();
+    await publishBusinessMetrics(asStorage(seededBusinessDb()), "testnet");
+    const closed = openDatabase(":memory:");
+    closed.close();
+    // The read fails (a closed, locked or corrupt database): the failure is
+    // logged, the previously published values survive, and the next pass
+    // retries — a business-metrics failure never takes the loop down.
+    await publishBusinessMetrics(asStorage(closed), "testnet");
+    assert.equal(metrics.value("active_mandates", { network: "testnet" }), 4);
+    assert.equal(metrics.value("active_merchants", { network: "testnet" }), 2);
+    assert.equal(metrics.value("mrr", { network: "testnet" }), SEEDED_MRR);
+    metrics.reset();
+  });
+
+  test("an indexer pass refreshes the business gauges", async () => {
+    metrics.reset();
+    const db = openDatabase(":memory:");
+    const indexer = new Indexer(db, fakeRpc(20_000, 1, [rawPlanEvent(10)]), testnet);
+    // The constructor publishes the starting state: an empty projection.
+    await indexer.ready;
+    assert.equal(metrics.value("active_mandates", { network: "testnet" }), 0);
+    assert.equal(metrics.value("active_merchants", { network: "testnet" }), 0);
+    assert.equal(metrics.value("mrr", { network: "testnet" }), "0");
+
+    insertMandate(db, 7, MERCHANT, "1000", 2_592_000, "Active");
+    await indexer.tick();
+    assert.equal(metrics.value("active_mandates", { network: "testnet" }), 1);
+    assert.equal(metrics.value("active_merchants", { network: "testnet" }), 1);
+    assert.equal(metrics.value("mrr", { network: "testnet" }), "1000");
+
+    // A second pass replays nothing and accumulates nothing: the gauges are
+    // re-read from the projection, so an idempotent pass leaves them as they
+    // stand.
+    await indexer.tick();
+    assert.equal(metrics.value("active_mandates", { network: "testnet" }), 1);
+    assert.equal(metrics.value("mrr", { network: "testnet" }), "1000");
     metrics.reset();
   });
 });

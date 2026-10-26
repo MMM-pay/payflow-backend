@@ -5,7 +5,8 @@
       "subscriber": "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR",
       "mandateCount": 1,
       "chargeCount": 1,
-      "totalCollected": "9900000"
+      "totalCollected": "9900000",
+      "ltv": "9900000"
     }
   ]
 }

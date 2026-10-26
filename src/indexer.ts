@@ -16,7 +16,7 @@ import {
   type DecodedEvent,
 } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
-import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
+import { metrics, publishBusinessMetrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { defaultMerchantSummaryCache, type MerchantSummaryCache } from "./routes/index.ts";
 
 export { parseCloseTime };
@@ -137,8 +137,15 @@ export class Indexer {
     this.archive = archive;
     // Publish the starting state, so a scrape sees the series from the first
     // moment and not only once the first pass has run.
-    this.publishMetrics(0);
+    this.ready = this.publishMetrics(0);
+    // Nothing else awaits it at construction; mark the rejection handled so it
+    // cannot surface as an unhandled rejection. Callers that care (the metrics
+    // test, anything that scrapes before the first pass) await `ready`.
+    void this.ready.catch(() => undefined);
   }
+
+  /** Resolves when the constructor's first metrics publish has completed. */
+  readonly ready: Promise<void>;
 
   /** The archive used to backfill a gap, if ARCHIVE_URL was configured. */
   private readonly archive: Archive | undefined;
@@ -184,9 +191,15 @@ export class Indexer {
    * operator needs, and the lag it leaves behind is exactly what the alert is
    * for.
    */
-  private publishMetrics(applied: number): void {
+  private async publishMetrics(applied: number): Promise<void> {
     const network = this.networkLabel;
     publishIndexerMetrics(this.status, network);
+    // The business gauges come from the projection this pass just wrote (or
+    // left untouched), so they are re-read here: after each pass the series
+    // describe the current mandate base, merchant base and MRR. The read is
+    // one indexed statement and logs-and-continues on failure, so it cannot
+    // crash the loop.
+    await publishBusinessMetrics(this.db, network);
     if (applied > 0) metrics.increment("events_applied", applied, { network });
   }
 
@@ -364,7 +377,7 @@ export class Indexer {
     // write nothing, so the saved cursor and projection are untouched and the
     // loop resumes exactly where it left off on resume.
     if (this.status.paused) {
-      this.publishMetrics(0);
+      await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: this.status.cursor, latest: this.status.latest };
     }
     const latestRes = await this.server.getLatestLedger();
@@ -379,7 +392,7 @@ export class Indexer {
     if (start > latest) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
-      this.publishMetrics(0);
+      await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -389,7 +402,7 @@ export class Indexer {
     if (end <= start) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
-      this.publishMetrics(0);
+      await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -452,7 +465,7 @@ export class Indexer {
 
     this.status.cursor = cursor;
     this.updateFreshness(latestCloseTime, lastSeenCloseTime, cursor, latest);
-    this.publishMetrics(applied);
+    await this.publishMetrics(applied);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
   }

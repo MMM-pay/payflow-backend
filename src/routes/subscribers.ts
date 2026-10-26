@@ -2,15 +2,27 @@ import { Router } from "express";
 import type { Storage } from "../lib/store/types.ts";
 import {
   getSubscriberSummary,
+  listSubscriberChargesAfter,
   listSubscriberUpcomingMandates,
+  type ChargeKey,
 } from "../lib/queries.ts";
-import { addressSchema, daysSchema, present, validate } from "./validate.ts";
+import {
+  addressSchema,
+  daysSchema,
+  present,
+  unixSecondsSchema,
+  validate,
+} from "./validate.ts";
+import { tokenUnits } from "./merchants.ts";
 import type { UpcomingCharge, UpcomingChargesResponse } from "./types.ts";
 
 const DAY_S = 86_400;
 const DEFAULT_FORECAST_DAYS = 30;
 const MAX_FORECAST_DAYS = 365;
 const MAX_UPCOMING_PER_MANDATE = 400;
+/** Rows read per query while streaming the charges CSV. */
+const CSV_PAGE = 500;
+const CSV_HEADER = "date,merchant,plan,amount,fee,tx_hash";
 
 function daysOf(raw: unknown, fallback = DEFAULT_FORECAST_DAYS): number {
   const n = Number(raw);
@@ -28,6 +40,73 @@ export function subscribersRouter(db: Storage): Router {
 
     const body = await getSubscriberSummary(db, address.value);
     res.json(body);
+  });
+
+  /**
+   * `GET /subscribers/:address/charges.csv?from=&to=`: every settled charge
+   * paid by the subscriber, oldest first, as a CSV download for accounting.
+   *
+   * `amount` is what the subscriber paid (the charge amount plus the fee),
+   * `fee` the protocol's share, each in token units with seven decimals and
+   * computed as bigint. `plan` is the mandate's plan id. `date` is the
+   * charge's ledger close time in ISO 8601 UTC. Rows are streamed a page at a
+   * time, so neither the response nor a single query grows with the history.
+   */
+  r.get("/subscribers/:address/charges.csv", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
+    if (!from.ok) return;
+    const to = validate(req, res, "to", unixSecondsSchema.optional(), present(req.query.to));
+    if (!to.ok) return;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="payflow-charges-${address.value}.csv"`,
+    );
+    res.write(`${CSV_HEADER}\r\n`);
+
+    let after: ChargeKey | null = null;
+    for (;;) {
+      const rows = await listSubscriberChargesAfter(
+        db,
+        address.value,
+        after,
+        CSV_PAGE,
+        from.value === undefined ? undefined : from.value * 1000,
+        to.value === undefined ? undefined : to.value * 1000,
+      );
+      if (rows.length === 0) break;
+      let chunk = "";
+      for (const row of rows) {
+        const fee = BigInt(row.fee);
+        chunk += [
+          new Date(row.created_at).toISOString(),
+          row.merchant,
+          row.plan_id ?? "",
+          tokenUnits(BigInt(row.amount) + fee),
+          tokenUnits(fee),
+          row.tx_hash,
+        ].join(",") + "\r\n";
+      }
+      // Respect backpressure from a slow client, and stop if it went away.
+      if (!res.write(chunk)) {
+        await new Promise<void>((resolve) => {
+          const done = (): void => {
+            res.off("drain", done);
+            res.off("close", done);
+            resolve();
+          };
+          res.on("drain", done);
+          res.on("close", done);
+        });
+      }
+      if (res.destroyed) return;
+      if (rows.length < CSV_PAGE) break;
+      after = rows[rows.length - 1]!;
+    }
+    res.end();
   });
 
   /**
