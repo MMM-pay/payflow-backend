@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import { nativeToScVal, type rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
 import { metrics, MetricsRegistry, publishBusinessMetrics } from "../src/lib/metrics.ts";
@@ -263,18 +264,18 @@ function insertMandate(
 const SEEDED_MRR = "9007199254745993";
 
 describe("the business gauges", () => {
-  test("active mandates, active merchants and MRR are read from the projection", () => {
+  test("active mandates, active merchants and MRR are read from the projection", async () => {
     metrics.reset();
-    publishBusinessMetrics(seededBusinessDb(), "testnet");
+    await publishBusinessMetrics(asStorage(seededBusinessDb()), "testnet");
     assert.equal(metrics.value("active_mandates", { network: "testnet" }), 4);
     assert.equal(metrics.value("active_merchants", { network: "testnet" }), 2);
     assert.equal(metrics.value("mrr", { network: "testnet" }), SEEDED_MRR);
     metrics.reset();
   });
 
-  test("MRR is an amount: the exact decimal string, never a JavaScript number", () => {
+  test("MRR is an amount: the exact decimal string, never a JavaScript number", async () => {
     metrics.reset();
-    publishBusinessMetrics(seededBusinessDb(), "testnet");
+    await publishBusinessMetrics(asStorage(seededBusinessDb()), "testnet");
     const mrr = metrics.value("mrr", { network: "testnet" });
     assert.equal(typeof mrr, "string");
     assert.equal(mrr, SEEDED_MRR);
@@ -288,16 +289,16 @@ describe("the business gauges", () => {
     metrics.reset();
   });
 
-  test("cardinality stays bounded: no per-merchant labels, one sample per network", () => {
+  test("cardinality stays bounded: no per-merchant labels, one sample per network", async () => {
     metrics.reset();
     const db = seededBusinessDb();
-    publishBusinessMetrics(db, "testnet");
+    await publishBusinessMetrics(asStorage(db), "testnet");
     // The business grows: ten more merchants, each with an active mandate.
     for (let i = 0; i < 10; i += 1) {
       insertMandate(db, 100 + i, `GM${i}`, "1000", 2_592_000, "Active");
     }
-    publishBusinessMetrics(db, "testnet");
-    publishBusinessMetrics(db, "mainnet");
+    await publishBusinessMetrics(asStorage(db), "testnet");
+    await publishBusinessMetrics(asStorage(db), "mainnet");
 
     const rendered = metrics.render();
     const businessLines = rendered
@@ -314,15 +315,15 @@ describe("the business gauges", () => {
     metrics.reset();
   });
 
-  test("a projection that cannot be read keeps the last gauges instead of throwing", () => {
+  test("a projection that cannot be read keeps the last gauges instead of throwing", async () => {
     metrics.reset();
-    publishBusinessMetrics(seededBusinessDb(), "testnet");
+    await publishBusinessMetrics(asStorage(seededBusinessDb()), "testnet");
     const closed = openDatabase(":memory:");
     closed.close();
     // The read fails (a closed, locked or corrupt database): the failure is
     // logged, the previously published values survive, and the next pass
     // retries — a business-metrics failure never takes the loop down.
-    publishBusinessMetrics(closed, "testnet");
+    await publishBusinessMetrics(asStorage(closed), "testnet");
     assert.equal(metrics.value("active_mandates", { network: "testnet" }), 4);
     assert.equal(metrics.value("active_merchants", { network: "testnet" }), 2);
     assert.equal(metrics.value("mrr", { network: "testnet" }), SEEDED_MRR);
@@ -334,6 +335,7 @@ describe("the business gauges", () => {
     const db = openDatabase(":memory:");
     const indexer = new Indexer(db, fakeRpc(20_000, 1, [rawPlanEvent(10)]), testnet);
     // The constructor publishes the starting state: an empty projection.
+    await indexer.ready;
     assert.equal(metrics.value("active_mandates", { network: "testnet" }), 0);
     assert.equal(metrics.value("active_merchants", { network: "testnet" }), 0);
     assert.equal(metrics.value("mrr", { network: "testnet" }), "0");

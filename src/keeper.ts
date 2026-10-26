@@ -13,6 +13,8 @@ import type { Config } from "./config.ts";
 import { logger } from "./lib/logger.ts";
 import { metrics } from "./lib/metrics.ts";
 import { simulationSource } from "./lib/simulate.ts";
+import { asStorage } from "./lib/store/index.ts";
+import type { Storage } from "./lib/store/types.ts";
 import { planTokensByIds } from "./lib/queries.ts";
 import type { ChargeStreakEvent } from "./lib/webhooks.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
@@ -280,7 +282,7 @@ export interface Channel {
  * streak, and because the streak is restored, a restart does not re-fire it.
  */
 export class Keeper {
-  private readonly db: DatabaseSync;
+  private readonly db: Storage;
   private readonly server: KeeperRpc;
   private config: Config;
   /**
@@ -313,14 +315,16 @@ export class Keeper {
    */
   private batchEntryMissing = false;
   private readonly passes: KeeperPassSummary[] = [];
+  /** Resolves when the persisted backoff has been loaded into memory. */
+  readonly ready: Promise<void>;
 
   constructor(
-    db: DatabaseSync,
+    db: Storage | DatabaseSync,
     server: KeeperRpc,
     config: Config,
     onStreak?: (event: ChargeStreakEvent) => Promise<void>,
   ) {
-    this.db = db;
+    this.db = asStorage(db);
     this.server = server;
     this.config = config;
     this.onStreak = onStreak;
@@ -328,7 +332,14 @@ export class Keeper {
       throw new Error("Keeper requires KEEPER_SECRET");
     }
     this.buildChannels(config);
-    this.restoreBackoff();
+    // The backoff a previous process left behind is read once per start; the
+    // pass methods await `ready` so a first pass never runs ahead of it.
+    this.ready = this.restoreBackoff();
+    // A caller that only reads the channels (the CLI's `status`) never awaits
+    // `ready`; mark the rejection handled so a database closed underneath it
+    // cannot surface as an unhandled rejection. Passes still await it and see
+    // the error.
+    void this.ready.catch(() => undefined);
   }
 
   /**
@@ -337,16 +348,14 @@ export class Keeper {
    * failing streak come back. One pass over the (mandate_id, id) index, once
    * per start; SQLite takes the bare columns from the row holding MAX(id).
    */
-  private restoreBackoff(): void {
-    const rows = this.db
-      .prepare(
-        `SELECT mandate_id, failures, retry_at
-           FROM (SELECT mandate_id, failures, retry_at, MAX(id)
-                   FROM charge_attempts
-                  GROUP BY mandate_id)
-          WHERE failures > 0`,
-      )
-      .all() as unknown as { mandate_id: number; failures: number; retry_at: number }[];
+  private async restoreBackoff(): Promise<void> {
+    const rows = await this.db.all<{ mandate_id: number; failures: number; retry_at: number }>(
+      `SELECT mandate_id, failures, retry_at
+         FROM (SELECT mandate_id, failures, retry_at, MAX(id)
+                 FROM charge_attempts
+                GROUP BY mandate_id)
+        WHERE failures > 0`,
+    );
     for (const row of rows) {
       this.backoff.set(row.mandate_id, { failures: row.failures, retryAt: row.retry_at });
     }
@@ -430,10 +439,12 @@ export class Keeper {
    * charge. With `KEEPER_MERCHANTS` set, only those merchants' mandates are
    * returned; empty means every merchant.
    */
-  findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): DueMandate[] {
+  async findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): Promise<DueMandate[]> {
+    // Nothing settles before the persisted backoff is back in memory.
+    await this.ready;
     const due: DueMandate[] = [];
     // Read past the backing-off mandates so they cannot fill the batch.
-    for (const m of this.queryDue(now, limit + this.backoff.size)) {
+    for (const m of await this.queryDue(now, limit + this.backoff.size)) {
       const wait = this.backoff.get(m.id);
       if (wait && wait.retryAt > now) continue;
       due.push(m);
@@ -442,30 +453,25 @@ export class Keeper {
     return due;
   }
 
-  /**
-   * `KEEPER_MERCHANTS` as a JSON array, bound into the due queries'
-   * `json_each` filter; `[]` means every merchant. Binding the list keeps
-   * the SQL text fixed whatever the config holds.
-   */
-  private merchantsJson(): string {
-    return JSON.stringify(this.config.KEEPER_MERCHANTS ?? []);
+  private async queryDue(now: number, limit: number): Promise<DueMandate[]> {
+    if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
+    return this.queryDueByOldest(now, limit);
   }
 
-  private queryDue(now: number, limit: number): DueMandate[] {
-    if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
-    const merchants = this.merchantsJson();
-    return this.db
-      .prepare(
-        `SELECT id, subscriber, merchant, next_charge, amount, plan_id
-           FROM mandates
-          WHERE status = 'Active'
-            AND next_charge <= ?
-            AND (max_charges = 0 OR charges_made < max_charges)
-            AND (? = '[]' OR merchant IN (SELECT value FROM json_each(?)))
-          ORDER BY next_charge ASC
-          LIMIT ?`,
-      )
-      .all(now, merchants, merchants, limit) as unknown as DueMandate[];
+  private async queryDueByOldest(now: number, limit: number): Promise<DueMandate[]> {
+    const merchants = this.config.KEEPER_MERCHANTS ?? [];
+    const merchantFilter = merchants.length ? `AND merchant IN (${merchants.map(() => "?").join(",")})` : "";
+    return this.db.all<DueMandate>(
+      `SELECT id, subscriber, merchant, next_charge, amount, plan_id
+         FROM mandates
+        WHERE status = 'Active'
+          AND next_charge <= ?
+          AND (max_charges = 0 OR charges_made < max_charges)
+          ${merchantFilter}
+        ORDER BY next_charge ASC
+        LIMIT ?`,
+      [now, ...merchants, limit],
+    );
   }
 
   /**
@@ -477,18 +483,18 @@ export class Keeper {
    * then id, so the order is deterministic. The scan is unbounded by design:
    * "largest first" must see every due mandate before it can pick a batch.
    */
-  private queryDueLargest(now: number, limit: number): DueMandate[] {
-    const merchants = this.merchantsJson();
-    const rows = this.db
-      .prepare(
-        `SELECT id, subscriber, merchant, next_charge, amount, plan_id
-           FROM mandates
-          WHERE status = 'Active'
-            AND next_charge <= ?
-            AND (max_charges = 0 OR charges_made < max_charges)
-            AND (? = '[]' OR merchant IN (SELECT value FROM json_each(?)))`,
-      )
-      .all(now, merchants, merchants) as unknown as DueMandate[];
+  private async queryDueLargest(now: number, limit: number): Promise<DueMandate[]> {
+    const merchants = this.config.KEEPER_MERCHANTS ?? [];
+    const merchantFilter = merchants.length ? `AND merchant IN (${merchants.map(() => "?").join(",")})` : "";
+    const rows = await this.db.all<DueMandate>(
+      `SELECT id, subscriber, merchant, plan_id, next_charge, amount
+         FROM mandates
+        WHERE status = 'Active'
+          AND next_charge <= ?
+          AND (max_charges = 0 OR charges_made < max_charges)
+          ${merchantFilter}`,
+      [now, ...merchants],
+    );
     rows.sort((a, b) => {
       const amountDiff = BigInt(b.amount) - BigInt(a.amount);
       if (amountDiff > 0n) return 1;
@@ -516,10 +522,7 @@ export class Keeper {
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
-    const due = this.findDue(now);
-    // Mandates the vault cannot cover are dropped before any transaction is
-    // built: the charge would fail in simulation anyway, and skipping it
-    // saves the RPC call and the fee.
+    const due = await this.findDue(now);
     const { chargeable, skipped } = await this.withoutShortfalls(due);
     const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
     const channels = chargeable.length > 0 ? await this.distributableChannels() : [];
@@ -533,7 +536,7 @@ export class Keeper {
     if (!dryRun && skipped.length > 0) {
       const byId = new Map(due.map((mandate) => [mandate.id, mandate]));
       for (const skip of skipped) {
-        this.record(
+        await this.record(
           byId.get(skip.mandateId)!,
           { result: "skipped", errorCode: "INSUFFICIENT_BALANCE", txHash: null, shortfall: skip.shortfall },
           now,
@@ -567,13 +570,13 @@ export class Keeper {
           const group = chargeable.slice(slot, slot + size);
           cursor += group.length;
           const results = await this.settleGroup(group, fee ?? BigInt(BASE_FEE), channel);
-          results.forEach((result, offset) => {
+          for (const [offset, result] of results.entries()) {
             // A simulation is neither a settlement nor a failure: a dry run
             // leaves the backoff and the attempt log exactly as they were.
             const attempt = attemptOf(result);
-            if (attempt) this.record(group[offset]!, attempt, now);
+            if (attempt) await this.record(group[offset]!, attempt, now);
             ordered.push({ slot: slot + offset, result });
-          });
+          }
         }
       }),
     );
@@ -586,9 +589,10 @@ export class Keeper {
     this.announceRetirement(results);
     this.recordPass(now, results, skipped);
     // The attempted_at index makes this a range delete, cheap on every pass.
-    this.db
-      .prepare("DELETE FROM charge_attempts WHERE attempted_at < ?")
-      .run(now - ATTEMPT_RETENTION_S);
+    await this.db.run(
+      "DELETE FROM charge_attempts WHERE attempted_at < ?",
+      [now - ATTEMPT_RETENTION_S],
+    );
     metrics.increment("keeper_passes");
     for (const result of results) {
       if (result.status === "settled") metrics.increment("charges_settled");
@@ -624,7 +628,7 @@ export class Keeper {
 
     // A mandate carries no token of its own; it inherits its plan's, and the
     // vault balance is per (subscriber, token).
-    const tokens = planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
+    const tokens = await planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
     // One read per subscriber and token per pass: a subscriber with several
     // mandates on the same plan is one balance, not one read each.
     const balances = new Map<string, bigint | null>();
@@ -895,7 +899,7 @@ export class Keeper {
    * merchant when the streak reaches {@link FAILING_STREAK} or ends after it.
    * One indexed insert; nothing here waits on the network.
    */
-  private record(mandate: DueMandate, attempt: ChargeAttempt, now: number): void {
+  private async record(mandate: DueMandate, attempt: ChargeAttempt, now: number): Promise<void> {
     const streak = this.backoff.get(mandate.id)?.failures ?? 0;
     const failures = attempt.result === "settled" ? 0 : streak + 1;
     const retryAt =
@@ -905,13 +909,12 @@ export class Keeper {
     if (retryAt === null) this.backoff.delete(mandate.id);
     else this.backoff.set(mandate.id, { failures, retryAt });
 
-    const { lastInsertRowid } = this.db
-      .prepare(
-        `INSERT INTO charge_attempts
-           (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const inserted = await this.db.get<{ id: number }>(
+      `INSERT INTO charge_attempts
+         (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING id`,
+      [
         mandate.id,
         now,
         attempt.result,
@@ -920,13 +923,15 @@ export class Keeper {
         attempt.shortfall,
         failures,
         retryAt,
-      );
+      ],
+    );
+    const attemptId = inserted!.id;
 
     const subject = {
       mandateId: mandate.id,
       subscriber: mandate.subscriber,
       merchant: mandate.merchant,
-      attemptId: Number(lastInsertRowid),
+      attemptId: Number(attemptId),
     };
     if (failures === FAILING_STREAK && retryAt !== null) {
       this.notify({

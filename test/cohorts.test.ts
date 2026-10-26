@@ -3,6 +3,7 @@ import { after, before, describe, test } from "node:test";
 import type { Server } from "node:http";
 import express from "express";
 import { openDatabase } from "../src/lib/db.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import { Indexer } from "../src/indexer.ts";
 import { getMerchantCohorts } from "../src/lib/queries.ts";
 import { merchantsRouter, MerchantSummaryCache } from "../src/routes/merchants.ts";
@@ -108,15 +109,16 @@ const EXPECTED: MerchantCohortsResponse = {
 
 describe("merchant cohort retention", () => {
   const db = openDatabase(":memory:");
+  const store = asStorage(db);
   let server: Server;
   let base = "";
 
   before(async () => {
     const indexer = new Indexer(db, {} as never, {} as never);
-    for (const event of FIXTURE) assert.equal(indexer.apply(event), "applied");
+    for (const event of FIXTURE) assert.equal(await indexer.apply(event), "applied");
 
     const app = express();
-    app.use("/api", merchantsRouter(db, new MerchantSummaryCache()));
+    app.use("/api", merchantsRouter(store, new MerchantSummaryCache()));
     await new Promise<void>((resolve) => {
       server = app.listen(0, "127.0.0.1", () => resolve());
     });
@@ -130,20 +132,20 @@ describe("merchant cohort retention", () => {
     db.close();
   });
 
-  test("monthly cohorts match the known answers", () => {
-    assert.deepEqual(getMerchantCohorts(db, MERCHANT, "month", 12, NOW), EXPECTED);
+  test("monthly cohorts match the known answers", async () => {
+    assert.deepEqual(await getMerchantCohorts(store, MERCHANT, "month", 12, NOW), EXPECTED);
   });
 
-  test("limit keeps the most recent cohorts", () => {
+  test("limit keeps the most recent cohorts", async () => {
     assert.deepEqual(
-      getMerchantCohorts(db, MERCHANT, "month", 1, NOW).cohorts,
+      (await getMerchantCohorts(store, MERCHANT, "month", 1, NOW)).cohorts,
       EXPECTED.cohorts.slice(1),
     );
   });
 
-  test("a period is reported only once its bucket has begun", () => {
+  test("a period is reported only once its bucket has begun", async () => {
     // On the last day of February only the January cohort has a period.
-    const early = getMerchantCohorts(db, MERCHANT, "month", 12, at("2025-02-28T23:59:59Z"));
+    const early = await getMerchantCohorts(store, MERCHANT, "month", 12, at("2025-02-28T23:59:59Z"));
     assert.deepEqual(
       early.cohorts.map((c) => [c.cohort, c.retention.length]),
       [
@@ -153,9 +155,9 @@ describe("merchant cohort retention", () => {
     );
   });
 
-  test("weekly cohorts start on Monday", () => {
+  test("weekly cohorts start on Monday", async () => {
     // Jan 5 2025 is a Sunday, so mandate 1 opens the week of Monday Dec 30.
-    const weekly = getMerchantCohorts(db, MERCHANT, "week", 120, NOW);
+    const weekly = await getMerchantCohorts(store, MERCHANT, "week", 120, NOW);
     assert.deepEqual(
       weekly.cohorts.map((c) => [c.cohort, c.size]),
       [
@@ -172,14 +174,14 @@ describe("merchant cohort retention", () => {
     assert.deepEqual(first, [1, 1, 1, 0, 0]);
   });
 
-  test("a merchant without mandates has no cohorts", () => {
-    assert.deepEqual(getMerchantCohorts(db, SUBSCRIBER, "month", 12, NOW).cohorts, []);
+  test("a merchant without mandates has no cohorts", async () => {
+    assert.deepEqual((await getMerchantCohorts(store, SUBSCRIBER, "month", 12, NOW)).cohorts, []);
   });
 
-  test("replaying the events leaves the cohorts unchanged", () => {
+  test("replaying the events leaves the cohorts unchanged", async () => {
     const indexer = new Indexer(db, {} as never, {} as never);
-    for (const event of FIXTURE) indexer.apply(event);
-    assert.deepEqual(getMerchantCohorts(db, MERCHANT, "month", 12, NOW), EXPECTED);
+    for (const event of FIXTURE) await indexer.apply(event);
+    assert.deepEqual(await getMerchantCohorts(store, MERCHANT, "month", 12, NOW), EXPECTED);
   });
 
   test("GET /merchants/:address/cohorts serves the report", async () => {

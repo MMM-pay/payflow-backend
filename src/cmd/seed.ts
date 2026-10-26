@@ -179,12 +179,12 @@ function isProductionNetwork(network: SeedNetwork): boolean {
     network.networkPassphrase === "Public Global Stellar Network ; September 2015";
 }
 
-export function seedDatabase(
+export async function seedDatabase(
   db: DatabaseSync,
   network: SeedNetwork,
   token = FALLBACK_TOKEN,
   now = Math.floor(Date.now() / 1000),
-): number {
+): Promise<number> {
   if (isProductionNetwork(network)) {
     throw new Error("Refusing to seed a production network database.");
   }
@@ -218,7 +218,7 @@ export function seedDatabase(
     db.exec(
       "CREATE TABLE IF NOT EXISTS local_seed_state (id INTEGER PRIMARY KEY CHECK (id = 1), seeded_at INTEGER NOT NULL)",
     );
-    for (const event of events) indexer.apply(event);
+    for (const event of events) await indexer.apply(event);
     db.prepare("INSERT OR IGNORE INTO local_seed_state (id, seeded_at) VALUES (1, ?)").run(now);
     db.exec("COMMIT");
   } catch (error) {
@@ -242,7 +242,7 @@ async function main(): Promise<void> {
     }
     const db = openDatabase(network.databasePath);
     try {
-      const count = seedDatabase(db, network, config.TOKEN_ID ?? FALLBACK_TOKEN);
+      const count = await seedDatabase(db, network, config.TOKEN_ID ?? FALLBACK_TOKEN);
       console.log(`Applied ${count} local sample events to ${network.databasePath}.`);
     } finally {
       db.close();

@@ -1,5 +1,6 @@
 import { loadConfig, networkConfigs } from "./config.ts";
-import { openDatabase, pruneOldEvents, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
+import { openStorage } from "./lib/store/index.ts";
+import { pruneOldEvents, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -20,11 +21,9 @@ const networks = networkConfigs(config);
 
 // One indexer and one database per network, so cursors and projections never
 // mix. `runtimes[0]` is the default network: it serves the unprefixed routes.
-const runtimes = networks.map((network) => {
-  // Mark the database as in use so `npm run reindex` refuses to move it away
-  // underneath us; a second server on the same file fails here too.
-  const releaseLock = acquireLock(network.databasePath);
-  const db = openDatabase(network.databasePath);
+const runtimes = await Promise.all(networks.map(async (network) => {
+  const releaseLock = network.databaseUrl ? undefined : acquireLock(network.databasePath);
+  const db = await openStorage(network);
   const server = makeRpc(network);
   // A full-history archive backfills the gap between the stored cursor and
   // the oldest ledger the RPC still serves, so an outage longer than RPC
@@ -73,12 +72,12 @@ const runtimes = networks.map((network) => {
   // SEP-10 sign-in reads the signing account's signers through the same RPC.
   const auth = sep10For(config, network, server);
   return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth };
-});
+}));
 const defaultRuntime = runtimes[0]!;
 // Release the database locks however the process ends; a crash that skips
 // this leaves a stale lock, which the next taker detects by its dead PID.
 process.on("exit", () => {
-  for (const rt of runtimes) rt.releaseLock();
+  for (const rt of runtimes) rt.releaseLock?.();
 });
 
 // A mandate's failing and recovered streaks reach the merchant's webhooks on
@@ -123,14 +122,14 @@ const adminHooks: AdminHooks = {
     const db = defaultRuntime.db;
     try {
       const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
-      logAuditEvent(db, {
+      await logAuditEvent(db, {
         action: "reindex",
         success: true,
         details: { cursor: results[0]?.cursor },
       });
       return results[0]!;
     } catch (err) {
-      logAuditEvent(db, {
+      await logAuditEvent(db, {
         action: "reindex",
         success: false,
         errorMsg: err instanceof Error ? err.message : String(err),
@@ -141,19 +140,19 @@ const adminHooks: AdminHooks = {
   // Runtime indexer control: hold every network's loop back without taking the
   // API down. While paused, each tick is a no-op, so the cursor and projection
   // are preserved and /health reports `indexer.paused: true`.
-  pauseIndexer: () => {
+  pauseIndexer: async () => {
     const db = defaultRuntime.db;
     for (const rt of runtimes) rt.indexer.pause();
-    logAuditEvent(db, {
+    await logAuditEvent(db, {
       action: "indexer_paused",
       success: true,
     });
     return null;
   },
-  resumeIndexer: () => {
+  resumeIndexer: async () => {
     const db = defaultRuntime.db;
     for (const rt of runtimes) rt.indexer.resume();
-    logAuditEvent(db, {
+    await logAuditEvent(db, {
       action: "indexer_resumed",
       success: true,
     });
@@ -162,15 +161,15 @@ const adminHooks: AdminHooks = {
   pruneData: async (daysToKeep: number) => {
     const db = defaultRuntime.db;
     try {
-      const deleted = pruneOldEvents(db, daysToKeep);
-      logAuditEvent(db, {
+      const deleted = await pruneOldEvents(db, daysToKeep);
+      await logAuditEvent(db, {
         action: "data_pruned",
         details: { deleted, daysToKeep },
         success: true,
       });
       return { deleted };
     } catch (err) {
-      logAuditEvent(db, {
+      await logAuditEvent(db, {
         action: "data_pruned",
         success: false,
         errorMsg: err instanceof Error ? err.message : String(err),
@@ -179,12 +178,15 @@ const adminHooks: AdminHooks = {
       throw err;
     }
   },
-  getAuditLogs: (limit: number) => {
+  getAuditLogs: async (limit: number) => {
     const db = defaultRuntime.db;
-    return db.prepare(`SELECT id, action, subject, details, success, error_msg as errorMsg,
-      created_at as createdAt FROM audit_logs ORDER BY created_at DESC LIMIT ?`).all(limit);
+    return db.all(
+      `SELECT id, action, subject, details, success, error_msg as errorMsg,
+        created_at as createdAt FROM audit_logs ORDER BY created_at DESC LIMIT ?`,
+      [limit],
+    );
   },
-  getPastDueMandates: () => {
+  getPastDueMandates: async () => {
     const db = defaultRuntime.db;
     return getPastDueMandatesFromDb(db);
   },
@@ -195,14 +197,14 @@ if (keeper && runKeeperPass) {
     try {
       const result = await runKeeperPass();
       const settled = (result as unknown[]).filter((r: unknown) => (r as { status: string }).status === "settled").length;
-      logAuditEvent(db, {
+      await logAuditEvent(db, {
         action: "keeper_pass",
         success: true,
         details: { settled, attempted: result.length },
       });
       return result;
     } catch (err) {
-      logAuditEvent(db, {
+      await logAuditEvent(db, {
         action: "keeper_pass",
         success: false,
         errorMsg: err instanceof Error ? err.message : String(err),
@@ -338,11 +340,11 @@ async function shutdown(signal: string): Promise<void> {
   const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
-  http.close(() => {
-    for (const rt of runtimes) {
-      rt.db.close();
-      rt.releaseLock();
-    }
+  http.close(async () => {
+    await Promise.all(runtimes.map(async (rt) => {
+      await rt.db.close();
+      rt.releaseLock?.();
+    }));
     process.exit(0);
   });
 }

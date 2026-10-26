@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import {
   getMandateById,
   isFunded,
@@ -54,7 +54,7 @@ function parseIds(raw: unknown): { ids: number[]; tooMany: boolean } | null {
 }
 
 /** `GET /mandates*` and the keeper-facing `GET /due`. */
-export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): Router {
+export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Router {
   const r = Router();
 
   r.get("/mandates", async (req, res) => {
@@ -107,7 +107,7 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
-    const page = listMandates(db, {
+    const page = await listMandates(db, {
       ids: parsedIds,
       subscriber: subscriber.value,
       merchant: merchant.value,
@@ -117,7 +117,7 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     });
     // A mandate carries no token of its own; it inherits its plan's, batched
     // into one read per page (see lib/queries.ts).
-    const planTokens = planTokensByIds(db, page.rows.map((row) => row.plan_id));
+    const planTokens = await planTokensByIds(db, page.rows.map((row) => row.plan_id));
     const mandates = await Promise.all(
       page.rows.map(async (row) => ({
         ...row,
@@ -135,23 +135,23 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
 
-    const row = getMandateById(db, id.value);
+    const row = await getMandateById(db, id.value);
     if (!row) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
     }
-    const tokenId = planTokensByIds(db, [row.plan_id]).get(row.plan_id);
+    const tokenId = (await planTokensByIds(db, [row.plan_id])).get(row.plan_id);
     res.json({ ...row, ...(await tokenFields(tokens, tokenId)) });
   });
 
-  r.get("/mandates/:id/timeline", (req, res) => {
+  r.get("/mandates/:id/timeline", async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
-    if (!getMandateById(db, id.value)) {
+    if (!(await getMandateById(db, id.value))) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
     }
-    const events = listMandateTimeline(db, id.value).map((event) => ({
+    const events = (await listMandateTimeline(db, id.value)).map((event) => ({
       mandateId: event.mandate_id,
       txHash: event.tx_hash,
       kind: event.kind,
@@ -161,8 +161,7 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
     }));
     res.json({ events });
   });
-
-  r.get("/mandates/:id/charges", (req, res) => {
+  r.get("/mandates/:id/charges", async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
@@ -184,15 +183,11 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
       return;
     }
 
-    // A mandate that does not exist has no charges: the same 404 the
-    // mandate's own route answers, so a caller cannot mistake "no such
-    // mandate" for "no charges yet".
-    if (!getMandateById(db, id.value)) {
+    if (!(await getMandateById(db, id.value))) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
     }
-
-    const charges = listMandateCharges(
+    const charges = await listMandateCharges(
       db,
       id.value,
       limitOf(limit.value),
@@ -208,19 +203,19 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
    * ended, the error code and transaction hash, and the backoff that
    * followed. Answers "why wasn't I charged?" for 90 days back.
    */
-  r.get("/mandates/:id/attempts", (req, res) => {
+  r.get("/mandates/:id/attempts", async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
-    if (!getMandateById(db, id.value)) {
+    if (!(await getMandateById(db, id.value))) {
       sendApiError(res, req, 404, "mandate_not_found");
       return;
     }
 
     const body: ChargeAttemptPage = {
-      attempts: listChargeAttempts(db, id.value, limitOf(limit.value)),
+      attempts: await listChargeAttempts(db, id.value, limitOf(limit.value)),
     };
     res.json(body);
   });
@@ -234,15 +229,15 @@ export function mandatesRouter(db: DatabaseSync, tokens: TokenMetadataService): 
    * settles — but it is enough to tell a mandate that is merely due from one
    * that is waiting for a top-up.
    */
-  r.get("/due", (req, res) => {
+  r.get("/due", async (req, res) => {
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
     const now = Math.floor(Date.now() / 1000);
-    const rows = listDueMandates(db, now, limitOf(limit.value));
+    const rows = await listDueMandates(db, now, limitOf(limit.value));
     // The vault balance is per (subscriber, token), and a mandate inherits its
     // plan's token; the merchant unpaid report shares this funded test.
-    const balances = lastKnownBalances(db, rows);
+    const balances = await lastKnownBalances(db, rows);
 
     const due: DueMandateRow[] = rows.map((row, i) => ({
       id: row.id,

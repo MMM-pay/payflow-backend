@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import type { Storage } from "./store/types.ts";
 
 /**
  * Schema notes.
@@ -423,10 +424,10 @@ export interface AuditLogEntry {
   errorMsg?: string | undefined;
 }
 
-export function logAuditEvent(db: DatabaseSync, entry: AuditLogEntry): void {
-  db.prepare(`INSERT INTO audit_logs
+export async function logAuditEvent(db: Storage, entry: AuditLogEntry): Promise<void> {
+  await db.run(`INSERT INTO audit_logs
     (action, subject, details, success, error_msg, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)`).run(
+    VALUES (?, ?, ?, ?, ?, ?)`, [
     entry.action,
     // SQLite takes NULL, not undefined, for an absent value.
     entry.subject ?? null,
@@ -434,14 +435,18 @@ export function logAuditEvent(db: DatabaseSync, entry: AuditLogEntry): void {
     entry.success ? 1 : 0,
     entry.errorMsg ?? null,
     Math.floor(Date.now() / 1000),
-  );
+  ]);
 }
 
-export function pruneOldEvents(db: DatabaseSync, daysToKeep: number = 30): number {
+export async function pruneOldEvents(db: Storage, daysToKeep: number = 30): Promise<number> {
   const cutoffTime = Math.floor((Date.now() - daysToKeep * 24 * 60 * 60 * 1000) / 1000);
-  const result = db.prepare("DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ?").run(cutoffTime);
-  // node:sqlite reports `changes` as a bigint on large deletes.
-  return Number(result.changes);
+  // `RETURNING` reports the deleted rows on both backends, so the count needs
+  // no second statement: node:sqlite's `changes` is not on the Storage boundary.
+  const deleted = await db.all<{ event_id: string }>(
+    "DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ? RETURNING event_id",
+    [cutoffTime],
+  );
+  return deleted.length;
 }
 
 export function markMandateAsPastDue(db: DatabaseSync, mandateId: number): void {
@@ -457,6 +462,8 @@ export function clearMandateAsPastDue(db: DatabaseSync, mandateId: number): void
   db.prepare(`UPDATE past_due_mandates SET still_past_due = 0 WHERE mandate_id = ?`).run(mandateId);
 }
 
-export function getPastDueMandates(db: DatabaseSync): Array<{ mandate_id: number; first_past_due_at: number }> {
-  return db.prepare("SELECT mandate_id, first_past_due_at FROM past_due_mandates WHERE still_past_due = 1 ORDER BY first_past_due_at ASC").all() as Array<{ mandate_id: number; first_past_due_at: number }>;
+export async function getPastDueMandates(db: Storage): Promise<Array<{ mandate_id: number; first_past_due_at: number }>> {
+  return db.all<{ mandate_id: number; first_past_due_at: number }>(
+    "SELECT mandate_id, first_past_due_at FROM past_due_mandates WHERE still_past_due = 1 ORDER BY first_past_due_at ASC",
+  );
 }

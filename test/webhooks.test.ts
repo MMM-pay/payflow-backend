@@ -79,10 +79,10 @@ describe("webhooks", () => {
   before(async () => {
     db = openDatabase(":memory:");
     ix = new Indexer(db, {} as never, {} as never);
-    ix.apply(ev("plan_created", [merchant, 1n], {
+    await ix.apply(ev("plan_created", [merchant, 1n], {
       token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Pro",
     }));
-    ix.apply(ev("subscribed", [1n, SUBSCRIBER, merchant], {
+    await ix.apply(ev("subscribed", [1n, SUBSCRIBER, merchant], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
     }));
 
@@ -221,7 +221,7 @@ describe("webhooks", () => {
 
   test("a charge event dispatches a signed POST to each registered webhook", async () => {
     calls.length = 0;
-    ix.apply(ev("charged", [1n, SUBSCRIBER, merchant], {
+    await ix.apply(ev("charged", [1n, SUBSCRIBER, merchant], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 1_700_000_000n,
     }, "tx-charge-1"));
 
@@ -253,11 +253,11 @@ describe("webhooks", () => {
 
   test("delivery retries with backoff and gives up after five attempts", async () => {
     const failing = Keypair.random().publicKey();
-    dispatcher.register(failing, "https://payflow.example/failing", "another-secret");
+    await dispatcher.register(failing, "https://payflow.example/failing", "another-secret");
     calls.length = 0;
 
     const T = nowSec();
-    ix.apply(ev("charged", [7n, SUBSCRIBER, failing], {
+    await ix.apply(ev("charged", [7n, SUBSCRIBER, failing], {
       amount: 5_000_000n, fee: 0n, charges_made: 1n, next_charge: 1n,
     }, "tx-charge-fail"));
     await waitFor(() => calls.length >= 1);
@@ -315,7 +315,7 @@ describe("webhooks", () => {
     assert.equal(webhook.failures, 5);
 
     calls.length = 0;
-    ix.apply(ev("charged", [8n, SUBSCRIBER, failing], {
+    await ix.apply(ev("charged", [8n, SUBSCRIBER, failing], {
       amount: 1n, fee: 0n, charges_made: 1n, next_charge: 1n,
     }, "tx-charge-after-giveup"));
     await new Promise((resolve) => setImmediate(resolve));
@@ -325,10 +325,10 @@ describe("webhooks", () => {
 
   test("retryDue delivers pending deliveries at their retry time", async () => {
     const ok = Keypair.random().publicKey();
-    dispatcher.register(ok, "https://payflow.example/ok", "ok-secret");
+    await dispatcher.register(ok, "https://payflow.example/ok", "ok-secret");
     calls.length = 0;
 
-    ix.apply(ev("charged", [9n, SUBSCRIBER, ok], {
+    await ix.apply(ev("charged", [9n, SUBSCRIBER, ok], {
       amount: 1n, fee: 0n, charges_made: 1n, next_charge: 1n,
     }, "tx-charge-ok"));
 
@@ -339,7 +339,7 @@ describe("webhooks", () => {
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     const id = (db.prepare("SELECT id FROM webhooks WHERE merchant = ?").get(ok) as { id: number }).id;
-    assert.equal(dispatcher.pendingCount(id), 0, "a delivered webhook has no pending deliveries");
+    assert.equal(await dispatcher.pendingCount(id), 0, "a delivered webhook has no pending deliveries");
   });
   describe("listing and deleting", () => {
     const ownerSeed = StrKey.encodeEd25519SecretSeed(crypto.getRandomValues(new Uint8Array(32)));
@@ -361,9 +361,9 @@ describe("webhooks", () => {
       });
 
     test("lists the merchant's webhooks without their secrets", async () => {
-      const first = dispatcher.register(owner, "https://owner.example/a", "secret-aaaa-1234");
-      const second = dispatcher.register(owner, "https://owner.example/b");
-      dispatcher.register(other, "https://other.example/x", "not-yours");
+      const first = await dispatcher.register(owner, "https://owner.example/a", "secret-aaaa-1234");
+      const second = await dispatcher.register(owner, "https://owner.example/b");
+      await dispatcher.register(other, "https://other.example/x", "not-yours");
 
       const t = nowSec();
       const res = await fetch(listUrl(owner, t, listSig(owner, t, ownerSeed)));
@@ -407,7 +407,7 @@ describe("webhooks", () => {
     });
 
     test("deleting with a wrong or expired signature is a 401 and deletes nothing", async () => {
-      const hook = dispatcher.register(owner, "https://owner.example/keep", "keep-secret");
+      const hook = await dispatcher.register(owner, "https://owner.example/keep", "keep-secret");
       const t = nowSec();
       let res = await del(hook.id, { merchant: owner, timestamp: t, signature: deleteSig(owner, hook.id, t, otherSeed) });
       assert.equal(res.status, 401);
@@ -422,7 +422,7 @@ describe("webhooks", () => {
     });
 
     test("a merchant cannot delete another merchant's webhook", async () => {
-      const theirs = dispatcher.register(other, "https://other.example/y", "theirs");
+      const theirs = await dispatcher.register(other, "https://other.example/y", "theirs");
       const t = nowSec();
       const res = await del(theirs.id, { merchant: owner, timestamp: t, signature: deleteSig(owner, theirs.id, t, ownerSeed) });
       assert.equal(res.status, 404);
@@ -433,8 +433,8 @@ describe("webhooks", () => {
     test("a deleted webhook receives no further deliveries", async () => {
       const seedC = StrKey.encodeEd25519SecretSeed(crypto.getRandomValues(new Uint8Array(32)));
       const merchantC = Keypair.fromSecret(seedC).publicKey();
-      const keep = dispatcher.register(merchantC, "https://c.example/keep", "keep");
-      const gone = dispatcher.register(merchantC, "https://c.example/failing-gone", "gone");
+      const keep = await dispatcher.register(merchantC, "https://c.example/keep", "keep");
+      const gone = await dispatcher.register(merchantC, "https://c.example/failing-gone", "gone");
 
       // A charge leaves a pending retry on the failing endpoint.
       calls.length = 0;
@@ -444,12 +444,12 @@ describe("webhooks", () => {
       await waitFor(() => calls.length >= 2);
       await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(dispatcher.pendingCount(gone.id), 1);
+      assert.equal(await dispatcher.pendingCount(gone.id), 1);
 
       const t = nowSec();
       const res = await del(gone.id, { merchant: merchantC, timestamp: t, signature: deleteSig(merchantC, gone.id, t, seedC) });
       assert.equal(res.status, 204);
-      assert.equal(dispatcher.pendingCount(gone.id), 0, "scheduled retries are dropped");
+      assert.equal(await dispatcher.pendingCount(gone.id), 0, "scheduled retries are dropped");
 
       // Neither the retry loop nor a new charge reaches the deleted endpoint.
       calls.length = 0;
@@ -472,7 +472,7 @@ describe("webhooks", () => {
     });
 
     test("the delete proof may be sent as query parameters", async () => {
-      const hook = dispatcher.register(owner, "https://owner.example/q", "q-secret");
+      const hook = await dispatcher.register(owner, "https://owner.example/q", "q-secret");
       const t = nowSec();
       const query = new URLSearchParams({
         merchant: owner,
@@ -505,7 +505,7 @@ describe("charge streak webhooks", () => {
     received.length = 0;
     const db = openDatabase(":memory:");
     const dispatcher = dispatcherFor(db);
-    const hook = dispatcher.register(merchant, "https://merchant.example/streaks", secret);
+    const hook = await dispatcher.register(merchant, "https://merchant.example/streaks", secret);
 
     await dispatcher.onChargeStreak({
       kind: "charge.failing",
@@ -535,7 +535,7 @@ describe("charge streak webhooks", () => {
       delivery!.signature,
       `sha256=${createHmac("sha256", secret).update(delivery!.raw).digest("hex")}`,
     );
-    assert.equal(dispatcher.history(merchant, hook.id)![0]!.eventId, "charge.failing:7:42");
+    assert.equal((await dispatcher.history(merchant, hook.id))![0]!.eventId, "charge.failing:7:42");
     db.close();
   });
 

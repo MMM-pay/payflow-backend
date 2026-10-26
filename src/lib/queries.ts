@@ -1,5 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
-import { readCursor } from "./db.ts";
+import type { Storage } from "./store/types.ts";
 import {
   BUCKET_SQL,
   bucketLabel,
@@ -77,12 +76,12 @@ export interface UpcomingMandateRow {
  * by a primary-key cursor. Fetch one extra row so the caller can tell whether
  * a further page exists.
  */
-export function listPlans(
-  db: DatabaseSync,
+export async function listPlans(
+  db: Storage,
   filter: ListPlansFilter,
-): { rows: PlanRow[]; nextCursorId: number | null } {
+): Promise<{ rows: PlanRow[]; nextCursorId: number | null }> {
   const { where, args } = planFilter(filter);
-  return cursorPage(
+  return cursorPage<PlanRow>(
     db,
     "FROM plans",
     where,
@@ -125,23 +124,19 @@ function planFilter(filter: Omit<ListPlansFilter, "cursor" | "limit">): {
  * filters keep, M mandates and A of them active; SQLite keeps only the top
  * `limit` rows while it sorts, so memory is O(limit).
  */
-export function listPlansBySubscribers(
-  db: DatabaseSync,
+export async function listPlansBySubscribers(
+  db: Storage,
   filter: Omit<ListPlansFilter, "cursor">,
-): PlanRow[] {
+): Promise<PlanRow[]> {
   const { where, args } = planFilter(filter);
-  return db
-    .prepare(
-      // `where` is built from fixed fragments and every value is a bound
-      // parameter, so this interpolation is structural, not user data.
-      // eslint-disable-next-line no-restricted-syntax
+  return db.all<PlanRow>(
       `SELECT * FROM plans ${where}
         ORDER BY (SELECT COUNT(*) FROM mandates m
                    WHERE m.plan_id = plans.id AND m.status = 'Active') DESC,
                  id ASC
         LIMIT ?`,
-    )
-    .all(...(args as never[]), filter.limit) as unknown as PlanRow[];
+    [...args, filter.limit],
+  );
 }
 
 /**
@@ -150,13 +145,13 @@ export function listPlansBySubscribers(
  * further page exists; the cursor names a primary key, never an offset, so
  * inserts or deletes between pages cannot skip or repeat rows.
  */
-export function cursorPage<T extends { id: number }>(
-  db: DatabaseSync,
+export async function cursorPage<T extends { id: number }>(
+  db: Storage,
   fromSql: string,
   whereSql: string,
   args: unknown[],
   filter: ListCursorFilter,
-): { rows: T[]; nextCursorId: number | null } {
+): Promise<{ rows: T[]; nextCursorId: number | null }> {
   let where = whereSql;
   if (filter.cursor !== undefined) {
     where += where.length ? ` AND id < ?` : ` WHERE id < ?`;
@@ -167,8 +162,7 @@ export function cursorPage<T extends { id: number }>(
   // `fromSql` ("FROM plans" / "FROM mandates") and `whereSql` ("WHERE ..." or
   // "") are built from fixed fragments; every value is a bound parameter, so
   // this interpolation is structural, not user data.
-  // eslint-disable-next-line no-restricted-syntax
-  const rows = db.prepare(`SELECT * ${fromSql}${separator}${where} ORDER BY id DESC LIMIT ?`).all(...(args as never[])) as unknown as T[];
+  const rows = await db.all<T>(`SELECT * ${fromSql}${separator}${where} ORDER BY id DESC LIMIT ?`, args);
   if (rows.length > filter.limit) {
     return { rows: rows.slice(0, filter.limit) as T[], nextCursorId: rows[filter.limit - 1]!.id };
   }
@@ -176,20 +170,19 @@ export function cursorPage<T extends { id: number }>(
 }
 
 /** Look up a single plan by on-chain id. */
-export function getPlanById(db: DatabaseSync, id: number): PlanRow | undefined {
-  return db
-    .prepare("SELECT * FROM plans WHERE id = ?")
-    .get(id) as unknown as PlanRow | undefined;
+export async function getPlanById(db: Storage, id: number): Promise<PlanRow | undefined> {
+  return db.get<PlanRow>("SELECT * FROM plans WHERE id = ?", [id]);
 }
 
 /** A merchant's self-declared profile, or undefined when it never set one. */
-export function getMerchantProfile(
-  db: DatabaseSync,
+export async function getMerchantProfile(
+  db: Storage,
   merchant: string,
-): MerchantProfile | undefined {
-  return db
-    .prepare("SELECT merchant, name, url, ledger FROM merchant_profiles WHERE merchant = ?")
-    .get(merchant) as unknown as MerchantProfile | undefined;
+): Promise<MerchantProfile | undefined> {
+  return db.get<MerchantProfile>(
+    "SELECT merchant, name, url, ledger FROM merchant_profiles WHERE merchant = ?",
+    [merchant],
+  );
 }
 
 /**
@@ -197,18 +190,16 @@ export function getMerchantProfile(
  * page of plans costs one primary-key read rather than one per row. Addresses
  * are de-duped first; a merchant without a profile is absent from the map.
  */
-export function merchantNamesByAddress(
-  db: DatabaseSync,
+export async function merchantNamesByAddress(
+  db: Storage,
   merchants: string[],
-): Map<string, string> {
+): Promise<Map<string, string>> {
   const unique = [...new Set(merchants)];
   if (unique.length === 0) return new Map();
-  const rows = db
-    // The interpolation is `?` placeholders only, one per de-duped address;
-    // the addresses themselves are bound parameters, never interpolated.
-    // eslint-disable-next-line no-restricted-syntax
-    .prepare(`SELECT merchant, name FROM merchant_profiles WHERE merchant IN (${unique.map(() => "?").join(",")})`)
-    .all(...(unique as never[])) as unknown as { merchant: string; name: string }[];
+  const rows = await db.all<{ merchant: string; name: string }>(
+    `SELECT merchant, name FROM merchant_profiles WHERE merchant IN (${unique.map(() => "?").join(",")})`,
+    unique,
+  );
   return new Map(rows.map((row) => [row.merchant, row.name]));
 }
 
@@ -241,48 +232,43 @@ export interface PlanStatsAggregate {
  * round-trips through a JavaScript number; replaying a ledger range is
  * idempotent because charges are keyed on (tx_hash, mandate_id).
  */
-export function getPlanStats(
-  db: DatabaseSync,
+export async function getPlanStats(
+  db: Storage,
   planId: number,
-): PlanStatsAggregate {
-  const mandateCounts = db
-    .prepare(
+): Promise<PlanStatsAggregate> {
+  const [mandateCounts, revenue] = await Promise.all([
+    db.get<{
+      total_mandates: number;
+      active_mandates: number;
+      cancellations: number;
+    }>(
       `SELECT COUNT(*) AS total_mandates,
               SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) AS active_mandates,
               SUM(CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END) AS cancellations
          FROM mandates
         WHERE plan_id = ?`,
-    )
-    .get(planId) as {
-      total_mandates: number;
-      active_mandates: number;
-      cancellations: number;
-    } | undefined;
-
-  const revenueStmt = db
-    .prepare(
+      [planId],
+    ),
+    db.get<{ total_collected: bigint; total_charges: bigint }>(
       `SELECT COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total_collected,
               COUNT(c.tx_hash) AS total_charges
          FROM charges c
          JOIN mandates m ON m.id = c.mandate_id
         WHERE m.plan_id = ?`,
-    );
-  // Read the sum as bigint so a large collected total never round-trips
-  // through a JavaScript number at stroop scale.
-  revenueStmt.setReadBigInts(true);
-  const revenue = revenueStmt.get(planId) as {
-    total_collected: bigint;
-    // COUNT also reads as bigint under setReadBigInts; counts are small, so
-    // coerce back to a number.
-    total_charges: bigint;
-  } | undefined;
+      [planId],
+    ),
+  ]);
 
   // One value per subscriber, ranked once so the median is read in the same
   // statement: `(n + 1) / 2` and `n / 2 + 1` name the same row when n is odd
   // and the middle two when it is even. Mandates come from the
   // (plan_id, status) index and charges from the mandate_id index; the rank
   // sorts S subscribers, O(S log S), and only one row reaches JavaScript.
-  const ltvStmt = db.prepare(
+  const ltv = await db.get<{
+    subscribers: number | bigint;
+    middle_sum: number | bigint;
+    middle_count: number | bigint;
+  }>(
     `WITH ltv AS (
        SELECT COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS value
          FROM mandates m
@@ -298,28 +284,26 @@ export function getPlanStats(
             COALESCE(SUM(CASE WHEN rn IN ((n + 1) / 2, n / 2 + 1) THEN value END), 0) AS middle_sum,
             COUNT(CASE WHEN rn IN ((n + 1) / 2, n / 2 + 1) THEN 1 END) AS middle_count
        FROM ranked`,
+    [planId],
   );
-  ltvStmt.setReadBigInts(true);
-  const ltv = ltvStmt.get(planId) as {
-    subscribers: bigint;
-    middle_sum: bigint;
-    middle_count: bigint;
-  };
 
-  const total = mandateCounts?.total_mandates ?? 0;
-  const totalCollected = revenue?.total_collected ?? 0n;
+  const total = Number(mandateCounts?.total_mandates ?? 0);
+  const totalCollected = BigInt(revenue?.total_collected ?? 0);
+  const subscribers = BigInt(ltv?.subscribers ?? 0);
+  const middleSum = BigInt(ltv?.middle_sum ?? 0);
+  const middleCount = BigInt(ltv?.middle_count ?? 0);
   return {
     planId,
-    activeMandates: mandateCounts?.active_mandates ?? 0,
+    activeMandates: Number(mandateCounts?.active_mandates ?? 0),
     totalMandates: total,
-    cancellations: mandateCounts?.cancellations ?? 0,
+    cancellations: Number(mandateCounts?.cancellations ?? 0),
     totalCollected,
     // Charges settled is a count, never an amount; safe to coerce to a number.
-    totalCharges: Number(revenue?.total_charges ?? 0n),
+    totalCharges: Number(revenue?.total_charges ?? 0),
     // The subscribers' values sum to the plan's net collected total, so the
     // mean divides that instead of summing the same charges again.
-    averageLtv: ltv.subscribers === 0n ? 0n : totalCollected / ltv.subscribers,
-    medianLtv: ltv.middle_count === 0n ? 0n : ltv.middle_sum / ltv.middle_count,
+    averageLtv: subscribers === 0n ? 0n : totalCollected / subscribers,
+    medianLtv: middleCount === 0n ? 0n : middleSum / middleCount,
   };
 }
 
@@ -329,15 +313,14 @@ export function getPlanStats(
  * mandates costs one read, not one per row. Ids are de-duped first; unknown
  * plan ids are simply absent from the map.
  */
-export function planTokensByIds(db: DatabaseSync, planIds: number[]): Map<number, string> {
+export async function planTokensByIds(db: Storage, planIds: number[]): Promise<Map<number, string>> {
   const ids = [...new Set(planIds)];
   if (ids.length === 0) return new Map();
-  const rows = db
-    // The interpolation is `?` placeholders only, one per de-duped numeric id;
-    // the ids themselves are bound parameters, never interpolated.
-    // eslint-disable-next-line no-restricted-syntax
-    .prepare(`SELECT id, token FROM plans WHERE id IN (${ids.map(() => "?").join(",")})`)
-    .all(...(ids as never[])) as unknown as { id: number; token: string }[];
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = await db.all<{ id: number; token: string }>(
+    `SELECT id, token FROM plans WHERE id IN (${placeholders})`,
+    ids,
+  );
   return new Map(rows.map((row) => [row.id, row.token]));
 }
 
@@ -346,10 +329,10 @@ export function planTokensByIds(db: DatabaseSync, planIds: number[]): Map<number
  * merchant, and status filters, paginated by a primary-key cursor. Fetch one
  * extra row so the caller can tell whether a further page exists.
  */
-export function listMandates(
-  db: DatabaseSync,
+export async function listMandates(
+  db: Storage,
   filter: ListMandatesFilter,
-): { rows: MandateRow[]; nextCursorId: number | null } {
+): Promise<{ rows: MandateRow[]; nextCursorId: number | null }> {
   if (filter.ids !== undefined && filter.ids.length === 0) {
     return { rows: [], nextCursorId: null };
   }
@@ -372,26 +355,20 @@ export function listMandates(
     args.push(filter.status);
   }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  return cursorPage(db, "FROM mandates", clause, args, filter);
+  return cursorPage<MandateRow>(db, "FROM mandates", clause, args, filter);
 }
 
 /** Look up a single mandate by on-chain id. */
-export function getMandateById(
-  db: DatabaseSync,
+export async function getMandateById(
+  db: Storage,
   id: number,
-): MandateRow | undefined {
-  return db
-    .prepare("SELECT * FROM mandates WHERE id = ?")
-    .get(id) as unknown as MandateRow | undefined;
+): Promise<MandateRow | undefined> {
+  return db.get<MandateRow>("SELECT * FROM mandates WHERE id = ?", [id]);
 }
 
 /** Resolve the merchant for a mandate when an event only includes its id. */
-export function getMandateMerchant(db: DatabaseSync, id: number): string | undefined {
-  return (
-    db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(id) as
-      | { merchant: string }
-      | undefined
-  )?.merchant;
+export async function getMandateMerchant(db: Storage, id: number): Promise<string | undefined> {
+  return (await db.get<{ merchant: string }>("SELECT merchant FROM mandates WHERE id = ?", [id]))?.merchant;
 }
 
 /**
@@ -402,13 +379,13 @@ export function getMandateMerchant(db: DatabaseSync, id: number): string | undef
  * `to * 1000 + 1` milliseconds is inside the range. Without them the whole
  * history is returned.
  */
-export function listMandateCharges(
-  db: DatabaseSync,
+export async function listMandateCharges(
+  db: Storage,
   mandateId: number,
   limit: number,
   from?: number,
   to?: number,
-): ChargeRow[] {
+): Promise<ChargeRow[]> {
   const where = ["mandate_id = ?"];
   const args: unknown[] = [mandateId];
   if (from !== undefined) {
@@ -423,30 +400,22 @@ export function listMandateCharges(
   args.push(limit);
   // The predicates are fixed fragments and the values are bound parameters,
   // so no request data reaches the SQL text.
-  return db
-    // eslint-disable-next-line no-restricted-syntax
-    .prepare(`SELECT * FROM charges WHERE ${where.join(" AND ")} ORDER BY ledger DESC LIMIT ?`)
-    .all(...(args as never[])) as unknown as ChargeRow[];
+  return db.all<ChargeRow>(
+    `SELECT * FROM charges WHERE ${where.join(" AND ")} ORDER BY ledger DESC LIMIT ?`,
+    args,
+  );
 }
 
 /**
  * A mandate's keeper charge attempts, newest first (#144). One range read on
  * the (mandate_id, id) index, O(log A + limit) however long the log is.
  */
-export function listChargeAttempts(
-  db: DatabaseSync,
+export async function listChargeAttempts(
+  db: Storage,
   mandateId: number,
   limit: number,
-): ChargeAttemptRow[] {
-  const rows = db
-    .prepare(
-      `SELECT id, mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at
-         FROM charge_attempts
-        WHERE mandate_id = ?
-        ORDER BY id DESC
-        LIMIT ?`,
-    )
-    .all(mandateId, limit) as unknown as Array<{
+): Promise<ChargeAttemptRow[]> {
+  const rows = await db.all<{
     id: number;
     mandate_id: number;
     attempted_at: number;
@@ -456,7 +425,14 @@ export function listChargeAttempts(
     shortfall: string | null;
     failures: number;
     retry_at: number | null;
-  }>;
+  }>(
+    `SELECT id, mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at
+       FROM charge_attempts
+      WHERE mandate_id = ?
+      ORDER BY id DESC
+      LIMIT ?`,
+    [mandateId, limit],
+  );
   return rows.map((row) => ({
     id: row.id,
     mandateId: row.mandate_id,
@@ -470,7 +446,6 @@ export function listChargeAttempts(
   }));
 }
 
-/** Latest indexed vault balance for each token owned by an address. */
 /** One settled charge, as the merchant CSV export reads it. */
 export interface MerchantChargeRow {
   tx_hash: string;
@@ -495,17 +470,16 @@ export interface ChargeKey {
  * export never holds the synchronous SQLite for its whole length.
  * `from`/`to` bound `created_at` in unix milliseconds, half-open.
  */
-export function listMerchantChargesAfter(
-  db: DatabaseSync,
+export async function listMerchantChargesAfter(
+  db: Storage,
   merchant: string,
   after: ChargeKey | null,
   limit: number,
   from = 0,
   to = Number.MAX_SAFE_INTEGER,
-): MerchantChargeRow[] {
+): Promise<MerchantChargeRow[]> {
   const key = after ?? { created_at: -1, tx_hash: "", mandate_id: -1 };
-  return db
-    .prepare(
+  return db.all<MerchantChargeRow>(
       `SELECT tx_hash, mandate_id, subscriber, amount, fee, created_at
          FROM charges
         WHERE merchant = ?
@@ -513,8 +487,8 @@ export function listMerchantChargesAfter(
           AND (created_at, tx_hash, mandate_id) > (?, ?, ?)
         ORDER BY created_at, tx_hash, mandate_id
         LIMIT ?`,
-    )
-    .all(merchant, from, to, key.created_at, key.tx_hash, key.mandate_id, limit) as unknown as MerchantChargeRow[];
+    [merchant, from, to, key.created_at, key.tx_hash, key.mandate_id, limit],
+  );
 }
 
 /** One settled charge, as the subscriber CSV export reads it. */
@@ -532,90 +506,84 @@ export interface SubscriberChargeRow {
  * One page of a subscriber's charges, oldest first, after `after` in
  * (created_at, tx_hash, mandate_id) order. Keyset pages over the
  * `charges_subscriber_created_at` index keep every query short, so a long
- * export never holds the synchronous SQLite for its whole length. `plan_id`
+ * export never holds the connection for its whole length. `plan_id`
  * comes from the mandate; it is null only if a charge arrived before its
  * mandate was projected. `from`/`to` bound `created_at` in unix milliseconds,
  * half-open.
  */
-export function listSubscriberChargesAfter(
-  db: DatabaseSync,
+export async function listSubscriberChargesAfter(
+  db: Storage,
   subscriber: string,
   after: ChargeKey | null,
   limit: number,
   from = 0,
   to = Number.MAX_SAFE_INTEGER,
-): SubscriberChargeRow[] {
+): Promise<SubscriberChargeRow[]> {
   const key = after ?? { created_at: -1, tx_hash: "", mandate_id: -1 };
-  return db
-    .prepare(
-      `SELECT c.tx_hash, c.mandate_id, c.merchant, m.plan_id, c.amount, c.fee, c.created_at
-         FROM charges c
-         LEFT JOIN mandates m ON m.id = c.mandate_id
-        WHERE c.subscriber = ?
-          AND c.created_at >= ? AND c.created_at < ?
-          AND (c.created_at, c.tx_hash, c.mandate_id) > (?, ?, ?)
-        ORDER BY c.created_at, c.tx_hash, c.mandate_id
-        LIMIT ?`,
-    )
-    .all(subscriber, from, to, key.created_at, key.tx_hash, key.mandate_id, limit) as unknown as SubscriberChargeRow[];
+  return db.all<SubscriberChargeRow>(
+    `SELECT c.tx_hash, c.mandate_id, c.merchant, m.plan_id, c.amount, c.fee, c.created_at
+       FROM charges c
+       LEFT JOIN mandates m ON m.id = c.mandate_id
+      WHERE c.subscriber = ?
+        AND c.created_at >= ? AND c.created_at < ?
+        AND (c.created_at, c.tx_hash, c.mandate_id) > (?, ?, ?)
+      ORDER BY c.created_at, c.tx_hash, c.mandate_id
+      LIMIT ?`,
+    [subscriber, from, to, key.created_at, key.tx_hash, key.mandate_id, limit],
+  );
 }
 
-export function getVaultBalances(
-  db: DatabaseSync,
+/** Latest indexed vault balance for each token owned by an address. */
+export async function getVaultBalances(
+  db: Storage,
   address: string,
-): VaultBalancePage["balances"] {
-  return db
-    .prepare(
+): Promise<VaultBalancePage["balances"]> {
+  return db.all<VaultBalancePage["balances"][number]>(
       `SELECT e.token, e.balance, e.ledger
          FROM vault_events e
-        WHERE e.user = ?
+        WHERE e."user" = ?
           AND NOT EXISTS (
             SELECT 1 FROM vault_events newer
-             WHERE newer.user = e.user
+             WHERE newer."user" = e."user"
                AND newer.token = e.token
                AND (newer.ledger > e.ledger OR
-                    (newer.ledger = e.ledger AND newer.rowid > e.rowid))
+                    (newer.ledger = e.ledger AND newer.tx_hash > e.tx_hash))
           )
         ORDER BY e.token`,
-    )
-    .all(address) as unknown as VaultBalancePage["balances"];
+    [address],
+  );
 }
 
 /** Vault events for an address, newest ledger and insertion order first. */
-export function listVaultEvents(
-  db: DatabaseSync,
+export async function listVaultEvents(
+  db: Storage,
   address: string,
   limit: number,
-): VaultEventPage["events"] {
-  return db
-    .prepare(
-      `SELECT tx_hash, kind, user, token, counterparty, amount, balance, ledger
+): Promise<VaultEventPage["events"]> {
+  return db.all<VaultEventPage["events"][number]>(
+      `SELECT tx_hash, kind, "user", token, counterparty, amount, balance, ledger
          FROM vault_events
-        WHERE user = ?
-        ORDER BY ledger DESC, rowid DESC
+          WHERE "user" = ?
+          ORDER BY ledger DESC, tx_hash DESC
         LIMIT ?`,
-    )
-    .all(address, limit) as unknown as VaultEventPage["events"];
+    [address, limit],
+  );
 }
 
 /** Current fee is the newest indexed fee change; null means no change is known. */
-export function getProtocolFeeHistory(db: DatabaseSync): ProtocolResponse {
-  const history = db
-    .prepare(
+export async function getProtocolFeeHistory(db: Storage): Promise<ProtocolResponse> {
+  const history = await db.all<ProtocolResponse["history"][number]>(
       `SELECT tx_hash, old_fee_bps, new_fee_bps, ledger
          FROM fee_history
-        ORDER BY ledger DESC, rowid DESC`,
-    )
-    .all() as unknown as ProtocolResponse["history"];
+        ORDER BY ledger DESC, tx_hash DESC`,
+  );
   // The newest upgrade per contract; empty until a contract has been upgraded.
-  const contract_versions = db
-    .prepare(
-      `SELECT contract_id, new_hash AS wasm_hash, ledger
+  const contract_versions = await db.all<ProtocolResponse["contract_versions"][number]>(
+      `SELECT u.contract_id, u.new_hash AS wasm_hash, u.ledger
          FROM contract_upgrades u
-        WHERE ledger = (SELECT MAX(ledger) FROM contract_upgrades WHERE contract_id = u.contract_id)
+        WHERE u.ledger = (SELECT MAX(ledger) FROM contract_upgrades WHERE contract_id = u.contract_id)
         ORDER BY contract_id`,
-    )
-    .all() as unknown as ProtocolResponse["contract_versions"];
+  );
   return { fee_bps: history[0]?.new_fee_bps ?? null, history, contract_versions };
 }
 
@@ -636,54 +604,32 @@ export function getProtocolFeeHistory(db: DatabaseSync): ProtocolResponse {
  * the cost is O(log C + W) for C charges and W of them in the window, and
  * memory is O(limit) buckets.
  */
-export function getProtocolFees(
-  db: DatabaseSync,
+export async function getProtocolFees(
+  db: Storage,
   bucket: RevenueBucketSize,
   limit: number,
-): ProtocolFeesResponse {
-  // Each edge is one seek on `charges_created_at_fee`; SQLite answers a lone
-  // MIN or MAX from the index without reading the table.
-  const edge = (sql: string): number | null =>
-    (db.prepare(sql).get() as { at: number | null } | undefined)?.at ?? null;
-  const newest = edge("SELECT MAX(created_at) AS at FROM charges");
-  const oldest = edge("SELECT MIN(created_at) AS at FROM charges");
+): Promise<ProtocolFeesResponse> {
+  const newest = (await db.get<{ at: number | null }>("SELECT MAX(created_at) AS at FROM charges"))?.at ?? null;
+  const oldest = (await db.get<{ at: number | null }>("SELECT MIN(created_at) AS at FROM charges"))?.at ?? null;
   if (newest === null || oldest === null) {
     return { bucket, buckets: [], totals: { fee: "0", charges: 0 } };
   }
 
-  const stmt = db.prepare(
-    // The bucket expression is a vetted static fragment chosen by the bucket
-    // size; the window start is a bound parameter, so no request data reaches
-    // the SQL text.
-    // eslint-disable-next-line no-restricted-syntax
-    `SELECT ${BUCKET_SQL[bucket]} AS bucket,
-            COALESCE(SUM(CAST(fee AS INTEGER)), 0) AS fee,
-            COUNT(*) AS charges
-       FROM (
-         SELECT CAST(created_at / 1000 AS INTEGER) AS at, fee
-           FROM charges
-          WHERE created_at >= ?
-       )
-      GROUP BY bucket
-      ORDER BY bucket`,
-  );
-  // Read the sums as bigint so a large fee total never round-trips through a
-  // JavaScript number at stroop scale.
-  stmt.setReadBigInts(true);
   // `created_at` is unix milliseconds; the bucket arithmetic is in seconds.
   const last = Math.floor(newest / 1000);
   const first = windowStart(bucket, last, limit);
-  const rows = stmt.all(first * 1000) as unknown as Array<{
-    bucket: bigint;
-    fee: bigint;
-    charges: bigint;
-  }>;
-
-  // A bucket start is a timestamp, not an amount, and fits in a number; a
-  // count is never an amount either.
-  const perBucket = new Map<number, { fee: bigint; charges: number }>(
-    rows.map((row) => [Number(row.bucket), { fee: row.fee, charges: Number(row.charges) }]),
+  const rows = await db.all<{ created_at: number; fee: string }>(
+    "SELECT created_at, fee FROM charges WHERE created_at >= ?",
+    [first * 1000],
   );
+  const perBucket = new Map<number, { fee: bigint; charges: number }>();
+  for (const row of rows) {
+    const key = Math.floor(bucketStart(bucket, Math.floor(row.created_at / 1000)).getTime() / 1000);
+    const current = perBucket.get(key) ?? { fee: 0n, charges: 0 };
+    current.fee += BigInt(row.fee);
+    current.charges += 1;
+    perBucket.set(key, current);
+  }
 
   // The window ends at the newest charge's bucket and starts `limit` buckets
   // earlier, or at the oldest charge's bucket when the history is shorter, so
@@ -722,26 +668,20 @@ function windowStart(bucket: RevenueBucketSize, at: number, count: number): numb
   return Math.floor(last.getTime() / 1000) - back * step;
 }
 
-/**
- * List active mandates currently eligible for settlement at `now`.
- *
- * `plan_id` comes along so the caller can find the mandate's token — the
- * vault balance is per (subscriber, token).
- */
-export function listDueMandates(
-  db: DatabaseSync,
+/** List active mandates currently eligible for settlement at `now`. */
+export async function listDueMandates(
+  db: Storage,
   now: number,
   limit: number,
-): DueMandateRecord[] {
-  return db
-    .prepare(
-      `SELECT id, subscriber, merchant, next_charge, amount, plan_id
+): Promise<DueMandateRecord[]> {
+  return db.all<DueMandateRecord>(
+      `SELECT id, subscriber, merchant, plan_id, next_charge, amount
          FROM mandates
         WHERE status = 'Active' AND next_charge <= ?
           AND (max_charges = 0 OR charges_made < max_charges)
         ORDER BY next_charge ASC LIMIT ?`,
-    )
-    .all(now, limit) as unknown as DueMandateRecord[];
+    [now, limit],
+  );
 }
 
 /**
@@ -751,17 +691,16 @@ export function listDueMandates(
  * operator wants the number ("are any mandates waiting?") without pulling
  * every row of the due list into memory.
  */
-export function countDueMandates(db: DatabaseSync, now: number): number {
-  return (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS n
-           FROM mandates
-          WHERE status = 'Active' AND next_charge <= ?
-            AND (max_charges = 0 OR charges_made < max_charges)`,
-      )
-      .get(now) as { n: number } | undefined
-  )?.n ?? 0;
+export async function countDueMandates(db: Storage, now: number): Promise<number> {
+  const row = await db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n
+       FROM mandates
+      WHERE status = 'Active' AND next_charge <= ?
+        AND (max_charges = 0 OR charges_made < max_charges)`,
+    [now],
+  );
+  if (!row) throw new Error("count due mandates query returned no result");
+  return row.n;
 }
 
 /**
@@ -775,36 +714,34 @@ export function countDueMandates(db: DatabaseSync, now: number): number {
  * The balances stay the strings they are stored as — an amount is never read
  * as a number, so no precision is lost on the way out.
  */
-export function listLatestVaultBalances(
-  db: DatabaseSync,
+export async function listLatestVaultBalances(
+  db: Storage,
   addresses: string[],
-): Map<string, Map<string, string>> {
+): Promise<Map<string, Map<string, string>>> {
   const unique = [...new Set(addresses)];
   const balances = new Map<string, Map<string, string>>();
   if (unique.length === 0) return balances;
   const placeholders = unique.map(() => "?").join(",");
-  const rows = db
-    .prepare(
-      // The placeholders are one "?" per de-duped address; the addresses
-      // themselves are bound parameters, so no request data reaches the SQL
-      // text.
-      // eslint-disable-next-line no-restricted-syntax
-      `SELECT e.user AS user, e.token AS token, e.balance AS balance
-         FROM vault_events e
-        WHERE e.user IN (${placeholders})
-          AND NOT EXISTS (
-            SELECT 1 FROM vault_events newer
-             WHERE newer.user = e.user
-               AND newer.token = e.token
-               AND (newer.ledger > e.ledger OR
-                    (newer.ledger = e.ledger AND newer.rowid > e.rowid))
-          )`,
-    )
-    .all(...(unique as never[])) as unknown as {
+  const rows = await db.all<{
     user: string;
     token: string;
     balance: string;
-  }[];
+  }>(
+    // The placeholders are one "?" per de-duped address; the addresses
+    // themselves are bound parameters, so no request data reaches the SQL
+    // text.
+    `SELECT e."user" AS user, e.token AS token, e.balance AS balance
+       FROM vault_events e
+      WHERE e."user" IN (${placeholders})
+        AND NOT EXISTS (
+          SELECT 1 FROM vault_events newer
+           WHERE newer."user" = e."user"
+             AND newer.token = e.token
+             AND (newer.ledger > e.ledger OR
+                  (newer.ledger = e.ledger AND newer.tx_hash > e.tx_hash))
+        )`,
+    unique,
+  );
   for (const row of rows) {
     const perToken = balances.get(row.user) ?? new Map<string, string>();
     perToken.set(row.token, row.balance);
@@ -819,12 +756,12 @@ export function listLatestVaultBalances(
  * when none is indexed. A mandate carries no token of its own — it inherits
  * its plan's — so a batch of rows costs two reads, not two per row.
  */
-export function lastKnownBalances(
-  db: DatabaseSync,
+export async function lastKnownBalances(
+  db: Storage,
   rows: DueMandateRecord[],
-): Array<string | undefined> {
-  const tokens = planTokensByIds(db, rows.map((row) => row.plan_id));
-  const balances = listLatestVaultBalances(db, rows.map((row) => row.subscriber));
+): Promise<Array<string | undefined>> {
+  const tokens = await planTokensByIds(db, rows.map((row) => row.plan_id));
+  const balances = await listLatestVaultBalances(db, rows.map((row) => row.subscriber));
   return rows.map((row) => {
     const token = tokens.get(row.plan_id);
     return token ? balances.get(row.subscriber)?.get(token) : undefined;
@@ -856,17 +793,17 @@ const UNPAID_PAGE = 200;
  * the D due mandates read before then, never a scan of the merchant's whole
  * history, and memory is O(page + limit).
  */
-export function listMerchantUnpaidMandates(
-  db: DatabaseSync,
+export async function listMerchantUnpaidMandates(
+  db: Storage,
   merchant: string,
   now: number,
   limit: number,
-): UnpaidMandateRow[] {
+): Promise<UnpaidMandateRow[]> {
   // The keyset is spelled as a closed range on next_charge plus a tiebreak on
   // id, not as a row value: SQLite's planner (with no ANALYZE statistics)
   // then seeks the merchant's own index on both bounds instead of walking the
   // protocol-wide `mandates_due` index. test/db.test.ts pins the plan.
-  const page = db.prepare(
+  const sql =
     `SELECT id, subscriber, merchant, next_charge, amount, plan_id
        FROM mandates
       WHERE merchant = ? AND status = 'Active'
@@ -874,20 +811,15 @@ export function listMerchantUnpaidMandates(
         AND (next_charge > ? OR id > ?)
         AND (max_charges = 0 OR charges_made < max_charges)
       ORDER BY next_charge, id
-      LIMIT ?`,
-  );
+      LIMIT ?`;
   const unpaid: UnpaidMandateRow[] = [];
   let after = { next_charge: -1, id: -1 };
   for (;;) {
-    const rows = page.all(
-      merchant,
-      after.next_charge,
-      now,
-      after.next_charge,
-      after.id,
-      UNPAID_PAGE,
-    ) as unknown as DueMandateRecord[];
-    const balances = lastKnownBalances(db, rows);
+    const rows = await db.all<DueMandateRecord>(
+      sql,
+      [merchant, after.next_charge, now, after.next_charge, after.id, UNPAID_PAGE],
+    );
+    const balances = await lastKnownBalances(db, rows);
     for (const [i, row] of rows.entries()) {
       const balance = balances[i];
       if (isFunded(balance, row.amount)) continue;
@@ -910,39 +842,35 @@ export function listMerchantUnpaidMandates(
 }
 
 /** Revenue per token: sums from charges and active mandates, joined via plans. */
-export function listMerchantTokenRevenue(
-  db: DatabaseSync,
+export async function listMerchantTokenRevenue(
+  db: Storage,
   merchant: string,
-): TokenRevenue[] {
-  // A charge carries no token of its own; its mandate's plan does. Both
-  // series read as bigint so no sum round-trips through a JS number.
-  const collected = db.prepare(
-    `SELECT p.token AS token, COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total
+): Promise<TokenRevenue[]> {
+  const collected = await db.all<{ token: string; amount: string }>(
+    `SELECT p.token AS token, c.amount
        FROM charges c
        JOIN mandates m ON m.id = c.mandate_id
        JOIN plans p ON p.id = m.plan_id
-      WHERE c.merchant = ?
-      GROUP BY p.token`,
+      WHERE c.merchant = ?`,
+    [merchant],
   );
-  collected.setReadBigInts(true);
-  const recurring = db.prepare(
-    // eslint-disable-next-line no-restricted-syntax
-    `SELECT p.token AS token,
-            COALESCE(SUM(CAST(m.amount AS INTEGER) * ${SECONDS_PER_MONTH} / m.period), 0) AS mrr
+  const recurring = await db.all<{ token: string; amount: string; period: number }>(
+    `SELECT p.token AS token, m.amount, m.period
        FROM mandates m
        JOIN plans p ON p.id = m.plan_id
-      WHERE m.merchant = ? AND m.status = 'Active' AND m.period > 0
-      GROUP BY p.token`,
+      WHERE m.merchant = ? AND m.status = 'Active' AND m.period > 0`,
+    [merchant],
   );
-  recurring.setReadBigInts(true);
 
   const tokens = new Map<string, { totalCollected: string; mrr: string }>();
-  for (const row of collected.all(merchant) as { token: string; total: bigint }[]) {
-    tokens.set(row.token, { totalCollected: String(row.total), mrr: "0" });
+  for (const row of collected) {
+    const sums = tokens.get(row.token) ?? { totalCollected: "0", mrr: "0" };
+    sums.totalCollected = (BigInt(sums.totalCollected) + BigInt(row.amount)).toString();
+    tokens.set(row.token, sums);
   }
-  for (const row of recurring.all(merchant) as { token: string; mrr: bigint }[]) {
+  for (const row of recurring) {
     const entry = tokens.get(row.token) ?? { totalCollected: "0", mrr: "0" };
-    entry.mrr = String(row.mrr);
+    entry.mrr = (BigInt(entry.mrr) + (BigInt(row.amount) * BigInt(SECONDS_PER_MONTH)) / BigInt(row.period)).toString();
     tokens.set(row.token, entry);
   }
   return [...tokens]
@@ -951,85 +879,83 @@ export function listMerchantTokenRevenue(
 }
 
 /** Compute merchant revenue summary and per-token breakdown. */
-export function getMerchantSummary(
-  db: DatabaseSync,
+export async function getMerchantSummary(
+  db: Storage,
   merchant: string,
   defaultToken?: string,
-): MerchantSummary {
-  const active = db
-    .prepare(
-      "SELECT COUNT(*) AS n FROM mandates WHERE merchant = ? AND status = 'Active'",
-    )
-    .get(merchant) as { n: number };
-  const collected = db
-    .prepare(
-      "SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) AS total, COUNT(*) AS n FROM charges WHERE merchant = ?",
-    )
-    .get(merchant) as { total: number; n: number };
+): Promise<MerchantSummary> {
+  const active = await db.get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM mandates WHERE merchant = ? AND status = 'Active'",
+    [merchant],
+  );
+  const collected = await db.all<{ amount: string }>(
+    "SELECT amount FROM charges WHERE merchant = ?",
+    [merchant],
+  );
   // Recurring revenue, normalised from each mandate's own period: MRR over a
   // 30-day month and ARR over a 365-day year. Integer division truncates,
   // which is fine at base-unit (stroop) scale.
-  const recurring = db
-    .prepare(
-      // Only module-level constants are interpolated here; the address is a
-      // bound parameter, so no request data reaches the SQL text.
-      // eslint-disable-next-line no-restricted-syntax
-      `SELECT COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_MONTH} / period), 0) AS mrr,
-              COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_YEAR} / period), 0) AS arr
-         FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
-    )
-    .get(merchant) as { mrr: number; arr: number };
+  const recurring = await db.all<{ amount: string; period: number }>(
+    "SELECT amount, period FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0",
+    [merchant],
+  );
+  const collectedTotal = collected.reduce((sum, row) => sum + BigInt(row.amount), 0n);
+  const mrr = recurring.reduce(
+    (sum, row) => sum + (BigInt(row.amount) * BigInt(SECONDS_PER_MONTH)) / BigInt(row.period),
+    0n,
+  );
+  const arr = recurring.reduce(
+    (sum, row) => sum + (BigInt(row.amount) * BigInt(SECONDS_PER_YEAR)) / BigInt(row.period),
+    0n,
+  );
 
   // The flat totals stop at one token only when a default exists. Without
   // TOKEN_ID they keep the previous all-token meaning.
-  const tokens = listMerchantTokenRevenue(db, merchant);
+  const tokens = await listMerchantTokenRevenue(db, merchant);
   const scoped = defaultToken
     ? tokens.find((t) => t.token === defaultToken)
     : undefined;
 
   return {
     merchant,
-    activeMandates: active.n,
-    totalCollected: defaultToken
-      ? (scoped?.totalCollected ?? "0")
-      : String(collected.total),
-    chargeCount: collected.n,
-    mrr: defaultToken ? (scoped?.mrr ?? "0") : String(recurring.mrr),
-    arr: String(recurring.arr),
+    activeMandates: active?.n ?? 0,
+      totalCollected: defaultToken ? (scoped?.totalCollected ?? "0") : collectedTotal.toString(),
+      chargeCount: collected.length,
+      mrr: defaultToken ? (scoped?.mrr ?? "0") : mrr.toString(),
+      arr: arr.toString(),
     tokens,
   };
 }
 
 /** Active positive-period mandates for a merchant's revenue forecast. */
 export function listMerchantForecastMandates(
-  db: DatabaseSync,
+  db: Storage,
   merchant: string,
-): ForecastMandateRow[] {
-  return db
-    .prepare(
+): Promise<ForecastMandateRow[]> {
+  return db.all<ForecastMandateRow>(
       `SELECT amount, period, next_charge, charges_made, max_charges, fee_bps
          FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
-    )
-    .all(merchant) as unknown as ForecastMandateRow[];
+    [merchant],
+  );
 }
 
 /** Subscriber mandates and cumulative gross amount paid (amount + fee). */
-export function getSubscriberSummary(
-  db: DatabaseSync,
+export async function getSubscriberSummary(
+  db: Storage,
   subscriber: string,
-): SubscriberSummary {
-  const mandates = db
-    .prepare("SELECT * FROM mandates WHERE subscriber = ? ORDER BY id DESC")
-    .all(subscriber) as unknown as MandateRow[];
-  const paid = db
-    .prepare(
-      "SELECT COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS total FROM charges WHERE subscriber = ?",
-    )
-    .get(subscriber) as { total: number };
+): Promise<SubscriberSummary> {
+  const mandates = await db.all<MandateRow>(
+    "SELECT * FROM mandates WHERE subscriber = ? ORDER BY id DESC",
+    [subscriber],
+  );
+  const paid = await db.all<{ amount: string; fee: string }>(
+    "SELECT amount, fee FROM charges WHERE subscriber = ?",
+    [subscriber],
+  );
   return {
     subscriber,
     mandates,
-    totalPaid: String(paid.total),
+    totalPaid: paid.reduce((total, charge) => total + BigInt(charge.amount) + BigInt(charge.fee), 0n).toString(),
   };
 }
 
@@ -1037,6 +963,13 @@ export function getSubscriberSummary(
 export const CHURN_KINDS = ["started", "cancelled", "ended", "completed"] as const;
 
 export type ChurnKind = (typeof CHURN_KINDS)[number];
+
+function bucketSql(db: Storage, bucket: ChurnBucketSize): string {
+  if (db.dialect === "sqlite") return BUCKET_SQL[bucket];
+  if (bucket === "day") return "FLOOR(at / 86400.0)::BIGINT * 86400";
+  if (bucket === "week") return "345600 + FLOOR((at - 345600) / 604800.0)::BIGINT * 604800";
+  return "EXTRACT(EPOCH FROM DATE_TRUNC('month', TO_TIMESTAMP(at) AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::BIGINT";
+}
 
 /**
  * A merchant's churn report: how many mandates started and departed in each
@@ -1051,28 +984,26 @@ export type ChurnKind = (typeof CHURN_KINDS)[number];
  * One indexed scan groups the events by bucket and kind, so the report costs
  * the same whether the merchant has ten mandates or ten thousand.
  */
-export function getMerchantChurn(
-  db: DatabaseSync,
+export async function getMerchantChurn(
+  db: Storage,
   merchant: string,
   bucket: ChurnBucketSize,
   limit: number,
-): MerchantChurnResponse {
-  const rows = db
-    .prepare(
-      // The bucket expression is a vetted static fragment chosen by the
-      // bucket size, never request data; the address is a bound parameter,
-      // so no request data reaches the SQL text.
-      // eslint-disable-next-line no-restricted-syntax
-      `SELECT kind, ${BUCKET_SQL[bucket]} AS bucket, COUNT(*) AS n
-         FROM mandate_events
-        WHERE merchant = ?
-        GROUP BY kind, bucket`,
-    )
-    .all(merchant) as unknown as Array<{
+): Promise<MerchantChurnResponse> {
+  const rows = await db.all<{
     kind: ChurnKind;
     bucket: number;
     n: number;
-  }>;
+  }>(
+      // The bucket expression is a vetted static fragment chosen by the
+      // bucket size, never request data; the address is a bound parameter,
+      // so no request data reaches the SQL text.
+      `SELECT kind, ${bucketSql(db, bucket)} AS bucket, COUNT(*) AS n
+         FROM mandate_events
+        WHERE merchant = ?
+        GROUP BY kind, bucket`,
+      [merchant],
+    );
 
   const counts = new Map<number, Record<ChurnKind, number>>();
   let min = Number.POSITIVE_INFINITY;
@@ -1085,9 +1016,9 @@ export function getMerchantChurn(
       entry = Object.fromEntries(CHURN_KINDS.map((k) => [k, 0])) as Record<ChurnKind, number>;
       counts.set(row.bucket, entry);
     }
-    entry[row.kind] = row.n;
-    if (row.bucket < min) min = row.bucket;
-    if (row.bucket > max) max = row.bucket;
+    entry[row.kind] = Number(row.n);
+    if (Number(row.bucket) < min) min = Number(row.bucket);
+    if (Number(row.bucket) > max) max = Number(row.bucket);
   }
 
   // Report the most recent buckets, oldest first within the window. The
@@ -1144,29 +1075,27 @@ export function getMerchantChurn(
  * so R ≤ C × (D + 1) rows reach JavaScript rather than one per mandate. The
  * walk is then O(R + limit × periods) with O(R) memory.
  */
-export function getMerchantCohorts(
-  db: DatabaseSync,
+export async function getMerchantCohorts(
+  db: Storage,
   merchant: string,
   bucket: ChurnBucketSize,
   limit: number,
   now: number,
-): MerchantCohortsResponse {
-  const rows = db
-    .prepare(
-      // The bucket expression is a vetted static fragment chosen by the
-      // bucket size, never request data; it reads a column named `at`, so
-      // each level renames the instant it buckets. The address is bound.
-      // eslint-disable-next-line no-restricted-syntax
-      `SELECT cohort, ${BUCKET_SQL[bucket]} AS departed, COUNT(*) AS n
-         FROM (SELECT ${BUCKET_SQL[bucket]} AS cohort, departed_at AS at
-                 FROM (SELECT s.at AS at, d.at AS departed_at
-                         FROM mandate_events s
-                         LEFT JOIN mandate_events d
-                           ON d.mandate_id = s.mandate_id AND d.slot = 'departure'
-                        WHERE s.merchant = ? AND s.kind = 'started'))
-        GROUP BY cohort, departed`,
-    )
-    .all(merchant) as unknown as Array<{ cohort: number; departed: number | null; n: number }>;
+): Promise<MerchantCohortsResponse> {
+  // The bucket expression is a vetted static fragment chosen by the
+  // bucket size, never request data; the address is bound as a parameter.
+  const bucketExpr = bucketSql(db, bucket);
+  const rows = await db.all<{ cohort: number; departed: number | null; n: number }>(
+    `SELECT cohort, ${bucketExpr} AS departed, COUNT(*) AS n
+       FROM (SELECT ${bucketExpr} AS cohort, departed_at AS at
+               FROM (SELECT s.at AS at, d.at AS departed_at
+                       FROM mandate_events s
+                       LEFT JOIN mandate_events d
+                         ON d.mandate_id = s.mandate_id AND d.slot = 'departure'
+                      WHERE s.merchant = ? AND s.kind = 'started'))
+      GROUP BY cohort, departed`,
+    [merchant],
+  );
 
   const cohorts = new Map<number, { size: number; departures: Map<number, number> }>();
   for (const row of rows) {
@@ -1237,14 +1166,14 @@ function bucketStarts(
  * so a charge exactly at `to` is excluded. Without them the report covers
  * the merchant's whole history.
  */
-export function getMerchantRevenue(
-  db: DatabaseSync,
+export async function getMerchantRevenue(
+  db: Storage,
   merchant: string,
   bucket: RevenueBucketSize,
   from: number | undefined,
   to: number | undefined,
   limit: number,
-): MerchantRevenueResponse {
+): Promise<MerchantRevenueResponse> {
   const where = ["merchant = ?"];
   const args: unknown[] = [merchant];
   if (from !== undefined) {
@@ -1257,12 +1186,16 @@ export function getMerchantRevenue(
     args.push(to * 1000);
   }
 
-  const stmt = db.prepare(
+  const rows = await db.all<{
+    bucket: number;
+    gross: bigint;
+    fee: bigint;
+    charges: number;
+  }>(
     // The bucket expression is a vetted static fragment chosen by the
     // bucket size and the predicates are fixed; the address and the range
     // are bound parameters, so no request data reaches the SQL text.
-    // eslint-disable-next-line no-restricted-syntax
-    `SELECT ${BUCKET_SQL[bucket]} AS bucket,
+    `SELECT ${bucketSql(db, bucket)} AS bucket,
             COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS gross,
             COALESCE(SUM(CAST(fee AS INTEGER)), 0) AS fee,
             COUNT(*) AS charges
@@ -1273,16 +1206,8 @@ export function getMerchantRevenue(
        )
       GROUP BY bucket
       ORDER BY bucket`,
+    args,
   );
-  // Read the sums as bigint so a large collected total never round-trips
-  // through a JavaScript number at stroop scale.
-  stmt.setReadBigInts(true);
-  const rows = stmt.all(...(args as never[])) as unknown as Array<{
-    bucket: number;
-    gross: bigint;
-    fee: bigint;
-    charges: bigint;
-  }>;
 
   const perBucket = new Map<number, { gross: bigint; fee: bigint; charges: number }>();
   let min = Number.POSITIVE_INFINITY;
@@ -1292,8 +1217,8 @@ export function getMerchantRevenue(
     // it is a timestamp, not an amount, and fits in a number.
     const start = Number(row.bucket);
     perBucket.set(start, {
-      gross: row.gross,
-      fee: row.fee,
+      gross: BigInt(row.gross),
+      fee: BigInt(row.fee),
       // A count, never an amount; safe to coerce back to a number.
       charges: Number(row.charges),
     });
@@ -1362,14 +1287,18 @@ export interface MerchantSubscriberAggregate {
  * parameter and the sum reads as bigint, so no amount round-trips through a
  * JavaScript number.
  */
-export function listMerchantSubscribers(
-  db: DatabaseSync,
+export async function listMerchantSubscribers(
+  db: Storage,
   merchant: string,
   limit: number,
-): MerchantSubscriberAggregate[] {
-  const stmt = db
-    // The address is a bound parameter, so no request data reaches the SQL text.
-    .prepare(
+): Promise<MerchantSubscriberAggregate[]> {
+  const rows = await db.all<{
+    subscriber: string;
+    mandate_count: number;
+    charge_count: number;
+    total_collected: bigint;
+  }>(
+      // The address is a bound parameter, so no request data reaches the SQL text.
       `SELECT m.subscriber AS subscriber,
               COUNT(DISTINCT m.id) AS mandate_count,
               COUNT(c.tx_hash) AS charge_count,
@@ -1380,77 +1309,60 @@ export function listMerchantSubscribers(
         GROUP BY m.subscriber
         ORDER BY total_collected DESC, m.subscriber
         LIMIT ?`,
+      [merchant, limit],
     );
-  // Read the sum as bigint so lifetime value never round-trips through a
-  // JavaScript number at stroop scale.
-  stmt.setReadBigInts(true);
-  const rows = stmt.all(merchant, limit) as unknown as {
-    subscriber: string;
-    mandate_count: number;
-    charge_count: number;
-    total_collected: bigint;
-  }[];
   return rows.map((row) => ({
-    // Counts came through as bigint because the statement reads integers as
-    // bigint; coerce back to numbers — they are small counts, never amounts.
+    // Counts are small; collected amounts remain bigint at base-unit scale.
     subscriber: row.subscriber,
     mandateCount: Number(row.mandate_count),
     chargeCount: Number(row.charge_count),
-    totalCollected: row.total_collected,
+    totalCollected: BigInt(row.total_collected),
   }));
 }
 
 /** Active positive-period mandates for a subscriber's upcoming schedule. */
 export function listSubscriberUpcomingMandates(
-  db: DatabaseSync,
+  db: Storage,
   subscriber: string,
-): UpcomingMandateRow[] {
-  return db
-    .prepare(
+): Promise<UpcomingMandateRow[]> {
+  return db.all<UpcomingMandateRow>(
       `SELECT id, merchant, amount, period, next_charge, charges_made, max_charges
          FROM mandates WHERE subscriber = ? AND status = 'Active' AND period > 0`,
-    )
-    .all(subscriber) as unknown as UpcomingMandateRow[];
+    [subscriber],
+  );
 }
 
 /** Run an aggregate returning one `total` column; decimal string out. */
-function sumOf(db: DatabaseSync, sql: string, ...args: unknown[]): string {
-  const stmt = db.prepare(sql);
-  // Read as bigint so a large sum never round-trips through a JS number.
-  stmt.setReadBigInts(true);
-  const row = stmt.get(...(args as never[])) as { total: bigint } | undefined;
-  return String(row?.total ?? 0n);
-}
-
 /** Protocol-wide counts, gross volume (24h and all-time), fees, and indexer cursor. */
-export function getProtocolStats(
-  db: DatabaseSync,
+export async function getProtocolStats(
+  db: Storage,
   since: number,
-): StatsResponse {
-  const one = (sql: string): number =>
-    (db.prepare(sql).get() as { n: number } | undefined)?.n ?? 0;
+): Promise<StatsResponse> {
+  const one = async (sql: string): Promise<number> =>
+    (await db.get<{ n: number }>(sql))?.n ?? 0;
+  const [plans, mandates, activeMandates, charges, recentCharges, allCharges, activeMerchants, cursor] = await Promise.all([
+    one("SELECT COUNT(*) AS n FROM plans"),
+    one("SELECT COUNT(*) AS n FROM mandates"),
+    one("SELECT COUNT(*) AS n FROM mandates WHERE status = 'Active'"),
+    one("SELECT COUNT(*) AS n FROM charges"),
+    db.all<{ amount: string; fee: string }>("SELECT amount, fee FROM charges WHERE created_at >= ?", [since]),
+    db.all<{ amount: string; fee: string }>("SELECT amount, fee FROM charges"),
+    one("SELECT COUNT(DISTINCT merchant) AS n FROM mandates WHERE status = 'Active'"),
+    db.get<{ last_ledger: number }>("SELECT last_ledger FROM cursor WHERE id = 1"),
+  ]);
+  const volume24h = recentCharges.reduce((sum, charge) => sum + BigInt(charge.amount) + BigInt(charge.fee), 0n);
+  const volumeAllTime = allCharges.reduce((sum, charge) => sum + BigInt(charge.amount) + BigInt(charge.fee), 0n);
+  const totalFees = allCharges.reduce((sum, charge) => sum + BigInt(charge.fee), 0n);
   return {
-    plans: one("SELECT COUNT(*) AS n FROM plans"),
-    mandates: one("SELECT COUNT(*) AS n FROM mandates"),
-    activeMandates: one("SELECT COUNT(*) AS n FROM mandates WHERE status = 'Active'"),
-    charges: one("SELECT COUNT(*) AS n FROM charges"),
-    volume24h: sumOf(
-      db,
-      "SELECT COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS total FROM charges WHERE created_at >= ?",
-      since,
-    ),
-    volumeAllTime: sumOf(
-      db,
-      "SELECT COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS total FROM charges",
-    ),
-    totalFees: sumOf(
-      db,
-      "SELECT COALESCE(SUM(CAST(fee AS INTEGER)), 0) AS total FROM charges",
-    ),
-    activeMerchants: one(
-      "SELECT COUNT(DISTINCT merchant) AS n FROM mandates WHERE status = 'Active'",
-    ),
-    lastIndexedLedger: readCursor(db, 0),
+    plans,
+    mandates,
+    activeMandates,
+    charges,
+    volume24h: volume24h.toString(),
+    volumeAllTime: volumeAllTime.toString(),
+    totalFees: totalFees.toString(),
+    activeMerchants,
+    lastIndexedLedger: cursor?.last_ledger ?? 0,
   };
 }
 
@@ -1470,21 +1382,23 @@ export interface RawContractEventRow {
  * Read one bounded archive batch in ledger/event order. Separate static SQL
  * statements avoid dynamic SQL interpolation and preserve parameter binding.
  */
-export function listRawContractEvents(
-  db: DatabaseSync,
+export async function listRawContractEvents(
+  db: Storage,
   ledger: number,
   eventId: string,
   contract: string | undefined,
   limit: number,
-): RawContractEventRow[] {
+): Promise<RawContractEventRow[]> {
   if (contract === undefined) {
-    return db.prepare(
+    return db.all<RawContractEventRow>(
       "SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time FROM events WHERE (ledger, event_id) > (?, ?) ORDER BY ledger, event_id LIMIT ?",
-    ).all(ledger, eventId, limit) as unknown as RawContractEventRow[];
+      [ledger, eventId, limit],
+    );
   }
-  return db.prepare(
+  return db.all<RawContractEventRow>(
     "SELECT event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time FROM events WHERE (ledger, event_id) > (?, ?) AND contract_id = ? ORDER BY ledger, event_id LIMIT ?",
-  ).all(ledger, eventId, contract, limit) as unknown as RawContractEventRow[];
+    [ledger, eventId, contract, limit],
+  );
 }
 
 /** Full event history, independent of the aggregate mandate_events churn log. */
@@ -1497,10 +1411,11 @@ export interface MandateTimelineRow {
   details: string;
 }
 
-export function listMandateTimeline(db: DatabaseSync, mandateId: number): MandateTimelineRow[] {
-  return db.prepare(
+export function listMandateTimeline(db: Storage, mandateId: number): Promise<MandateTimelineRow[]> {
+  return db.all<MandateTimelineRow>(
     "SELECT mandate_id, tx_hash, kind, ledger, at, details FROM mandate_timeline WHERE mandate_id = ? ORDER BY ledger ASC, tx_hash ASC, kind ASC",
-  ).all(mandateId) as unknown as MandateTimelineRow[];
+    [mandateId],
+  );
 }
 
 /** Contract upgrade history. */
@@ -1513,17 +1428,19 @@ export interface ContractUpgradeRow {
   old_hash: string | null;
 }
 
-export function listContractUpgrades(
-  db: DatabaseSync,
+export async function listContractUpgrades(
+  db: Storage,
   contractId?: string,
   limit: number = 100,
-): ContractUpgradeRow[] {
+): Promise<ContractUpgradeRow[]> {
   if (contractId === undefined) {
-    return db.prepare(
+    return db.all<ContractUpgradeRow>(
       "SELECT contract_id, tx_hash, ledger, close_time, new_hash, old_hash FROM contract_upgrades ORDER BY ledger DESC LIMIT ?",
-    ).all(limit) as unknown as ContractUpgradeRow[];
+      [limit],
+    );
   }
-  return db.prepare(
+  return db.all<ContractUpgradeRow>(
     "SELECT contract_id, tx_hash, ledger, close_time, new_hash, old_hash FROM contract_upgrades WHERE contract_id = ? ORDER BY ledger DESC LIMIT ?",
-  ).all(contractId, limit) as unknown as ContractUpgradeRow[];
+    [contractId, limit],
+  );
 }

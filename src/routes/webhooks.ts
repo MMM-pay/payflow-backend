@@ -1,8 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import type { DatabaseSync } from "node:sqlite";
 import { WebhookDispatcher } from "../lib/webhooks.ts";
+import type { Storage } from "../lib/store/types.ts";
 import type { WebhookDeliveriesResponse, WebhookListResponse } from "./types.ts";
 import { sessionOf, type Sep10Auth } from "./auth.ts";
 import { sendApiError } from "./errors.ts";
@@ -183,7 +183,7 @@ function merchantOf(
  * Every route also accepts a SEP-10 JWT (`Authorization: Bearer`, see
  * `auth.ts`) in place of its signed message.
  */
-export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, auth?: Sep10Auth): Router {
+export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?: Sep10Auth): Router {
   const r = Router();
 
   r.post("/webhooks", async (req, res) => {
@@ -197,7 +197,7 @@ export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, 
         sendWrongAccount(req, res);
         return;
       }
-      res.json({ ...dispatcher.register(session.value, url, secret), active: true });
+      res.json({ ...(await dispatcher.register(session.value, url, secret)), active: true });
       return;
     }
 
@@ -227,7 +227,7 @@ export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, 
       return;
     }
 
-    const registration = dispatcher.register(merchant, url, secret);
+    const registration = await dispatcher.register(merchant, url, secret);
     res.json({ ...registration, active: true });
   });
 
@@ -238,13 +238,13 @@ export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, 
    * The proof travels in the query string: `merchant`, `timestamp` and
    * `signature` over `payflow-webhook-list:v1:<merchant>:<timestamp>`.
    */
-  r.get("/webhooks", (req, res) => {
+  r.get("/webhooks", async (req, res) => {
     const merchant = merchantOf(req, res, auth, "query", req.query, (m, t) => `${LIST_MESSAGE_PREFIX}:${m}:${t}`);
     if (merchant === null) return;
 
     const body: WebhookListResponse = {
       merchant,
-      webhooks: dispatcher.listForMerchant(merchant),
+      webhooks: await dispatcher.listForMerchant(merchant),
     };
     res.setHeader("Cache-Control", "no-store");
     res.json(body);
@@ -259,7 +259,7 @@ export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, 
    * that does not exist, is already deleted or belongs to another merchant
    * is a 404, so the endpoint does not reveal other merchants' ids.
    */
-  r.delete("/webhooks/:id", (req, res) => {
+  r.delete("/webhooks/:id", async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const hasBody =
@@ -274,7 +274,7 @@ export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, 
     );
     if (merchant === null) return;
 
-    if (!dispatcher.deactivate(merchant, id.value)) {
+    if (!await dispatcher.deactivate(merchant, id.value)) {
       sendApiError(res, req, 404, "not_found", "No webhook with that id is registered for this merchant.");
       return;
     }
@@ -287,13 +287,13 @@ export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, 
    * `Payflow-Signature`) until `previousSecretExpiresAt`. The proof is a
    * JSON body signed over `payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>`.
    */
-  r.post("/webhooks/:id/rotate", (req, res) => {
+  r.post("/webhooks/:id/rotate", async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const merchant = merchantOf(req, res, auth, "body", req.body, (m, t) => `${ROTATE_MESSAGE_PREFIX}:${m}:${id.value}:${t}`);
     if (merchant === null) return;
 
-    const rotation = dispatcher.rotateSecret(merchant, id.value);
+    const rotation = await dispatcher.rotateSecret(merchant, id.value);
     if (rotation === null) {
       sendApiError(res, req, 404, "not_found", "No webhook with that id is registered for this merchant.");
       return;
@@ -329,13 +329,13 @@ export function webhooksRouter(db: DatabaseSync, dispatcher: WebhookDispatcher, 
    * keeps its history. The proof travels in the query string, signed over
    * `payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>`.
    */
-  r.get("/webhooks/:id/deliveries", (req, res) => {
+  r.get("/webhooks/:id/deliveries", async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const merchant = merchantOf(req, res, auth, "query", req.query, (m, t) => `${DELIVERIES_MESSAGE_PREFIX}:${m}:${id.value}:${t}`);
     if (merchant === null) return;
 
-    const deliveries = dispatcher.history(merchant, id.value);
+    const deliveries = await dispatcher.history(merchant, id.value);
     if (deliveries === null) {
       sendApiError(res, req, 404, "not_found", "No webhook with that id is registered for this merchant.");
       return;

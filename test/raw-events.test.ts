@@ -64,9 +64,9 @@ test("all raw events survive overlapping windows; rebuild restores identical pro
     await indexer.tick();
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n, 2);
     db.prepare("DELETE FROM plans").run();
-    assert.equal(indexer.rebuildProjections(), 1);
+    assert.equal(await indexer.rebuildProjections(), 1);
     assert.deepEqual(db.prepare("SELECT * FROM plans").all(), original);
-    assert.equal(indexer.rebuildProjections(), 1);
+    assert.equal(await indexer.rebuildProjections(), 1);
     assert.deepEqual(db.prepare("SELECT * FROM plans").all(), original);
   } finally {
     db.close();

@@ -120,7 +120,7 @@ describe("webhook management", () => {
 
   describe("rotating a signing secret", () => {
     test("returns the new secret once and signs with both secrets during the overlap", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/rotate", "old-secret-0001");
+      const hook = await dispatcher.register(merchant, "https://m.example/rotate", "old-secret-0001");
       const before = nowSec();
       const res = await rotate(hook.id);
       assert.equal(res.status, 200);
@@ -130,7 +130,7 @@ describe("webhook management", () => {
       assert.notEqual(rotation.secret, "old-secret-0001");
       assert.ok(rotation.previousSecretExpiresAt! >= before + OVERLAP_S && rotation.previousSecretExpiresAt! <= nowSec() + OVERLAP_S);
       assert.deepEqual(
-        dispatcher.listForMerchant(merchant).find((w) => w.id === hook.id)?.secretLast4,
+        (await dispatcher.listForMerchant(merchant)).find((w) => w.id === hook.id)?.secretLast4,
         rotation.secret.slice(-4),
         "the list shows the new secret's last four",
       );
@@ -146,7 +146,7 @@ describe("webhook management", () => {
     });
 
     test("the old secret stops signing once the overlap has passed", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/expired", "old-secret-0002");
+      const hook = await dispatcher.register(merchant, "https://m.example/expired", "old-secret-0002");
       const rotation = (await (await rotate(hook.id)).json()) as WebhookRotation;
       db.prepare("UPDATE webhooks SET previous_secret_expires_at = ? WHERE id = ?").run(nowSec() - 1, hook.id);
 
@@ -159,8 +159,8 @@ describe("webhook management", () => {
 
     test("an overlap of zero retires the old secret at once", async () => {
       const immediate = new WebhookDispatcher({ db, fetchImpl: fetchImpl as typeof fetch, secretOverlapSeconds: 0 });
-      const hook = immediate.register(merchant, "https://m.example/leaked", "leaked-secret");
-      const rotation = immediate.rotateSecret(merchant, hook.id)!;
+      const hook = await immediate.register(merchant, "https://m.example/leaked", "leaked-secret");
+      const rotation = (await immediate.rotateSecret(merchant, hook.id))!;
       assert.equal(rotation.previousSecretExpiresAt, null);
       const row = db.prepare("SELECT previous_secret FROM webhooks WHERE id = ?").get(hook.id) as { previous_secret: string | null };
       assert.equal(row.previous_secret, null);
@@ -171,7 +171,7 @@ describe("webhook management", () => {
     });
 
     test("needs the merchant's proof, and only rotates the merchant's own live webhook", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/guarded", "guarded-secret");
+      const hook = await dispatcher.register(merchant, "https://m.example/guarded", "guarded-secret");
       assert.equal((await post(`/api/webhooks/${hook.id}/rotate`, { ...proof("payflow-webhook-rotate:v1", hook.id), signature: proof("payflow-webhook-delete:v1", hook.id).signature })).status, 401);
       assert.equal((await post(`/api/webhooks/${hook.id}/rotate`, proof("payflow-webhook-rotate:v1", hook.id, merchantKey, nowSec() - 11 * 60))).status, 401);
       assert.equal((await rotate(hook.id, otherKey)).status, 404, "another merchant's webhook");
@@ -187,7 +187,7 @@ describe("webhook management", () => {
 
   describe("sending a test event", () => {
     test("delivers a ping signed exactly like a charge and reports status and latency", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/ping", "ping-secret");
+      const hook = await dispatcher.register(merchant, "https://m.example/ping", "ping-secret");
       calls.length = 0;
       charge(2n, "tx-before-ping");
       await flush();
@@ -215,19 +215,19 @@ describe("webhook management", () => {
     });
 
     test("a failing endpoint is reported and retried on the normal path", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/ping-down", "down-secret");
+      const hook = await dispatcher.register(merchant, "https://m.example/ping-down", "down-secret");
       script.set("https://m.example/ping-down", [503]);
       const before = nowSec();
       const result = (await (await ping(hook.id)).json()) as WebhookTestResult;
       assert.equal(result.status, "pending");
       assert.equal(result.statusCode, 503);
       assert.ok(result.nextRetryAt! >= before + 120 && result.nextRetryAt! <= nowSec() + 120, "first retry in two minutes");
-      assert.equal(dispatcher.pendingCount(hook.id), 1);
+      assert.equal(await dispatcher.pendingCount(hook.id), 1);
 
       db.prepare("UPDATE webhook_deliveries SET retry_at = ? WHERE id = ?").run(before - 1, result.deliveryId);
       const pass = await dispatcher.retryDue(before);
       assert.equal(pass.delivered, 1);
-      assert.equal(dispatcher.pendingCount(hook.id), 0);
+      assert.equal(await dispatcher.pendingCount(hook.id), 0);
 
       script.set("https://m.example/ping-down", ["throw"]);
       const unreachable = (await (await ping(hook.id)).json()) as WebhookTestResult;
@@ -236,7 +236,7 @@ describe("webhook management", () => {
     });
 
     test("needs the merchant's proof and a webhook that is receiving deliveries", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/ping-guarded", "s");
+      const hook = await dispatcher.register(merchant, "https://m.example/ping-guarded", "s");
       assert.equal((await ping(hook.id, otherKey)).status, 404);
       assert.equal((await post(`/api/webhooks/${hook.id}/test`, { ...proof("payflow-webhook-test:v1", hook.id), signature: "bm90" })).status, 401);
       assert.equal((await post(`/api/webhooks/${hook.id}/test`, {})).status, 400);
@@ -247,7 +247,7 @@ describe("webhook management", () => {
 
   describe("delivery history", () => {
     test("a delivery that failed and then succeeded shows both attempts", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/flaky", "flaky-secret");
+      const hook = await dispatcher.register(merchant, "https://m.example/flaky", "flaky-secret");
       script.set("https://m.example/flaky", [500]);
       const before = nowSec();
       charge(3n, "tx-flaky");
@@ -278,22 +278,22 @@ describe("webhook management", () => {
     });
 
     test("keeps only the newest 100 attempts per webhook", async () => {
-      const busy = dispatcher.register(merchant, "https://m.example/busy", "busy");
-      const quiet = dispatcher.register(merchant, "https://m.example/quiet", "quiet");
+      const busy = await dispatcher.register(merchant, "https://m.example/busy", "busy");
+      const quiet = await dispatcher.register(merchant, "https://m.example/quiet", "quiet");
       await dispatcher.ping(merchant, quiet.id);
       const deliveryIds: number[] = [];
       for (let i = 0; i < 105; i += 1) deliveryIds.push((await dispatcher.ping(merchant, busy.id))!.deliveryId);
 
       const rows = (db.prepare("SELECT COUNT(*) AS n FROM webhook_attempts WHERE webhook_id = ?").get(busy.id) as { n: number }).n;
       assert.equal(rows, 100, "older rows are pruned from the table, not just hidden");
-      const kept = dispatcher.history(merchant, busy.id)!;
+      const kept = (await dispatcher.history(merchant, busy.id))!;
       assert.equal(kept.length, 100);
       assert.deepEqual(kept.map((d) => d.deliveryId), deliveryIds.slice(5).reverse(), "the newest 100, newest first");
-      assert.equal(dispatcher.history(merchant, quiet.id)!.length, 1, "another webhook's history is untouched");
+      assert.equal((await dispatcher.history(merchant, quiet.id))!.length, 1, "another webhook's history is untouched");
     });
 
     test("needs the merchant's proof; a deleted webhook keeps its history", async () => {
-      const hook = dispatcher.register(merchant, "https://m.example/history", "h");
+      const hook = await dispatcher.register(merchant, "https://m.example/history", "h");
       await dispatcher.ping(merchant, hook.id);
       assert.equal((await history(hook.id, otherKey)).status, 404, "another merchant's webhook");
       const stale = proof("payflow-webhook-deliveries:v1", hook.id, merchantKey, nowSec() - 11 * 60);

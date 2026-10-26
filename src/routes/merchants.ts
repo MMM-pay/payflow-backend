@@ -1,5 +1,5 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import {
   getMerchantProfile,
   getMerchantSummary,
@@ -141,13 +141,13 @@ function occurrencesIn(
 
 /** `GET /merchants/:address/summary`. */
 export function merchantsRouter(
-  db: DatabaseSync,
+  db: Storage,
   cache: MerchantSummaryCache = defaultMerchantSummaryCache,
   defaultToken?: string,
 ): Router {
   const r = Router();
 
-  r.get("/merchants/:address/summary", (req, res) => {
+  r.get("/merchants/:address/summary", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
 
@@ -158,7 +158,7 @@ export function merchantsRouter(
       return;
     }
 
-    const body = getMerchantSummary(db, address.value, defaultToken);
+  const body = await getMerchantSummary(db, address.value, defaultToken);
     cache.set(cacheKey, body);
     res.json(body);
   });
@@ -168,11 +168,11 @@ export function merchantsRouter(
    * last set through the plan registry's `set_profile`. Self-declared: the
    * contract does not verify either, so neither does this route.
    */
-  r.get("/merchants/:address/profile", (req, res) => {
+  r.get("/merchants/:address/profile", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
 
-    const body: MerchantProfile | undefined = getMerchantProfile(db, address.value);
+    const body: MerchantProfile | undefined = await getMerchantProfile(db, address.value);
     if (!body) {
       sendApiError(res, req, 404, "profile_not_found");
       return;
@@ -186,7 +186,7 @@ export function merchantsRouter(
    * long each has been due, longest overdue first. The same funded test as
    * `/due`, so the balance can trail the chain the same way.
    */
-  r.get("/merchants/:address/unpaid", (req, res) => {
+  r.get("/merchants/:address/unpaid", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
@@ -196,21 +196,22 @@ export function merchantsRouter(
     const body: MerchantUnpaidResponse = {
       merchant: address.value,
       now,
-      unpaid: listMerchantUnpaidMandates(db, address.value, now, limitOf(limit.value)),
+      unpaid: await listMerchantUnpaidMandates(db, address.value, now, limitOf(limit.value)),
     };
     res.json(body);
   });
 
   /** The merchant's distinct subscribers, grouped by lifetime value. */
-  r.get("/merchants/:address/subscribers", (req, res) => {
+  r.get("/merchants/:address/subscribers", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
+    const subscribers = await listMerchantSubscribers(db, address.value, limitOf(limit.value));
     const body: MerchantSubscribersResponse = {
       merchant: address.value,
-      subscribers: listMerchantSubscribers(db, address.value, limitOf(limit.value)).map(
+      subscribers: subscribers.map(
         (sub) => {
           // A charge's amount is the merchant's share, so the collected sum
           // is already the lifetime value net of fee.
@@ -228,7 +229,7 @@ export function merchantsRouter(
    * bucket. Both the cohort and the departures follow ledger close times;
    * `limit` keeps the most recent cohorts.
    */
-  r.get("/merchants/:address/cohorts", (req, res) => {
+  r.get("/merchants/:address/cohorts", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
@@ -236,7 +237,7 @@ export function merchantsRouter(
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
-    const body: MerchantCohortsResponse = getMerchantCohorts(
+    const body: MerchantCohortsResponse = await getMerchantCohorts(
       db,
       address.value,
       churnBucketSize(bucket.value),
@@ -255,7 +256,7 @@ export function merchantsRouter(
    * bucketed by the ledger close time of each event, so they are the chain's
    * own history rather than the indexer's view of it.
    */
-  r.get("/merchants/:address/churn", (req, res) => {
+  r.get("/merchants/:address/churn", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
@@ -263,7 +264,7 @@ export function merchantsRouter(
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
-    const body: MerchantChurnResponse = getMerchantChurn(
+    const body: MerchantChurnResponse = await getMerchantChurn(
       db,
       address.value,
       churnBucketSize(bucket.value),
@@ -282,7 +283,7 @@ export function merchantsRouter(
    * range in unix seconds; without them the report covers the merchant's
    * whole history.
    */
-  r.get("/merchants/:address/revenue", (req, res) => {
+  r.get("/merchants/:address/revenue", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
@@ -294,7 +295,7 @@ export function merchantsRouter(
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 
-    const body: MerchantRevenueResponse = getMerchantRevenue(
+    const body: MerchantRevenueResponse = await getMerchantRevenue(
       db,
       address.value,
       churnBucketSize(bucket.value),
@@ -334,7 +335,7 @@ export function merchantsRouter(
 
     let after: Parameters<typeof listMerchantChargesAfter>[2] = null;
     for (;;) {
-      const rows = listMerchantChargesAfter(
+      const rows = await listMerchantChargesAfter(
         db,
         address.value,
         after,
@@ -377,7 +378,7 @@ export function merchantsRouter(
   });
 
   /** Projected charges over the next `days`, net of the protocol fee. */
-  r.get("/merchants/:address/forecast", (req, res) => {
+  r.get("/merchants/:address/forecast", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));
@@ -387,7 +388,7 @@ export function merchantsRouter(
     const from = Math.floor(Date.now() / 1000);
     const to = from + window * DAY_S;
 
-    const mandates = listMerchantForecastMandates(db, address.value);
+    const mandates = await listMerchantForecastMandates(db, address.value);
 
     let net = 0n;
     let counted = 0;
@@ -420,4 +421,3 @@ export function merchantsRouter(
 
   return r;
 }
-

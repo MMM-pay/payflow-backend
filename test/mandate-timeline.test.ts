@@ -4,6 +4,7 @@ import express from "express";
 import { openDatabase } from "../src/lib/db.ts";
 import { Indexer } from "../src/indexer.ts";
 import { mandatesRouter } from "../src/routes/mandates.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 import type { TokenMetadataService } from "../src/lib/tokens.ts";
 
@@ -34,10 +35,10 @@ test("mandate timeline covers all six event types and is unchanged by replay", a
     make("mandate_completed", "tx-7"),
   ];
   try {
-    for (const event of events) assert.equal(indexer.apply(event), "applied");
+    for (const event of events) assert.equal(await indexer.apply(event), "applied");
     const before = db.prepare("SELECT * FROM mandate_timeline ORDER BY ledger, tx_hash, kind").all();
     assert.equal(before.length, 7);
-    for (const event of events) assert.equal(indexer.apply(event), "applied");
+    for (const event of events) assert.equal(await indexer.apply(event), "applied");
     assert.deepEqual(db.prepare("SELECT * FROM mandate_timeline ORDER BY ledger, tx_hash, kind").all(), before);
     assert.deepEqual(before.map(row => row.kind), events.map(e => e.name));
     const charged = before.find(row => row.kind === "charged");
@@ -45,7 +46,7 @@ test("mandate timeline covers all six event types and is unchanged by replay", a
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM mandate_events").get() as { n: number }).n, 2);
 
     const app = express();
-    app.use("/api", mandatesRouter(db, {} as TokenMetadataService));
+    app.use("/api", mandatesRouter(asStorage(db), {} as TokenMetadataService));
     const server = app.listen(0);
     try {
       const address = server.address();

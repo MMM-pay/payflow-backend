@@ -7,6 +7,7 @@ import { createApp } from "../src/app.ts";
 import { loadConfig, type Config } from "../src/config.ts";
 import { Indexer } from "../src/indexer.ts";
 import { getProtocolFeeHistory } from "../src/lib/queries.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import type { AdminHooks, AdminToken } from "../src/routes/admin.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 
@@ -104,16 +105,16 @@ describe("version endpoint", () => {
 });
 
 describe("contract upgrades", () => {
-  test("an upgraded event shows up as the contract's current code version", () => {
+  test("an upgraded event shows up as the contract's current code version", async () => {
     const db = openDatabase(":memory:");
     const ix = new Indexer(db, {} as never, {} as never);
     const hash = Buffer.alloc(32, 0xab);
     const event = (ledger: number, tx: string, h: Buffer): DecodedEvent =>
       ({ name: "upgraded", contractId: C, ledger, txHash: tx, topics: [], data: { new_wasm_hash: h }, closeTime: 1_800_000_000 }) as unknown as DecodedEvent;
-    assert.equal(ix.apply(event(10, "tx-a", Buffer.alloc(32, 0x01))), "applied");
-    assert.equal(ix.apply(event(20, "tx-b", hash)), "applied");
-    ix.apply(event(20, "tx-b", hash)); // replay is a no-op
-    const body = getProtocolFeeHistory(db);
+    assert.equal(await ix.apply(event(10, "tx-a", Buffer.alloc(32, 0x01))), "applied");
+    assert.equal(await ix.apply(event(20, "tx-b", hash)), "applied");
+    await ix.apply(event(20, "tx-b", hash)); // replay is a no-op
+    const body = await getProtocolFeeHistory(asStorage(db));
     assert.deepEqual(body.contract_versions.map((r) => ({ ...r })), [{ contract_id: C, wasm_hash: hash.toString("hex"), ledger: 20 }]);
   });
 });

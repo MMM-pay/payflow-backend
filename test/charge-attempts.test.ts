@@ -3,6 +3,7 @@ import { after, before, describe, test } from "node:test";
 import type { Server } from "node:http";
 import express from "express";
 import { openDatabase } from "../src/lib/db.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import { mandatesRouter } from "../src/routes/mandates.ts";
 import type { TokenMetadataService } from "../src/lib/tokens.ts";
 import type { ChargeAttemptPage } from "../src/routes/types.ts";
@@ -39,7 +40,7 @@ describe("mandate charge attempts", () => {
     attempt.run(1, 10_180, "settled", null, TX, null, 0, null);
 
     const app = express();
-    app.use("/api", mandatesRouter(db, {} as TokenMetadataService));
+    app.use("/api", mandatesRouter(asStorage(db), {} as TokenMetadataService));
     await new Promise<void>((resolve) => {
       server = app.listen(0, "127.0.0.1", () => resolve());
     });

@@ -161,7 +161,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   // Runtime indexer control. Pause holds the scheduled passes back; the API
   // keeps serving the projection as it stands. The body reports the new state
   // so an operator can confirm the switch took.
-  r.post("/indexer/pause", (req, res) => {
+  r.post("/indexer/pause", async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "indexer")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -172,10 +172,10 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
       sendApiError(res, req, 503, "indexer_unavailable");
       return;
     }
-    res.json({ status: "ok", paused: true, result: pause() ?? null });
+    res.json({ status: "ok", paused: true, result: (await pause()) ?? null });
   });
 
-  r.post("/indexer/resume", (req, res) => {
+  r.post("/indexer/resume", async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "indexer")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -186,7 +186,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
       sendApiError(res, req, 503, "indexer_unavailable");
       return;
     }
-    res.json({ status: "ok", paused: false, result: resume() ?? null });
+    res.json({ status: "ok", paused: false, result: (await resume()) ?? null });
   });
 
   r.post("/data/prune", async (req, res) => {
@@ -199,23 +199,23 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     await respond(req, res, "prune_failed", () => prune(daysToKeep));
   });
 
-  r.get("/audit-logs", (req, res) => {
+  r.get("/audit-logs", async (req, res) => {
     const read = hooks.getAuditLogs;
     if (!read) {
       sendApiError(res, req, 503, "audit_unavailable");
       return;
     }
     const limit = Math.min(1000, Math.max(1, Number(req.query.limit ?? 100)));
-    res.json({ status: "ok", logs: read(limit) ?? [] });
+    res.json({ status: "ok", logs: (await read(limit)) ?? [] });
   });
 
-  r.get("/past-due", (req, res) => {
+  r.get("/past-due", async (req, res) => {
     const read = hooks.getPastDueMandates;
     if (!read) {
       sendApiError(res, req, 503, "indexer_unavailable");
       return;
     }
-    res.json({ status: "ok", past_due: read() ?? [] });
+    res.json({ status: "ok", past_due: (await read()) ?? [] });
   });
 
   return r;

@@ -8,6 +8,9 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import helmet from "helmet";
 import { pinoHttp } from "pino-http";
 import type { DatabaseSync } from "node:sqlite";
+import { SqliteStorage } from "./lib/store/sqlite.ts";
+import { asStorage } from "./lib/store/index.ts";
+import type { Storage } from "./lib/store/types.ts";
 import type { Config, NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
 import { buildAdminRoutes, type AdminHooks, type AdminToken } from "./routes/admin.ts";
@@ -122,7 +125,7 @@ function lagOf(indexer: IndexerStatus | undefined): number | null {
 
 export interface NetworkRuntime {
   config: NetworkConfig;
-  db: DatabaseSync;
+  db: Storage | DatabaseSync;
   events?: EventEmitter | undefined;
   indexer?: IndexerStatus | undefined;
   summaryCache?: MerchantSummaryCache | undefined;
@@ -237,7 +240,7 @@ export function createApp(
           startLedger: config.INDEXER_START_LEDGER ?? 0,
           databasePath: config.DATABASE_PATH ?? ":memory:",
         },
-        db,
+        db: new SqliteStorage(db),
         indexer,
         summaryCache: merchantCache,
         rpc,
@@ -352,7 +355,7 @@ export function createApp(
   // Prometheus metrics. Opt-in: without METRICS_ENABLED the path does not
   // exist and answers 404 like any other unknown route.
   if (config.METRICS_ENABLED) {
-    app.get("/metrics", (_req, res) => {
+    app.get("/metrics", async (_req, res) => {
       // The gauges describe the projection as it stands, not as it stood
       // after the last pass, so they are refreshed before the render. The
       // business gauges are re-read the same way — one short indexed query
@@ -360,7 +363,7 @@ export function createApp(
       // without an attached indexer.
       for (const rt of runtimes) {
         if (rt.indexer) publishIndexerMetrics(rt.indexer, rt.config.name);
-        publishBusinessMetrics(rt.db, rt.config.name);
+        await publishBusinessMetrics(asStorage(rt.db), rt.config.name);
       }
       res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
       res.setHeader("Cache-Control", "no-store");

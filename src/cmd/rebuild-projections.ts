@@ -16,7 +16,7 @@ for (const network of networkConfigs(config)) {
   try {
     // Rebuild does not make RPC calls; the server is only a constructor dependency.
     const indexer = new Indexer(db, makeRpc(network), network);
-    const applied = indexer.rebuildProjections();
+    const applied = await indexer.rebuildProjections();
     logger.info({ network: network.name, applied }, "projections rebuilt from local events");
   } catch {
     failed = true;

@@ -3,6 +3,7 @@ import { after, before, describe, test } from "node:test";
 import type { Server } from "node:http";
 import express from "express";
 import { openDatabase } from "../src/lib/db.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import { Indexer } from "../src/indexer.ts";
 import { getPlanStats } from "../src/lib/queries.ts";
 import { plansRouter } from "../src/routes/plans.ts";
@@ -100,16 +101,17 @@ const FIXTURE: DecodedEvent[] = [
 
 describe("lifetime value", () => {
   const db = openDatabase(":memory:");
+  const store = asStorage(db);
   let server: Server;
   let base = "";
 
   before(async () => {
     const indexer = new Indexer(db, {} as never, {} as never);
-    for (const event of FIXTURE) assert.equal(indexer.apply(event), "applied");
+    for (const event of FIXTURE) assert.equal(await indexer.apply(event), "applied");
 
     const app = express();
-    app.use("/api", plansRouter(db, {} as TokenMetadataService));
-    app.use("/api", merchantsRouter(db, new MerchantSummaryCache()));
+    app.use("/api", plansRouter(store, {} as TokenMetadataService));
+    app.use("/api", merchantsRouter(store, new MerchantSummaryCache()));
     await new Promise<void>((resolve) => {
       server = app.listen(0, "127.0.0.1", () => resolve());
     });
@@ -123,20 +125,20 @@ describe("lifetime value", () => {
     db.close();
   });
 
-  test("a plan's average and median match the hand calculation", () => {
-    const odd = getPlanStats(db, 1);
+  test("a plan's average and median match the hand calculation", async () => {
+    const odd = await getPlanStats(store, 1);
     assert.equal(odd.averageLtv, 13_200_000n);
     assert.equal(odd.medianLtv, 9_900_000n);
 
-    const even = getPlanStats(db, 2);
+    const even = await getPlanStats(store, 2);
     assert.equal(even.averageLtv, 2_475_005n, "the mean is rounded down");
     assert.equal(even.medianLtv, 2_475_005n, "the mean of the middle two is rounded down");
 
-    const empty = getPlanStats(db, 3);
+    const empty = await getPlanStats(store, 3);
     assert.equal(empty.averageLtv, 0n);
     assert.equal(empty.medianLtv, 0n);
 
-    const large = getPlanStats(db, 4);
+    const large = await getPlanStats(store, 4);
     assert.equal(large.averageLtv, BEYOND_FLOAT);
     assert.equal(large.medianLtv, BEYOND_FLOAT);
   });
@@ -168,9 +170,9 @@ describe("lifetime value", () => {
   });
 
   test("replaying the charges leaves every lifetime value unchanged", async () => {
-    const before = getPlanStats(db, 1);
+    const before = await getPlanStats(store, 1);
     const indexer = new Indexer(db, {} as never, {} as never);
-    for (const event of FIXTURE) indexer.apply(event);
-    assert.deepEqual(getPlanStats(db, 1), before);
+    for (const event of FIXTURE) await indexer.apply(event);
+    assert.deepEqual(await getPlanStats(store, 1), before);
   });
 });

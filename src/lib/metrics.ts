@@ -21,7 +21,7 @@
  *   value as text anyway.
  */
 
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "./store/types.ts";
 import { SECONDS_PER_MONTH } from "../routes/helpers.ts";
 import { logger } from "./logger.ts";
 
@@ -316,10 +316,10 @@ export interface BusinessMetrics {
  * range (any mandate over ~35,500 units of the token), which would round the
  * very figures this gauge exists to chart. Money stays a string, end to end.
  */
-export function readBusinessMetrics(db: DatabaseSync): BusinessMetrics {
-  const rows = db
-    .prepare("SELECT merchant, amount, period FROM mandates WHERE status = 'Active'")
-    .all() as unknown as Array<{ merchant: string; amount: string; period: number }>;
+export async function readBusinessMetrics(db: Storage): Promise<BusinessMetrics> {
+  const rows = await db.all<{ merchant: string; amount: string; period: number }>(
+    "SELECT merchant, amount, period FROM mandates WHERE status = 'Active'",
+  );
 
   const month = BigInt(SECONDS_PER_MONTH);
   const merchants = new Set<string>();
@@ -353,9 +353,9 @@ export function readBusinessMetrics(db: DatabaseSync): BusinessMetrics {
  * and left for the next refresh: one bad scrape of business numbers must not
  * take the indexer loop down with it.
  */
-export function publishBusinessMetrics(db: DatabaseSync, network: string): void {
+export async function publishBusinessMetrics(db: Storage, network: string): Promise<void> {
   try {
-    const business = readBusinessMetrics(db);
+    const business = await readBusinessMetrics(db);
     const labels = { network };
     metrics.set("active_mandates", business.activeMandates, labels);
     metrics.set("active_merchants", business.activeMerchants, labels);

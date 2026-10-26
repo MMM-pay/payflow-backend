@@ -1,6 +1,6 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
+import type { Storage } from "../lib/store/types.ts";
 import { sendApiError } from "./errors.ts";
 import { listRawContractEvents } from "../lib/queries.ts";
 
@@ -26,9 +26,9 @@ function parseAfter(value: string): [number, string] | null {
  * instead of changing that storage contract or silently skipping matches.
  * (ledger, event_id) is a stable unique ordering even for events in one tx.
  */
-export function rawEventsRouter(db: DatabaseSync): Router {
+export function rawEventsRouter(db: Storage): Router {
   const router = Router();
-  router.get("/events", (req, res) => {
+  router.get("/events", async (req, res) => {
     const contract = req.query.contract;
     const name = req.query.name;
     const after = req.query.after;
@@ -55,7 +55,7 @@ export function rawEventsRouter(db: DatabaseSync): Router {
     let id = start[1];
     let exhausted = false;
     while (items.length <= PAGE_SIZE && !exhausted) {
-      const rows = listRawContractEvents(db, ledger, id, contract as string | undefined, SCAN_SIZE);
+      const rows = await listRawContractEvents(db, ledger, id, contract as string | undefined, SCAN_SIZE);
       if (rows.length < SCAN_SIZE) exhausted = true;
       for (const row of rows) {
         ledger = row.ledger;
