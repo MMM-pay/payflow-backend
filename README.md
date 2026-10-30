@@ -889,6 +889,7 @@ examined without API downtime.
 | `TOKEN_ID` | — | Default token for the flat merchant-summary amounts. Unset, they span every token |
 | `NETWORKS` | *(empty)* | Extra networks to serve, comma-separated (see below) |
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
+| `RUN_API`, `RUN_INDEXER`, `RUN_KEEPER` | `true` | Set one to `false` to leave that part out of this process, so the API, the indexer and the keeper can run as separate processes on the same database. Only the process running the indexer takes the database lock. Several API processes need Postgres; with SQLite run one |
 | `KEEPER_DRY_RUN` | `false` | Rehearse each pass: simulate every due charge and log the outcome without signing or submitting anything |
 | `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
