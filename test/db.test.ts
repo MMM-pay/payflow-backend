@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
-import { openDatabase } from "../src/lib/db.ts";
+import { openDatabase, backupDatabase, writeCursor } from "../src/lib/db.ts";
 
 type Db = ReturnType<typeof openDatabase>;
 
@@ -73,6 +73,72 @@ describe("summary query indexes", () => {
     assert.match(paid, /COVERING INDEX/);
     assert.doesNotMatch(paid, /SCAN charges\b/);
     db.close();
+  });
+});
+
+describe("database backup", () => {
+  test("produces a consistent copy that opens and reads the same data", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "payflow-backup-"));
+    try {
+      const primary = path.join(dir, "primary.db");
+      const backup = path.join(dir, "backup.db");
+
+      const db = openDatabase(primary);
+      // Seed some data through the projection tables.
+      db.prepare("INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger) VALUES (1, 'M', 'Pro', 'T', '1000', 2592000, 1, 100)").run();
+      db.prepare("INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, last_charge, charges_made, max_charges, fee_bps, status, ledger) VALUES (1, 'S', 'M', 1, '1000', 2592000, 1700000000, 0, 0, 0, 100, 'Active', 100)").run();
+      db.prepare("INSERT INTO charges (tx_hash, mandate_id, subscriber, merchant, amount, fee, charges_made, next_charge, ledger, created_at) VALUES ('tx-1', 1, 'S', 'M', '990', '10', 1, 1700000000, 100, 1700000000)").run();
+      writeCursor(db, 100);
+      db.close();
+
+      backupDatabase(openDatabase(primary), backup);
+
+      const copy = openDatabase(backup);
+      const plan = copy.prepare("SELECT * FROM plans WHERE id = 1").get() as { name: string; amount: string };
+      assert.equal(plan.name, "Pro");
+      assert.equal(plan.amount, "1000");
+
+      const mandate = copy.prepare("SELECT * FROM mandates WHERE id = 1").get() as { status: string; charges_made: number };
+      assert.equal(mandate.status, "Active");
+      assert.equal(mandate.charges_made, 0);
+
+      const charge = copy.prepare("SELECT COUNT(*) AS n FROM charges").get() as { n: number };
+      assert.equal(charge.n, 1);
+
+      const cursor = copy.prepare("SELECT last_ledger FROM cursor WHERE id = 1").get() as { last_ledger: number };
+      assert.equal(cursor.last_ledger, 100);
+
+      copy.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("backup of an in-memory database writes a readable file", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "payflow-backup-"));
+    try {
+      const backup = path.join(dir, "mem-backup.db");
+
+      const db = openDatabase(":memory:");
+      db.prepare("INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger) VALUES (1, 'M', 'Pro', 'T', '1000', 2592000, 1, 100)").run();
+      db.close();
+
+      backupDatabase(openDatabase(":memory:"), backup);
+      assert.ok(fs.existsSync(backup), "backup file was created");
+      assert.ok(fs.statSync(backup).size > 0, "backup file is not empty");
+
+      fs.rmSync(dir, { recursive: true, force: true });
+    } finally {
+      // no-op: cleaned in try
+    }
   });
 });
 

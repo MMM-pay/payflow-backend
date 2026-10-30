@@ -467,3 +467,12 @@ export async function getPastDueMandates(db: Storage): Promise<Array<{ mandate_i
     "SELECT mandate_id, first_past_due_at FROM past_due_mandates WHERE still_past_due = 1 ORDER BY first_past_due_at ASC",
   );
 }
+
+/** Back up the database to `backupPath` with a transactionally consistent snapshot. */
+export function backupDatabase(db: DatabaseSync, backupPath: string): void {
+  // Checkpoint the WAL so the main file holds all committed data before we
+  // copy it; `VACUUM INTO` then produces a self-contained, consistent
+  // database file at `backupPath` while the live database keeps running.
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+}
