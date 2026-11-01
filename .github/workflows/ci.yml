@@ -113,7 +113,7 @@ jobs:
       DATABASE_URL: postgres://payflow:payflow@localhost:5432/payflow_test
       LOG_LEVEL: fatal
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
