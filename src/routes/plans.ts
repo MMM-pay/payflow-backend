@@ -43,6 +43,7 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
       rows.map(async (row) => ({
         ...row,
         ...(await tokenFields(tokens, row.token)),
+        open: row.active === 1,
         merchantName: names.get(row.merchant) ?? null,
       })),
     );
@@ -120,6 +121,10 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
       sendApiError(res, req, 404, "plan_not_found");
       return;
     }
+    if (row.active !== 1) {
+      sendApiError(res, req, 410, "plan_gone");
+      return;
+    }
     const [plan] = await enrich([row]);
     res.json(plan);
   });
@@ -132,8 +137,13 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
     if (!id.ok) return;
     const planId = id.value;
 
-    if (!(await getPlanById(db, planId))) {
+    const plan = await getPlanById(db, planId);
+    if (!plan) {
       sendApiError(res, req, 404, "plan_not_found");
+      return;
+    }
+    if (plan.active !== 1) {
+      sendApiError(res, req, 410, "plan_gone");
       return;
     }
     const stats = await getPlanStats(db, planId);

@@ -60,6 +60,10 @@ release that ships them numbers them here.
 
 ### Added
 
+- `open` on every plan in `/api/plans` — true while the plan accepts new
+  subscribers, false once it is closed (#358).
+- `410 plan_gone` for `GET /api/plans/:id` and `/stats` on a deactivated
+  plan; a plan that never existed stays `404 plan_not_found` (#361).
 - `/api/v1/...` — every route under a versioned root (#173). `/api/...`
   keeps answering the same routes as an alias, from the same router and the
   same projection, so existing clients are unaffected. A breaking change

@@ -412,6 +412,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
           },
           "400": invalidRequest(),
           "404": notFound("plan_not_found", "plan"),
+          "410": errorResponse('The plan was deactivated and is gone (error.code = "plan_gone").'),
         },
       },
     },
@@ -432,6 +433,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
           },
           "400": invalidRequest(),
           "404": notFound("plan_not_found", "plan"),
+          "410": errorResponse('The plan was deactivated and is gone (error.code = "plan_gone").'),
         },
       },
     },
@@ -1716,6 +1718,7 @@ function componentSchemas(): Record<string, SchemaObject> {
             amount: amount(),
             period: { type: "integer", description: "The billing period in seconds." },
             active: { type: "integer", description: "1 when the plan is published, 0 when it is not." },
+            open: { type: "boolean", description: "True while the plan accepts new subscribers (`active` is 1); false once it is closed." },
             ledger: { type: "integer" },
             merchantName: {
               type: ["string", "null"],

@@ -737,6 +737,7 @@ the server's public key as `SIGNING_KEY` and the endpoint as
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
 | `plan_not_found` | 404 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` with no such plan |
+| `plan_gone` | 410 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` for a plan that was deactivated; a plan that never existed is `plan_not_found` (404). Plans in lists carry `open`, false once closed to new subscribers |
 | `mandate_not_found` | 404 | `GET /api/mandates/:id` or `GET /api/mandates/:id/charges` with no such mandate |
 | `profile_not_found` | 404 | `GET /api/merchants/:address/profile` for a merchant that has not set a profile |
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |

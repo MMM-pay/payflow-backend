@@ -11,6 +11,7 @@ import type { Request, Response } from "express";
 export type ApiErrorCode =
   | "not_found"
   | "plan_not_found"
+  | "plan_gone"
   | "mandate_not_found"
   | "profile_not_found"
   | "invalid_ids"
@@ -77,6 +78,7 @@ export interface ApiErrorBody {
 const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   not_found: "The requested resource was not found.",
   plan_not_found: "No plan exists with that id.",
+  plan_gone: "This plan was deactivated and is no longer available.",
   mandate_not_found: "No mandate exists with that id.",
   profile_not_found: "The merchant has not set a profile.",
   invalid_ids: "The `ids` parameter must be a comma-separated list of positive integers.",
