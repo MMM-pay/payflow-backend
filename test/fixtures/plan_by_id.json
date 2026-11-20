@@ -9,5 +9,6 @@
   "ledger": 1,
   "tokenSymbol": null,
   "decimals": null,
+  "open": true,
   "merchantName": null
 }

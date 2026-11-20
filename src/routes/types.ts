@@ -46,6 +46,8 @@ export interface PlanRow extends TokenFields {
   amount: string;
   period: number;
   active: number;
+  /** True while the plan accepts new subscribers (`active` is 1). */
+  open?: boolean;
   ledger: number;
   /**
    * The merchant's self-declared display name (see {@link MerchantProfile});
