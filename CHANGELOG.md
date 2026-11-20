@@ -270,6 +270,12 @@ All notable changes to payflow-backend. The format follows
   `test/replay.test.ts` replays them through `decodeEvent` and the projection,
   asserts the resulting database state matches a committed snapshot, and proves
   that replaying the fixture twice leaves the database unchanged.
+- **Structured indexer progress every N ledgers (#359).** Each time the cursor
+  moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000; `0` turns it off)
+  the indexer logs one `indexer progress` line with the network, cursor,
+  latest ledger, how far behind it is, the ledgers and events since the last
+  line and the rate in ledgers per second, so a long catch-up shows movement
+  even through ranges with no events.
 
 ### Changed
 

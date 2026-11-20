@@ -189,6 +189,13 @@ const schema = z.object({
    * this to 1 for strictly sequential reads.
    */
   INDEXER_FETCH_CONCURRENCY: z.coerce.number().int().positive().max(16).default(4),
+  /**
+   * How many ledgers the indexer advances between two `indexer progress`
+   * log lines. A catch-up over a long range is otherwise silent between
+   * passes that apply no events; this gives operators a steady heartbeat of
+   * cursor, lag and rate. `0` turns the progress log off.
+   */
+  INDEXER_PROGRESS_LEDGERS: z.coerce.number().int().nonnegative().default(10_000),
 
   /**
    * Days to retain raw contract events before pruning. Events older than this
@@ -298,6 +305,8 @@ export interface NetworkConfig {
   archiveUrl?: string | undefined;
   /** Advance the cursor past a gap the RPC cannot serve. */
   allowGaps?: boolean | undefined;
+  /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
+  progressLedgers?: number | undefined;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -360,6 +369,7 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
     ...network,
     archiveUrl: config.ARCHIVE_URL,
     allowGaps: config.ALLOW_GAPS,
+    progressLedgers: config.INDEXER_PROGRESS_LEDGERS,
   }));
 }
 

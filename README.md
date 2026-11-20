@@ -224,6 +224,13 @@ in the builder, production dependencies only in the final image.
   applied in ledger order and the cursor advances only after a window is
   applied. Paging continues until a page is empty or passes the range end: a
   short page does not mean the range is exhausted.
+- **Catch-up progress is logged at a steady cadence.** Each time the cursor
+  moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000) the indexer logs
+  one `indexer progress` line with `network`, `cursor`, `latest`, `behind`,
+  the `ledgers` and `events` (and spec-`mismatched` events) since the last
+  line, and `ledgersPerSecond`. A long backfill shows movement even through
+  ranges with no events, and a caught-up indexer, which advances a few ledgers
+  per pass, stays quiet. `0` turns it off.
 - **Failing mandates back off.** A mandate whose charge fails (usually an
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
@@ -903,6 +910,7 @@ examined without API downtime.
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
+| `INDEXER_PROGRESS_LEDGERS` | `10000` | Ledgers between two `indexer progress` log lines (cursor, lag, events, ledgers per second); `0` turns them off |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
 | `ARCHIVE_URL` | *(empty)* | Full-history archive URL used to backfill the gap between the stored cursor and the oldest ledger the RPC still serves |

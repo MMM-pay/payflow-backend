@@ -24,6 +24,8 @@ export { parseCloseTime };
 /** RPC caps a single getEvents window; stay well inside it. */
 const LEDGER_WINDOW = 8_000;
 const PAGE_LIMIT = 200;
+/** Ledgers between two `indexer progress` log lines when none is configured. */
+const DEFAULT_PROGRESS_LEDGERS = 10_000;
 
 /** The RPC calls the indexer makes. Narrow so tests can supply a fake. */
 export type IndexerRpc = Pick<rpc.Server, "getLatestLedger" | "getHealth" | "getEvents">;
@@ -149,6 +151,68 @@ export class Indexer {
 
   /** The archive used to backfill a gap, if ARCHIVE_URL was configured. */
   private readonly archive: Archive | undefined;
+
+  /**
+   * Where the current progress interval started: the cursor, the wall-clock
+   * time, and the events applied and mismatched since then. Null until the
+   * first pass that reads ledgers.
+   */
+  private progress: { ledger: number; at: number; applied: number; mismatched: number } | null = null;
+
+  /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
+  private get progressLedgers(): number {
+    const setting =
+      "INDEXER_PROGRESS_LEDGERS" in this.config
+        ? this.config.INDEXER_PROGRESS_LEDGERS
+        : this.config.progressLedgers;
+    return setting ?? DEFAULT_PROGRESS_LEDGERS;
+  }
+
+  /**
+   * Log `indexer progress` once the cursor has moved `progressLedgers` past
+   * the start of the current interval, then start a new interval at the
+   * cursor. One line per interval, however many passes it took, so a long
+   * catch-up reports at a steady cadence and a caught-up indexer (a few
+   * ledgers per pass) stays quiet. Structured fields only: the network, the
+   * cursor and the latest ledger, how far behind it is, the ledgers and
+   * events covered since the last line, and the rate.
+   */
+  private reportProgress(
+    start: number,
+    startedAt: number,
+    cursor: number,
+    latest: number,
+    applied: number,
+    mismatched: number,
+  ): void {
+    const every = this.progressLedgers;
+    if (every <= 0) return;
+    const now = Date.now();
+    // A cursor that moved backwards (a reindex rewound it) starts afresh. A
+    // new interval starts when this pass did, so its rate covers the pass.
+    if (this.progress === null || start < this.progress.ledger) {
+      this.progress = { ledger: start, at: startedAt, applied: 0, mismatched: 0 };
+    }
+    this.progress.applied += applied;
+    this.progress.mismatched += mismatched;
+    const ledgers = cursor - this.progress.ledger;
+    if (ledgers < every) return;
+    const seconds = Math.max(0.001, (now - this.progress.at) / 1000);
+    logger.info(
+      {
+        network: this.networkLabel,
+        cursor,
+        latest,
+        behind: Math.max(0, latest - cursor),
+        ledgers,
+        events: this.progress.applied,
+        mismatched: this.progress.mismatched,
+        ledgersPerSecond: Math.round(ledgers / seconds),
+      },
+      "indexer progress",
+    );
+    this.progress = { ledger: cursor, at: now, applied: 0, mismatched: 0 };
+  }
 
   /** Advance past a gap the RPC cannot serve; accepts silent under-reporting. */
   private get allowGaps(): boolean {
@@ -380,6 +444,7 @@ export class Indexer {
       await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: this.status.cursor, latest: this.status.latest };
     }
+    const startedAt = Date.now();
     const latestRes = await this.server.getLatestLedger();
     const latest = latestRes.sequence;
     const latestCloseTime = parseCloseTime((latestRes as { closeTime?: unknown }).closeTime);
@@ -465,6 +530,8 @@ export class Indexer {
 
     this.status.cursor = cursor;
     this.updateFreshness(latestCloseTime, lastSeenCloseTime, cursor, latest);
+    // Windows applied before a failed fetch are real progress, so they count.
+    this.reportProgress(start, startedAt, cursor, latest, applied, mismatched);
     await this.publishMetrics(applied);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };

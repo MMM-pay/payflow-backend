@@ -428,6 +428,122 @@ describe("indexer sync", () => {
   });
 });
 
+describe("indexer progress log", () => {
+  /** Run `work` with `logger.info` captured; returns the `indexer progress` lines' fields. */
+  async function progressLines(work: () => Promise<unknown>): Promise<Record<string, unknown>[]> {
+    const lines: Record<string, unknown>[] = [];
+    mock.method(logger, "info", (...args: unknown[]): void => {
+      if (args[1] === "indexer progress") lines.push(args[0] as Record<string, unknown>);
+    });
+    try {
+      await work();
+    } finally {
+      mock.restoreAll();
+    }
+    return lines;
+  }
+
+  test("logs one structured line each time the cursor moves N ledgers", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = {
+      latest: 25_000,
+      oldest: 1,
+      events: [rawEvent(10, 1), rawEvent(9_000, 2), rawEvent(17_000, 3)],
+      calls: [],
+    };
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 10, progressLedgers: 16_000 }));
+
+    // Passes cover [10, 8010), [8010, 16010), [16010, 24010), [24010, 25000):
+    // the second reaches 16,000 ledgers, the last two together do not.
+    const lines = await progressLines(() => ix.catchUp());
+
+    assert.equal(lines.length, 1, "one line per 16,000 ledgers, not one per pass");
+    const line = lines[0]!;
+    assert.equal(line.network, "testnet");
+    assert.equal(line.cursor, 16_010);
+    assert.equal(line.latest, 25_000);
+    assert.equal(line.behind, 8_990);
+    assert.equal(line.ledgers, 16_000);
+    assert.equal(line.events, 2);
+    assert.equal(line.mismatched, 0);
+    assert.equal(typeof line.ledgersPerSecond, "number");
+    db.close();
+  });
+
+  test("the next interval starts where the last line left off", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = { latest: 40_010, oldest: 1, events: [rawEvent(20_000, 1)], calls: [] };
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 10, progressLedgers: 8_000 }));
+
+    const lines = await progressLines(() => ix.catchUp());
+
+    assert.deepEqual(
+      lines.map((line) => [line.cursor, line.ledgers, line.events]),
+      [
+        [8_010, 8_000, 0],
+        [16_010, 8_000, 0],
+        [24_010, 8_000, 1],
+        [32_010, 8_000, 0],
+        [40_010, 8_000, 0],
+      ],
+    );
+    db.close();
+  });
+
+  test("a caught-up indexer advancing a few ledgers per pass stays quiet", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = { latest: 1_005, oldest: 1, events: [], calls: [] };
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 1_000, progressLedgers: 100 }));
+
+    const lines = await progressLines(async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await ix.tick();
+        chain.latest += 5;
+      }
+    });
+
+    // Fifty ledgers in ten passes: below the 100-ledger cadence.
+    assert.deepEqual(lines, []);
+    db.close();
+  });
+
+  test("0 turns the progress log off", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = { latest: 30_000, oldest: 1, events: [], calls: [] };
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 10, progressLedgers: 0 }));
+
+    assert.deepEqual(await progressLines(() => ix.catchUp()), []);
+    db.close();
+  });
+
+  test("windows applied before a failed fetch still count toward progress", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = { latest: 25_000, oldest: 1, events: [rawEvent(10, 1)], calls: [] };
+    const base = fakeRpc(chain);
+    const flaky = {
+      ...base,
+      getEvents: async (req: Record<string, unknown>) => {
+        if (req.startLedger === 8_010) throw new Error("rpc unavailable");
+        return base.getEvents(req as never);
+      },
+    } as unknown as IndexerRpc;
+    const ix = new Indexer(db, flaky, {
+      ...config,
+      INDEXER_START_LEDGER: 10,
+      INDEXER_FETCH_CONCURRENCY: 3,
+      INDEXER_PROGRESS_LEDGERS: 8_000,
+    });
+
+    const lines = await progressLines(() => assert.rejects(() => ix.tick(), /rpc unavailable/));
+
+    assert.deepEqual(
+      lines.map((line) => [line.cursor, line.ledgers, line.events]),
+      [[8_010, 8_000, 1]],
+    );
+    db.close();
+  });
+});
+
 /** A keeper whose every charge fails at simulation, as an empty vault would. */
 function failingKeeper(db: ReturnType<typeof openDatabase>, failIds: Set<number>) {
   const attempted: number[] = [];

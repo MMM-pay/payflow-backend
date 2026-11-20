@@ -255,6 +255,14 @@ describe("network configs", () => {
     assert.equal(mainnet.databasePath, "/data/payflow-mainnet.db");
   });
 
+  test("every network carries the indexer progress cadence, 10,000 ledgers by default", () => {
+    assert.equal(loadConfig(env()).INDEXER_PROGRESS_LEDGERS, 10_000);
+    assert.equal(networkConfigs(loadConfig(env()), env())[0]!.progressLedgers, 10_000);
+    const overrides = { INDEXER_PROGRESS_LEDGERS: "0" };
+    assert.equal(networkConfigs(loadConfig(env(overrides)), env(overrides))[0]!.progressLedgers, 0);
+    assert.throws(() => loadConfig(env({ INDEXER_PROGRESS_LEDGERS: "-1" })), /INDEXER_PROGRESS_LEDGERS/);
+  });
+
   test("naming the default network in NETWORKS does not duplicate it", () => {
     const overrides = { NETWORKS: "testnet, testnet" };
     const config = loadConfig(env(overrides));
