@@ -13,6 +13,7 @@
  * ```
  */
 import type {
+  ChargeAttemptPage,
   ChargePage,
   ChurnBucketSize,
   DuePage,
@@ -39,6 +40,8 @@ import type {
 // src/routes/types.ts serves the handlers, this client and every consumer.
 export type {
   ApiErrorResponse,
+  ChargeAttemptPage,
+  ChargeAttemptRow,
   ChargePage,
   ChargeRow,
   ChurnBucket,
@@ -192,6 +195,16 @@ export class PayflowClient {
 
   charges(mandateId: number, query: ChargesQuery = {}): Promise<ChargePage> {
     return this.get<ChargePage>(`${API_PATH}/mandates/${mandateId}/charges`, query);
+  }
+
+  /**
+   * The keeper's attempts to charge a mandate over the last 90 days, newest
+   * first: how each one ended (`settled`, `failed`, or `skipped` when the
+   * vault could not cover it), its error code, transaction hash, shortfall
+   * and the backoff that followed.
+   */
+  chargeAttempts(mandateId: number, query: PageQuery = {}): Promise<ChargeAttemptPage> {
+    return this.get<ChargeAttemptPage>(`${API_PATH}/mandates/${mandateId}/attempts`, query);
   }
 
   due(query: PageQuery = {}): Promise<DuePage> {

@@ -276,6 +276,10 @@ All notable changes to payflow-backend. The format follows
   latest ledger, how far behind it is, the ledgers and events since the last
   line and the rate in ledgers per second, so a long catch-up shows movement
   even through ranges with no events.
+- **The typed client reads charge attempts (#363).** The keeper already
+  records every attempt with its outcome and reason in `charge_attempts`
+  (#144); `PayflowClient.chargeAttempts` now reads them from
+  `GET /api/v1/mandates/:id/attempts`, and the route is listed in the README.
 
 ### Changed
 

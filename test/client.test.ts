@@ -55,6 +55,15 @@ before(async () => {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
 
+  // What the keeper recorded for mandate 1: a vault shortfall, then the settlement.
+  const attempt = db.prepare(
+    `INSERT INTO charge_attempts
+       (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  attempt.run(1, 1_700_000_100, "skipped", "INSUFFICIENT_BALANCE", null, "400000", 1, 1_700_000_160);
+  attempt.run(1, 1_700_000_160, "settled", null, "tx1", null, 0, null);
+
   const app = createApp(db, config, status);
   await new Promise<void>((resolve) => {
     server = app.listen(0, () => {
@@ -197,6 +206,35 @@ describe("typed api client", () => {
       address: SUBSCRIBER,
       events: [],
     });
+  });
+
+  test("reads a mandate's charge attempts, with the reason each one did not settle", async () => {
+    const { attempts } = await client.chargeAttempts(1);
+    assert.deepEqual(
+      attempts.map(({ result, errorCode, txHash, shortfall, failures }) => ({
+        result,
+        errorCode,
+        txHash,
+        shortfall,
+        failures,
+      })),
+      [
+        { result: "settled", errorCode: null, txHash: "tx1", shortfall: undefined, failures: 0 },
+        { result: "skipped", errorCode: "INSUFFICIENT_BALANCE", txHash: null, shortfall: "400000", failures: 1 },
+      ],
+    );
+
+    const latest = await client.chargeAttempts(1, { limit: 1 });
+    assert.deepEqual(latest.attempts.map((a) => a.result), ["settled"]);
+
+    await assert.rejects(
+      () => client.chargeAttempts(999),
+      (err: unknown) => err instanceof PayflowApiError && err.status === 404,
+    );
+    await assert.rejects(
+      () => client.chargeAttempts(1, { limit: 0 }),
+      (err: unknown) => err instanceof PayflowApiError && err.status === 400,
+    );
   });
 
   test("a 404 raises PayflowApiError with the parsed error body", async () => {

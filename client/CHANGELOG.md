@@ -4,6 +4,15 @@ All notable changes to `@mmm-pay/payflow-client`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the package uses
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `chargeAttempts(mandateId, { limit })` for `GET /api/v1/mandates/:id/attempts`:
+  the keeper's attempts to charge a mandate, with the result, error code,
+  transaction hash and shortfall of each, and the `ChargeAttemptPage` and
+  `ChargeAttemptRow` types.
+
 ## [0.1.0] - 2026-10-22
 
 ### Added

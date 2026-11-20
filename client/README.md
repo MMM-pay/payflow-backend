@@ -50,9 +50,9 @@ const api = new PayflowClient({ baseUrl: "http://localhost:8080", fetch: myFetch
 ## Endpoints
 
 `health`, `plans`, `plan`, `planStats`, `mandates`, `mandate`, `charges`,
-`due`, `merchantSummary`, `merchantForecast`, `merchantSubscribers`,
-`merchantChurn`, `merchantRevenue`, `subscriberSummary`, `stats`, `protocol`,
-`vault`, `vaultEvents`, and `keeper`.
+`chargeAttempts`, `due`, `merchantSummary`, `merchantForecast`,
+`merchantSubscribers`, `merchantChurn`, `merchantRevenue`, `subscriberSummary`,
+`stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`.
 
 ## Requirements
 

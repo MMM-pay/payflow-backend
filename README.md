@@ -387,6 +387,7 @@ unversioned `/api/<network>/...` paths remain as aliases.
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
 | `GET` | `/api/mandates/:id` | One mandate |
 | `GET` | `/api/mandates/:id/charges?from=&to=` | Settlement history, optionally bounded by ledger close time |
+| `GET` | `/api/mandates/:id/attempts?limit=` | The keeper's charge attempts over the last 90 days, newest first: result (`settled`, `failed`, `skipped`), error code, tx hash, vault shortfall, failure streak and next retry |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
 | `POST` | `/api/webhooks` | Register a URL to receive signed `charged` events; proves control of the merchant address with a signature |
 | `POST` | `/api/webhooks/:id/rotate` | Replace a webhook's signing secret; both secrets sign during the overlap |
@@ -825,10 +826,11 @@ try {
 ```
 
 Every endpoint is covered: `health`, `plans`, `plan`, `planStats`, `mandates`,
-`mandate`, `charges`, `due`, `merchantSummary`, `merchantForecast`,
-`merchantSubscribers`, `merchantChurn`, `merchantRevenue`, `subscriberSummary`,
-`stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`. The client calls the
-versioned `/api/v1` paths; `health` stays at the service root.
+`mandate`, `charges`, `chargeAttempts`, `due`, `merchantSummary`,
+`merchantForecast`, `merchantSubscribers`, `merchantChurn`, `merchantRevenue`,
+`subscriberSummary`, `stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`.
+The client calls the versioned `/api/v1` paths; `health` stays at the service
+root.
 
 The client is published independently as
 [`@mmm-pay/payflow-client`](https://www.npmjs.com/package/@mmm-pay/payflow-client).
