@@ -93,6 +93,10 @@ events per page; `next` is `null` at the end. The ordering is ascending by
 `(ledger, event_id)`, which is stable across re-indexes and handles multiple
 events in the same ledger. Pass the unchanged `next` value as `after` for
 the next page. Invalid parameters return `400 invalid_request`.
+A page without `name` reads at most 51 rows, seeking from the cursor through
+the `(ledger, event_id)` index, or `(contract_id, ledger, event_id)` with
+`contract`, so its cost does not grow with the size of the table. `name` is
+matched on the decoded topic, so a filtered page scans in batches of 200.
 
 An event contains `contract`, `ledger`, `txHash`, `index`, `name`,
 `topics`, `data`, and `closeTime`. `topics` is an array of base64-encoded

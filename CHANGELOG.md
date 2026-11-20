@@ -279,6 +279,16 @@ All notable changes to payflow-backend. The format follows
 
 ### Changed
 
+- **The raw event feed reads one page per request (#364).** `GET /api/events`
+  without a `name` filter now asks the database for one page plus one row
+  (51) instead of a 200-row batch, and a `contract` filter is served by a new
+  `(contract_id, ledger, event_id)` index, created on startup for SQLite and
+  PostgreSQL alike, instead of walking every contract's events from the
+  cursor. On 200,000 events, a page for a contract with 50 of them went from a
+  91 ms parallel sequential scan to a 0.24 ms index scan on PostgreSQL 16, and
+  from 99 ms to 5 ms through the route on SQLite. Responses, page sizes and
+  cursors are unchanged.
+
 - **The indexer's idempotency is tested under random orderings (#48).** The
   projection was checked against a handful of hand-written replays. A seeded
   generator now builds a random history across several mandates, plans and

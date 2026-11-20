@@ -321,6 +321,10 @@ const ADDED_INDEXES: ReadonlyArray<[table: string, name: string, columns: string
   // A merchant's unpaid report walks its due mandates oldest-due first, so
   // the range and the order both come from the index.
   ["mandates", "mandates_merchant_status_next_charge", "merchant, status, next_charge"],
+  // The raw event feed filtered by contract walks one contract's events in
+  // (ledger, event_id) order from the page cursor, so the range, the filter
+  // and the order all come from the index instead of every contract's rows.
+  ["events", "events_contract_ledger", "contract_id, ledger, event_id"],
 ];
 
 export function migrate(db: DatabaseSync): void {

@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS events (
   close_time BIGINT
 );
 CREATE INDEX IF NOT EXISTS events_ledger ON events(ledger, event_id);
+CREATE INDEX IF NOT EXISTS events_contract_ledger ON events(contract_id, ledger, event_id);
 CREATE TABLE IF NOT EXISTS cursor (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   last_ledger BIGINT NOT NULL

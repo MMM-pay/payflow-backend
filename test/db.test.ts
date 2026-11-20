@@ -76,6 +76,45 @@ describe("summary query indexes", () => {
   });
 });
 
+describe("raw event feed indexes", () => {
+  const COLUMNS = "event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time";
+
+  test("migrate creates the contract feed index", () => {
+    const db = openDatabase(":memory:");
+    const names = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]
+    ).map((r) => r.name);
+    assert.ok(names.includes("events_contract_ledger"));
+    db.close();
+  });
+
+  test("a contract-filtered page seeks the contract's own events from the cursor", () => {
+    const db = openDatabase(":memory:");
+    const plan = queryPlan(
+      db,
+      `SELECT ${COLUMNS} FROM events WHERE (ledger, event_id) > (?, ?) AND contract_id = ? ORDER BY ledger, event_id LIMIT ?`,
+      [0, "", "C", 51],
+    );
+    assert.match(plan, /USING INDEX events_contract_ledger \(contract_id=\? AND \(ledger,event_id\)>\(\?,\?\)\)/);
+    assert.doesNotMatch(plan, /SCAN events\b/);
+    assert.doesNotMatch(plan, /TEMP B-TREE/);
+    db.close();
+  });
+
+  test("an unfiltered page seeks from the cursor in feed order", () => {
+    const db = openDatabase(":memory:");
+    const plan = queryPlan(
+      db,
+      `SELECT ${COLUMNS} FROM events WHERE (ledger, event_id) > (?, ?) ORDER BY ledger, event_id LIMIT ?`,
+      [0, "", 51],
+    );
+    assert.match(plan, /USING INDEX events_ledger \(\(ledger,event_id\)>\(\?,\?\)\)/);
+    assert.doesNotMatch(plan, /SCAN events\b/);
+    assert.doesNotMatch(plan, /TEMP B-TREE/);
+    db.close();
+  });
+});
+
 describe("database backup", () => {
   test("produces a consistent copy that opens and reads the same data", async () => {
     const fs = await import("node:fs");
