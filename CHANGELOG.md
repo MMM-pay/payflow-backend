@@ -280,6 +280,12 @@ All notable changes to payflow-backend. The format follows
   records every attempt with its outcome and reason in `charge_attempts`
   (#144); `PayflowClient.chargeAttempts` now reads them from
   `GET /api/v1/mandates/:id/attempts`, and the route is listed in the README.
+- **A threat model for the public API (#360).** `docs/THREAT_MODEL.md`
+  describes the assets, actors and trust boundaries, every entry point with
+  how it authenticates, the merchant, SEP-10 and operator authorization
+  model, the controls in place, and fifteen known risks with the code they
+  live in and what contains them. It is linked from the README and
+  SECURITY.md.
 
 ### Changed
 

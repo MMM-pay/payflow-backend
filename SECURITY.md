@@ -13,6 +13,12 @@ and signing, the REST API, and configuration handling.
 Out of scope: the Soroban contracts (report in `payflow-contract`), the
 frontend, and third-party RPC availability.
 
+The API's trust boundaries, authentication and authorization model, and the
+risks known and not yet fixed are written down in
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md). A finding listed there is
+already known; a report that goes further than it, or a route it misses, is
+welcome.
+
 ## Reporting
 
 Do not open a public issue. Use GitHub private vulnerability reporting on this

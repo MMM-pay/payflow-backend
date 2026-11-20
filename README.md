@@ -17,6 +17,7 @@
 > **Docs:** https://mmm-pay.github.io/payflow-docs/ ·
 > **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 > **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md) ·
+> **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) ·
 > **API changelog:** [API_CHANGELOG.md](API_CHANGELOG.md)
 
 ---
@@ -1061,7 +1062,9 @@ Dependabot keeps dependencies current. Changes are recorded in
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Unaudited, testnet only.
+See [SECURITY.md](SECURITY.md). Unaudited, testnet only. The API's trust
+boundaries, authentication model and known risks are in
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## Maintainers
 
