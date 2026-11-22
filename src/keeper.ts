@@ -16,6 +16,7 @@ import { simulationSource } from "./lib/simulate.ts";
 import { asStorage } from "./lib/store/index.ts";
 import type { Storage } from "./lib/store/types.ts";
 import { planTokensByIds } from "./lib/queries.ts";
+import type { KeeperRpc } from "./lib/stellar.ts";
 import type { ChargeStreakEvent } from "./lib/webhooks.ts";
 import type { KeeperPassSummary } from "./routes/types.ts";
 
@@ -30,22 +31,8 @@ export interface DueMandate {
   plan_id: number;
 }
 
-/**
- * The RPC calls the keeper makes. Narrow so tests can supply a fake.
- *
- * `simulateTransaction` is optional: the vault-balance read is an
- * optimisation, not a requirement, so an RPC that cannot simulate settles
- * exactly as it did before the check was added.
- */
-export type KeeperRpc = Pick<
-  rpc.Server,
-  | "getAccount"
-  | "getFeeStats"
-  | "prepareTransaction"
-  | "sendTransaction"
-  | "getTransaction"
-> &
-  Partial<Pick<rpc.Server, "simulateTransaction">>;
+/** Re-export so existing imports of `KeeperRpc` from `keeper.ts` continue to work. */
+export type { KeeperRpc } from "./lib/stellar.ts";
 
 /** First retry delay after a failed charge; doubles per failure. */
 const BACKOFF_BASE_S = 60;

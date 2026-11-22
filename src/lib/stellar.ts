@@ -22,6 +22,24 @@ export type RpcLike = Pick<
   | "getLedgerEntries"
 >;
 
+/**
+ * The RPC calls the keeper needs. A subset of {@link RpcLike} with
+ * `simulateTransaction` made optional: the vault-balance pre-check is an
+ * optimisation, so an RPC that cannot simulate settles exactly as before.
+ *
+ * Defined here — the central Stellar module — so a test fake only imports
+ * this type rather than re-defining an equivalent subset in each test file.
+ */
+export type KeeperRpc = Pick<
+  rpc.Server,
+  | "getAccount"
+  | "getFeeStats"
+  | "prepareTransaction"
+  | "sendTransaction"
+  | "getTransaction"
+> &
+  Partial<Pick<rpc.Server, "simulateTransaction">>;
+
 /** Where failover currently stands; reported by /health. */
 export interface RpcStatus {
   /** URL of the endpoint calls currently go to. */
