@@ -1058,6 +1058,76 @@ describe("keeper vault balance check", () => {
     assert.equal(submitted.length, 1);
     db.close();
   });
+
+  test("zero vault balance is a shortfall even for the smallest mandate amount", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    insertMandate(db, 1, 1_000, "1");
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      balanceRpc(0n, submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.deepEqual(results, [], "nothing was settled when vault is empty");
+    assert.equal(submitted.length, 0);
+    const pass = keeper.passHistory()[0]!;
+    assert.equal(pass.skipped?.length, 1);
+    assert.equal(pass.skipped?.[0]?.balance, "0");
+    assert.equal(pass.skipped?.[0]?.required, "1");
+    assert.equal(pass.skipped?.[0]?.shortfall, "1");
+    db.close();
+  });
+
+  test("balance exactly equal to the required amount is not a shortfall", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    insertMandate(db, 1, 1_000, "777");
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      balanceRpc(777n, submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.equal(results[0]!.status, "settled", "balance === required should settle");
+    assert.equal(submitted.length, 1);
+    assert.equal(keeper.passHistory()[0]!.skipped?.length, 0);
+    db.close();
+  });
+
+  test("simulateTransaction returning { error } is treated as unknown balance, not a shortfall", async () => {
+    const db = openDatabase(":memory:");
+    insertPlan(db, 1, TOKEN);
+    insertMandate(db, 1, 1_000, "1000");
+    const submitted: string[] = [];
+    const errorRpc: KeeperRpc = {
+      ...fakeRpc(new Set([keyA.publicKey()]), submitted),
+      simulateTransaction: async () =>
+        ({ error: "HostError: contract execution failed" }) as never,
+    } as unknown as KeeperRpc;
+    const keeper = new Keeper(
+      db,
+      errorRpc,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }),
+    );
+
+    const results = await keeper.tick(10_000);
+
+    assert.equal(
+      results[0]!.status,
+      "settled",
+      "an error response is treated as null balance and the mandate proceeds",
+    );
+    assert.equal(submitted.length, 1);
+    assert.equal(keeper.passHistory()[0]!.skipped?.length, 0);
+    db.close();
+  });
 });
 
 /**
