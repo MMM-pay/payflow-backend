@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
+import { Keypair, Networks } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 import { testAddress } from "./addresses.ts";
+import { Sep10Auth } from "../src/routes/auth.ts";
 
 /**
  * Every route of the API, its filters and its error cases.
@@ -322,5 +325,115 @@ describe("a bad id is refused, not crashed on", () => {
       const { status } = await get(path);
       assert.ok(status >= 400 && status < 500, `${path} answered ${status}`);
     }
+  });
+});
+
+/**
+ * Subscriber data export — issue #353.
+ *
+ * The endpoint is auth-gated: a subscriber may only download their own data.
+ * Tests run against a fresh app that has SEP-10 configured so the auth
+ * middleware is wired in.
+ */
+describe("GET /api/subscribers/:address/export", () => {
+  const JWT_SECRET = "a-jwt-secret-that-is-at-least-32-characters";
+  const HOME = "payflow.example";
+  const ISSUER = `https://${HOME}/api/testnet/auth`;
+  const exportDb = openDatabase(":memory:");
+  let exportServer: Server;
+  let exportBase = "";
+  const serverKey = Keypair.random();
+  const auth = new Sep10Auth({
+    signingKey: serverKey.secret(),
+    jwtSecret: JWT_SECRET,
+    homeDomain: HOME,
+    webAuthDomain: HOME,
+    networkPassphrase: Networks.TESTNET,
+    issuer: ISSUER,
+    tokenTtlS: 900,
+    loadAccount: async () => null,
+  });
+
+  /** Forge a JWT for `account` without going through the full SEP-10 dance. */
+  function forge(account: string): string {
+    const now = Math.floor(Date.now() / 1000);
+    const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(JSON.stringify({ sub: account, iss: ISSUER, iat: now, exp: now + 900, jti: "test" })).toString("base64url");
+    const sig = createHmac("sha256", JWT_SECRET).update(`${header}.${payload}`).digest("base64url");
+    return `${header}.${payload}.${sig}`;
+  }
+
+  before(async () => {
+    const ix = new Indexer(exportDb, {} as never, {} as never);
+    ix.apply(ev("plan_created", [MERCHANT, 1n], {
+      token: TOKEN, amount: 10_000_000n, period: 2_592_000n, name: "monthly",
+    }, "ep1"));
+    ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+      plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n, fee_bps: 100n,
+    }, "es1"));
+    ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 2n,
+    }, "ech1"));
+    const app = createApp(
+      [{ config: testnet, db: exportDb, auth }],
+      config,
+    );
+    await new Promise<void>((resolve) => {
+      exportServer = app.listen(0, () => {
+        const addr = exportServer.address();
+        exportBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    exportServer.close();
+    exportDb.close();
+  });
+
+  test("returns the subscriber's mandates, charges and charge_attempts as a JSON download", async () => {
+    const token = forge(SUBSCRIBER);
+    const res = await fetch(`${exportBase}/api/subscribers/${SUBSCRIBER}/export`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-disposition") ?? "", /attachment/);
+    const body = await res.json() as Record<string, unknown>;
+    assert.equal(body.subscriber, SUBSCRIBER);
+    assert.ok(typeof body.exportedAt === "string");
+    assert.ok(Array.isArray(body.mandates));
+    assert.ok(Array.isArray(body.charges));
+    assert.ok(Array.isArray(body.chargeAttempts));
+    assert.equal((body.mandates as unknown[]).length, 1);
+    assert.equal((body.charges as unknown[]).length, 1);
+  });
+
+  test("returns 401 when no Bearer token is provided", async () => {
+    const res = await fetch(`${exportBase}/api/subscribers/${SUBSCRIBER}/export`);
+    assert.equal(res.status, 401);
+  });
+
+  test("returns 401 when the Bearer token is invalid", async () => {
+    const res = await fetch(`${exportBase}/api/subscribers/${SUBSCRIBER}/export`, {
+      headers: { authorization: "Bearer not.a.valid.jwt" },
+    });
+    assert.equal(res.status, 401);
+  });
+
+  test("returns 403 when the JWT account does not match the requested address", async () => {
+    const token = forge(OTHER_SUBSCRIBER);
+    const res = await fetch(`${exportBase}/api/subscribers/${SUBSCRIBER}/export`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 403);
+  });
+
+  test("returns 400 for a malformed address", async () => {
+    const token = forge(SUBSCRIBER);
+    const res = await fetch(`${exportBase}/api/subscribers/not-an-address/export`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 400);
   });
 });
