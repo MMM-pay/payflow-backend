@@ -355,3 +355,62 @@ describe("the business gauges", () => {
     metrics.reset();
   });
 });
+
+describe("HTTP request metrics", () => {
+  let server: Server;
+  let base = "";
+
+  before(async () => {
+    metrics.reset();
+    const app = createApp(
+      [{ config: testnet, db }],
+      { ...config, METRICS_ENABLED: true } as Config,
+    );
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, () => {
+        const addr = server.address();
+        base = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    server.close();
+    metrics.reset();
+  });
+
+  test("a successful request increments http_requests with method and 2xx class", async () => {
+    metrics.reset();
+    await fetch(`${base}/health`);
+    assert.equal(metrics.value("http_requests", { method: "GET", status_class: "2xx" }), 1);
+  });
+
+  test("a 404 request increments http_requests with 4xx class", async () => {
+    metrics.reset();
+    await fetch(`${base}/no-such-route`);
+    assert.equal(metrics.value("http_requests", { method: "GET", status_class: "4xx" }), 1);
+    assert.equal(metrics.value("http_errors"), undefined);
+  });
+
+  test("http_requests and http_errors appear in the /metrics output", async () => {
+    metrics.reset();
+    await fetch(`${base}/health`);
+    const body = await (await fetch(`${base}/metrics`)).text();
+    assert.match(body, /# HELP payflow_http_requests_total/);
+    assert.match(body, /# TYPE payflow_http_requests_total counter/);
+    assert.match(body, /# HELP payflow_http_errors_total/);
+    assert.match(body, /# TYPE payflow_http_errors_total counter/);
+  });
+
+  test("multiple requests accumulate per method and status class", async () => {
+    metrics.reset();
+    await Promise.all([
+      fetch(`${base}/health`),
+      fetch(`${base}/health`),
+      fetch(`${base}/health`),
+    ]);
+    const twoxx = metrics.value("http_requests", { method: "GET", status_class: "2xx" }) as number;
+    assert.ok(typeof twoxx === "number" && twoxx >= 3, `expected >= 3 GET 2xx, got ${twoxx}`);
+  });
+});

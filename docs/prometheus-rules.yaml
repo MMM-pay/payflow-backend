@@ -1,0 +1,140 @@
+# Prometheus recording and alerting rules for payflow-backend.
+#
+# Two SLO families are covered:
+#
+#   - API availability: the fraction of requests that succeed (non-5xx).
+#     payflow_http_requests_total  — all requests, labelled by method and
+#                                    status_class (2xx, 4xx, 5xx)
+#     payflow_http_errors_total    — 5xx requests (unlabelled, for a quick
+#                                    per-process total)
+#
+#   - Keeper success rate: the fraction of due charges the keeper settles.
+#     payflow_charges_settled_total — settled on-chain since process start
+#     payflow_charges_failed_total  — could not be settled since process start
+#
+# Recording rules pre-compute the error-budget burn rates so dashboards and
+# alerts stay cheap (no per-scrape vector arithmetic on large label sets).
+#
+# Alert thresholds follow the Google SRE multi-window, multi-burn-rate model:
+# a fast (1 h / 5 min) window catches sudden spikes, a slow (6 h / 30 min)
+# window catches gradual regressions. Both must be breaching to fire.
+
+groups:
+  - name: payflow_api_slo
+    interval: 1m
+    rules:
+      # 1-hour request error rate.
+      - record: job:payflow_http_error_rate:rate1h
+        expr: |
+          sum(rate(payflow_http_errors_total[1h]))
+          /
+          sum(rate(payflow_http_requests_total[1h]))
+
+      # 5-minute request error rate (fast window).
+      - record: job:payflow_http_error_rate:rate5m
+        expr: |
+          sum(rate(payflow_http_errors_total[5m]))
+          /
+          sum(rate(payflow_http_requests_total[5m]))
+
+      # 6-hour request error rate (slow window for gradual regressions).
+      - record: job:payflow_http_error_rate:rate6h
+        expr: |
+          sum(rate(payflow_http_errors_total[6h]))
+          /
+          sum(rate(payflow_http_requests_total[6h]))
+
+      # 30-minute request error rate.
+      - record: job:payflow_http_error_rate:rate30m
+        expr: |
+          sum(rate(payflow_http_errors_total[30m]))
+          /
+          sum(rate(payflow_http_requests_total[30m]))
+
+      # Page: fast burn (14× budget) + slow burn (5× budget). SLO = 99.9 %
+      # (error budget = 0.1 %). Fires when both windows are burning quickly.
+      - alert: PayflowApiHighErrorRate
+        expr: |
+          job:payflow_http_error_rate:rate1h  > 14 * 0.001
+          and
+          job:payflow_http_error_rate:rate5m  > 14 * 0.001
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "payflow API error rate is above the SLO (fast burn)"
+          description: >
+            More than 14× the allowed error budget is being consumed over
+            the last hour and the last 5 minutes.
+            Current 1 h rate: {{ $value | humanizePercentage }}.
+
+      # Ticket: slow burn (2× budget) for 6 h. Gradual regression.
+      - alert: PayflowApiElevatedErrorRate
+        expr: |
+          job:payflow_http_error_rate:rate6h  > 2 * 0.001
+          and
+          job:payflow_http_error_rate:rate30m > 2 * 0.001
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "payflow API error rate is elevated (slow burn)"
+          description: >
+            More than 2× the allowed error budget is being consumed over
+            the last 6 hours and the last 30 minutes.
+            Current 6 h rate: {{ $value | humanizePercentage }}.
+
+  - name: payflow_keeper_slo
+    interval: 1m
+    rules:
+      # Keeper failure rate over 1 hour.
+      - record: job:payflow_keeper_failure_rate:rate1h
+        expr: |
+          sum(rate(payflow_charges_failed_total[1h]))
+          /
+          (
+            sum(rate(payflow_charges_settled_total[1h]))
+            +
+            sum(rate(payflow_charges_failed_total[1h]))
+          )
+
+      # Keeper failure rate over 5 minutes (fast window).
+      - record: job:payflow_keeper_failure_rate:rate5m
+        expr: |
+          sum(rate(payflow_charges_failed_total[5m]))
+          /
+          (
+            sum(rate(payflow_charges_settled_total[5m]))
+            +
+            sum(rate(payflow_charges_failed_total[5m]))
+          )
+
+      # Page: keeper is failing to settle more than 20 % of charges.
+      - alert: PayflowKeeperHighFailureRate
+        expr: |
+          job:payflow_keeper_failure_rate:rate1h > 0.20
+          and
+          job:payflow_keeper_failure_rate:rate5m > 0.20
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "payflow keeper charge failure rate is high"
+          description: >
+            The keeper has failed to settle more than 20 % of attempted
+            charges over the last hour and the last 5 minutes.
+            Current 1 h failure rate: {{ $value | humanizePercentage }}.
+
+      # Ticket: keeper is failing more than 5 % of charges.
+      - alert: PayflowKeeperElevatedFailureRate
+        expr: |
+          job:payflow_keeper_failure_rate:rate1h > 0.05
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "payflow keeper charge failure rate is elevated"
+          description: >
+            The keeper has failed to settle more than 5 % of attempted
+            charges over the last hour.
+            Current failure rate: {{ $value | humanizePercentage }}.

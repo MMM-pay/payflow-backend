@@ -113,6 +113,18 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     help: "Keeper passes run since the process started.",
     type: "counter",
   },
+  {
+    key: "http_requests",
+    name: "payflow_http_requests_total",
+    help: "HTTP requests handled since the process started, labelled by method and status class (2xx, 4xx, 5xx).",
+    type: "counter",
+  },
+  {
+    key: "http_errors",
+    name: "payflow_http_errors_total",
+    help: "HTTP requests that ended with a 5xx status since the process started.",
+    type: "counter",
+  },
 ];
 
 /**

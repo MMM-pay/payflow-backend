@@ -318,6 +318,19 @@ export function createApp(
   );
   app.use(express.json({ limit: "64kb" }));
 
+  // Count every completed request. The finish event fires once the response is
+  // sent, so the status code is final.
+  app.use((_req, res, next) => {
+    res.on("finish", () => {
+      const statusClass = `${Math.floor(res.statusCode / 100)}xx`;
+      metrics.increment("http_requests", 1, { method: _req.method, status_class: statusClass });
+      if (res.statusCode >= 500) {
+        metrics.increment("http_errors");
+      }
+    });
+    next();
+  });
+
   app.get(["/health", "/ready"], (_req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     next();
