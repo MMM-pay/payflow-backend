@@ -56,6 +56,7 @@ export interface ParameterObject {
 export interface ResponseObject {
   description: string;
   content?: Record<string, { schema: SchemaObject }>;
+  headers?: Record<string, { description?: string; schema: SchemaObject }>;
 }
 
 /** One operation (a method on a path). */
