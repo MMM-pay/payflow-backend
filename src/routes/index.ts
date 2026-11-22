@@ -112,7 +112,7 @@ export function buildRoutes(
   r.use(protocolRouter(db));
   r.use(mandatesRouter(db, tokens));
   r.use(merchantsRouter(db, summaryCache, defaultToken));
-  r.use(subscribersRouter(db));
+  r.use(subscribersRouter(db, auth));
   r.use(statsRouter(db));
   r.use(tokensRouter(tokens));
   if (events) r.use(streamRouter(events, db));

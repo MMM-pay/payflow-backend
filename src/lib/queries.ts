@@ -26,6 +26,7 @@ import type {
   RevenueBucket,
   RevenueBucketSize,
   StatsResponse,
+  SubscriberExport,
   SubscriberSummary,
   TokenRevenue,
   UnpaidMandateRow,
@@ -940,6 +941,71 @@ export function listMerchantForecastMandates(
 }
 
 /** Subscriber mandates and cumulative gross amount paid (amount + fee). */
+/**
+ * Collect everything the backend holds about one subscriber in one call.
+ *
+ * Returns mandates, every settled charge (oldest first), and every keeper
+ * attempt for all of the subscriber's mandates (newest per mandate first),
+ * so a subscriber can verify or dispute what was billed.
+ */
+export async function getSubscriberExport(
+  db: Storage,
+  subscriber: string,
+): Promise<SubscriberExport> {
+  const mandates = await db.all<MandateRow>(
+    "SELECT * FROM mandates WHERE subscriber = ? ORDER BY id ASC",
+    [subscriber],
+  );
+  const charges = await db.all<ChargeRow>(
+    `SELECT tx_hash, mandate_id, subscriber, merchant, amount, fee, ledger, created_at
+       FROM charges WHERE subscriber = ? ORDER BY ledger ASC, tx_hash ASC`,
+    [subscriber],
+  );
+  const mandateIds = mandates.map((m) => m.id);
+  let attemptRows: Awaited<ReturnType<typeof listChargeAttempts>> = [];
+  if (mandateIds.length > 0) {
+    const placeholders = mandateIds.map(() => "?").join(",");
+    const rows = await db.all<{
+      id: number;
+      mandate_id: number;
+      attempted_at: number;
+      result: ChargeAttemptRow["result"];
+      error_code: string | null;
+      tx_hash: string | null;
+      shortfall: string | null;
+      failures: number;
+      retry_at: number | null;
+    }>(
+      `SELECT id, mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at
+         FROM charge_attempts WHERE mandate_id IN (${placeholders})
+         ORDER BY mandate_id ASC, id DESC`,
+      mandateIds,
+    );
+    attemptRows = rows.map((row) => ({
+      id: row.id,
+      mandateId: row.mandate_id,
+      attemptedAt: row.attempted_at,
+      result: row.result,
+      errorCode: row.error_code,
+      txHash: row.tx_hash,
+      ...(row.shortfall === null ? {} : { shortfall: row.shortfall }),
+      failures: row.failures,
+      retryAt: row.retry_at,
+    }));
+  }
+  const totalPaid = charges
+    .reduce((total, charge) => total + BigInt(charge.amount) + BigInt(charge.fee), 0n)
+    .toString();
+  return {
+    subscriber,
+    exportedAt: new Date().toISOString(),
+    mandates,
+    charges,
+    chargeAttempts: attemptRows,
+    totalPaid,
+  };
+}
+
 export async function getSubscriberSummary(
   db: Storage,
   subscriber: string,

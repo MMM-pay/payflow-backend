@@ -357,6 +357,19 @@ export interface SubscriberSummary {
   totalPaid: string;
 }
 
+/** Full GDPR-style data export for one subscriber. */
+export interface SubscriberExport {
+  subscriber: string;
+  exportedAt: string;
+  mandates: MandateRow[];
+  /** Every settled charge, oldest first. */
+  charges: ChargeRow[];
+  /** Every keeper attempt for every mandate, newest first per mandate. */
+  chargeAttempts: ChargeAttemptRow[];
+  /** Sum of (amount + fee) across all settled charges, token's smallest unit. */
+  totalPaid: string;
+}
+
 /** One subscriber of a merchant, grouped across all of that subscriber's mandates with the merchant. */
 export interface MerchantSubscriber {
   /** Subscriber address. */

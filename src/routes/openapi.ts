@@ -1143,6 +1143,29 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/subscribers/{address}/export")]: {
+      get: {
+        tags: ["subscribers"],
+        summary: "Export a subscriber's data",
+        description:
+          "Returns everything the backend holds about the subscriber — mandates, settled charges, keeper attempts, and total paid — as a JSON file download. Requires a valid SEP-10 JWT whose subject matches the `:address` path parameter.",
+        operationId: `getSubscriberExport${operationSuffix(root)}`,
+        parameters: [addressParameter()],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description:
+              "The subscriber's full data export. The response carries `Content-Disposition: attachment; filename=\"payflow-export-{address}.json\"` so it saves directly in a browser.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/SubscriberExport" } },
+            },
+          },
+          "400": invalidRequest(),
+          "401": { description: "No valid SEP-10 bearer token supplied." },
+          "403": { description: "The token's subject does not match the requested address." },
+        },
+      },
+    },
     [p("/vault/{address}")]: {
       get: {
         tags: ["vault"],
@@ -2085,6 +2108,19 @@ function componentSchemas(): Record<string, SchemaObject> {
         totalPaid: amount(),
       },
       required: ["subscriber", "mandates", "totalPaid"],
+    },
+    SubscriberExport: {
+      type: "object",
+      description: "Full data export for a subscriber (GDPR-style).",
+      properties: {
+        subscriber: { type: "string", description: ADDRESS_DESCRIPTION },
+        exportedAt: { type: "string", format: "date-time", description: "When this export was generated." },
+        mandates: { type: "array", items: { $ref: "#/components/schemas/Mandate" } },
+        charges: { type: "array", items: { $ref: "#/components/schemas/ChargeRow" } },
+        chargeAttempts: { type: "array", items: { $ref: "#/components/schemas/ChargeAttempt" } },
+        totalPaid: amount(),
+      },
+      required: ["subscriber", "exportedAt", "mandates", "charges", "chargeAttempts", "totalPaid"],
     },
     UpcomingCharge: {
       type: "object",

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Storage } from "../lib/store/types.ts";
 import {
+  getSubscriberExport,
   getSubscriberSummary,
   listSubscriberChargesAfter,
   listSubscriberUpcomingMandates,
@@ -15,6 +16,8 @@ import {
 } from "./validate.ts";
 import { tokenUnits } from "./merchants.ts";
 import type { UpcomingCharge, UpcomingChargesResponse } from "./types.ts";
+import { sendApiError } from "./errors.ts";
+import { sessionOf, type Sep10Auth } from "./auth.ts";
 
 const DAY_S = 86_400;
 const DEFAULT_FORECAST_DAYS = 30;
@@ -30,8 +33,8 @@ function daysOf(raw: unknown, fallback = DEFAULT_FORECAST_DAYS): number {
   return Math.min(Math.trunc(n), MAX_FORECAST_DAYS);
 }
 
-/** `GET /subscribers/:address/summary` and `GET /subscribers/:address/upcoming`. */
-export function subscribersRouter(db: Storage): Router {
+/** `GET /subscribers/:address/summary`, `GET /subscribers/:address/upcoming`, and `GET /subscribers/:address/export`. */
+export function subscribersRouter(db: Storage, auth?: Sep10Auth): Router {
   const r = Router();
 
   r.get("/subscribers/:address/summary", async (req, res) => {
@@ -176,6 +179,44 @@ export function subscribersRouter(db: Storage): Router {
         "Vault funding is not modelled; an underfunded vault will not settle on schedule.",
       ],
     };
+    res.json(body);
+  });
+
+  /**
+   * `GET /subscribers/:address/export`: everything the backend holds about a
+   * subscriber, in one JSON response suitable for a GDPR data-access request.
+   *
+   * The subscriber must authenticate: a valid SEP-10 JWT is required, and its
+   * subject must equal the `:address` path parameter. A missing or expired
+   * token is answered with 401; a token for a different account is answered
+   * with 403.
+   *
+   * The response is a JSON file download (`Content-Disposition: attachment`)
+   * so it can be saved directly by a browser. It contains mandates, settled
+   * charges, keeper attempts, total paid, and the timestamp at which the
+   * export was generated.
+   */
+  r.get("/subscribers/:address/export", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const session = sessionOf(req, res, auth);
+    if (!session.ok) return;
+    if (session.value === null) {
+      sendApiError(res, req, 401, "unauthorized", "A SEP-10 bearer token is required to export subscriber data.");
+      return;
+    }
+    if (session.value !== address.value) {
+      sendApiError(res, req, 403, "forbidden", "You may only export your own data.");
+      return;
+    }
+
+    const body = await getSubscriberExport(db, address.value);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="payflow-export-${address.value}.json"`,
+    );
     res.json(body);
   });
 

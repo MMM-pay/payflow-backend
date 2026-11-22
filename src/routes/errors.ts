@@ -20,6 +20,7 @@ export type ApiErrorCode =
   | "invalid_token_id"
   | "token_metadata_unavailable"
   | "unauthorized"
+  | "forbidden"
   | "reindex_unavailable"
   | "keeper_unavailable"
   | "indexer_unavailable"
@@ -87,6 +88,7 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   invalid_token_id: "The token id must be `native` or a contract address.",
   token_metadata_unavailable: "The token contract's metadata could not be read; try again.",
   unauthorized: "A valid bearer token is required for this endpoint.",
+  forbidden: "You do not have permission to access this resource.",
   reindex_unavailable: "Reindexing is not available on this instance.",
   prune_unavailable: "Data pruning is not available on this instance.",
   prune_failed: "The prune could not be completed.",
