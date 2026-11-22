@@ -453,6 +453,16 @@ export async function pruneOldEvents(db: Storage, daysToKeep: number = 30): Prom
   return deleted.length;
 }
 
+export async function pruneChargeAttempts(db: Storage, daysToKeep: number = 90): Promise<number> {
+  if (daysToKeep === 0) return 0;
+  const cutoffTime = Math.floor((Date.now() - daysToKeep * 24 * 60 * 60 * 1000) / 1000);
+  const deleted = await db.all<{ id: number }>(
+    "DELETE FROM charge_attempts WHERE attempted_at < ? RETURNING id",
+    [cutoffTime],
+  );
+  return deleted.length;
+}
+
 export function markMandateAsPastDue(db: DatabaseSync, mandateId: number): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(`INSERT INTO past_due_mandates (mandate_id, first_past_due_at, last_checked_at, still_past_due)

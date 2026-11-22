@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { createApp } from "../src/app.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import { Indexer } from "../src/indexer.ts";
-import { getMerchantSummary, getPlanById, getProtocolStats, listMandateCharges } from "../src/lib/queries.ts";
+import { getMerchantSummary, getPlanById, getProtocolStats, listMandateCharges, listPlans, listMandates } from "../src/lib/queries.ts";
 import { PostgresStorage } from "../src/lib/store/postgres.ts";
 import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 import type { Storage } from "../src/lib/store/types.ts";
@@ -186,6 +186,115 @@ test("SQLite and PostgreSQL return identical projection responses", { skip: !DAT
   try {
     assert.deepEqual(await project(postgres), await project(sqlite));
     assert.deepEqual(await apiResponses(postgres), await apiResponses(sqlite));
+  } finally {
+    await Promise.all([sqlite.close(), postgres.close()]);
+  }
+});
+
+/**
+ * Issue #362: SQLite and PostgreSQL must return lists in the same deterministic
+ * order so clients see stable results regardless of which backend is active.
+ *
+ * The tests below run on SQLite (always available) and optionally on PostgreSQL
+ * when DATABASE_URL is set, then assert both return identical ordering.
+ */
+
+async function seedOrderingFixture(storage: Storage): Promise<void> {
+  // Insert plans in a non-sequential order to verify the query re-orders them.
+  for (const id of [3, 1, 4, 2]) {
+    await storage.run(
+      `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, MERCHANT, `Plan ${id}`, TOKEN, "100", 2592000, 1, id],
+    );
+  }
+  for (const id of [5, 2, 8, 1]) {
+    await storage.run(
+      `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
+       VALUES (?, ?, ?, 1, ?, 60, ?, 'Active', 1)`,
+      [id, SUBSCRIBER, MERCHANT, "10", id * 1000],
+    );
+  }
+}
+
+for (const backend of backends) {
+  test(`${backend.name}: listPlans returns newest-first order (id DESC)`, async () => {
+    const storage = await backend.open();
+    try {
+      await seedOrderingFixture(storage);
+      const { rows } = await listPlans(storage, { limit: 10 });
+      const ids = rows.map((r) => r.id);
+      assert.deepEqual(ids, [...ids].sort((a, b) => b - a), "plans are ordered by id DESC");
+    } finally {
+      await storage.close();
+    }
+  });
+
+  test(`${backend.name}: listMandates returns newest-first order (id DESC)`, async () => {
+    const storage = await backend.open();
+    try {
+      await seedOrderingFixture(storage);
+      const { rows } = await listMandates(storage, { limit: 10 });
+      const ids = rows.map((r) => r.id);
+      assert.deepEqual(ids, [...ids].sort((a, b) => b - a), "mandates are ordered by id DESC");
+    } finally {
+      await storage.close();
+    }
+  });
+
+  test(`${backend.name}: cursor pagination returns consistent pages`, async () => {
+    const storage = await backend.open();
+    try {
+      await seedOrderingFixture(storage);
+      // Fetch page 1 (newest 2).
+      const page1 = await listPlans(storage, { limit: 2 });
+      assert.equal(page1.rows.length, 2);
+      assert.ok(page1.nextCursorId !== null, "there should be a next page");
+      // Fetch page 2 using the cursor from page 1.
+      const page2 = await listPlans(storage, { limit: 2, cursor: page1.nextCursorId! });
+      // All ids from page 2 must be less than the minimum id on page 1.
+      const minPage1 = Math.min(...page1.rows.map((r) => r.id));
+      assert.ok(
+        page2.rows.every((r) => r.id < minPage1),
+        "cursor page must not repeat or skip rows",
+      );
+      // Pages must not share any ids.
+      const page1Ids = new Set(page1.rows.map((r) => r.id));
+      const overlap = page2.rows.filter((r) => page1Ids.has(r.id));
+      assert.equal(overlap.length, 0, "pages must not overlap");
+    } finally {
+      await storage.close();
+    }
+  });
+}
+
+test("SQLite and PostgreSQL return identical list ordering", { skip: !DATABASE_URL }, async () => {
+  const sqlite = await SqliteStorage.open(":memory:");
+  const postgres = await PostgresStorage.open(
+    DATABASE_URL!,
+    `ordering_${process.pid}_${randomBytes(4).toString("hex")}`,
+  );
+  try {
+    await seedOrderingFixture(sqlite);
+    await seedOrderingFixture(postgres);
+    const [sqlitePlans, postgresPlanss] = await Promise.all([
+      listPlans(sqlite, { limit: 10 }),
+      listPlans(postgres, { limit: 10 }),
+    ]);
+    assert.deepEqual(
+      sqlitePlans.rows.map((r) => r.id),
+      postgresPlanss.rows.map((r) => r.id),
+      "SQLite and PostgreSQL return plans in the same order",
+    );
+    const [sqliteMandates, postgresMandates] = await Promise.all([
+      listMandates(sqlite, { limit: 10 }),
+      listMandates(postgres, { limit: 10 }),
+    ]);
+    assert.deepEqual(
+      sqliteMandates.rows.map((r) => r.id),
+      postgresMandates.rows.map((r) => r.id),
+      "SQLite and PostgreSQL return mandates in the same order",
+    );
   } finally {
     await Promise.all([sqlite.close(), postgres.close()]);
   }

@@ -62,8 +62,7 @@ export function streamRouter(
     if (!subscriberFilter.ok) return;
 
     if (activeStreams >= maxStreams) {
-      res.setHeader("Retry-After", "5");
-      sendApiError(res, req, 503, "stream_limit");
+      sendApiError(res, req, 503, "stream_limit", undefined, undefined, 5);
       return;
     }
 

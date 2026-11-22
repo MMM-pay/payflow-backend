@@ -134,6 +134,9 @@ export function apiErrorBody(
 /**
  * Send a structured error response. Every error path in the API funnels through
  * here so the shape, the code set, and the `requestId` stay consistent.
+ *
+ * Pass `retryAfter` (seconds) for transient 503 responses so clients know when
+ * to try again; it is set as the `Retry-After` header before the JSON body.
  */
 export function sendApiError(
   res: Response,
@@ -142,6 +145,10 @@ export function sendApiError(
   code: ApiErrorCode,
   message?: string,
   details?: ApiErrorDetail[],
+  retryAfter?: number,
 ): void {
+  if (retryAfter !== undefined && status === 503) {
+    res.set("Retry-After", String(retryAfter));
+  }
   res.status(status).json(apiErrorBody(code, requestIdOf(req), message, details));
 }

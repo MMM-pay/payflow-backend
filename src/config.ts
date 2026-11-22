@@ -200,8 +200,20 @@ const schema = z.object({
   /**
    * Days to retain raw contract events before pruning. Events older than this
    * are removed by the prune operation. Set to 0 to keep all events indefinitely.
+   * @deprecated Use RAW_EVENT_RETENTION_DAYS for per-table control.
    */
   DATA_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(30),
+  /**
+   * Days to retain raw contract events (`events` table). Overrides
+   * `DATA_RETENTION_DAYS` when set. Set to 0 to keep events indefinitely.
+   */
+  RAW_EVENT_RETENTION_DAYS: z.coerce.number().int().nonnegative().optional(),
+  /**
+   * Days to retain keeper charge-attempt logs (`charge_attempts` table).
+   * Attempts older than this are pruned automatically on each keeper pass and
+   * on demand via the admin prune endpoint. Set to 0 to keep all logs.
+   */
+  CHARGE_ATTEMPT_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(90),
 
   PORT: z.coerce.number().int().positive().default(8080),
   API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),

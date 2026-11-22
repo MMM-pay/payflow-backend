@@ -279,6 +279,17 @@ const errorResponse = (description: string): ResponseObject => ({
   },
 });
 
+/** A transient 503 that carries a `Retry-After` header with the suggested wait in seconds. */
+const transient503 = (description: string): ResponseObject => ({
+  ...errorResponse(description),
+  headers: {
+    "Retry-After": {
+      description: "Suggested number of seconds to wait before retrying the request.",
+      schema: { type: "integer", example: 30 },
+    },
+  },
+});
+
 /** The standard "not found" answer of an id-bearing route. */
 const notFound = (code: string, what: string): ResponseObject =>
   errorResponse(`No ${what} exists with that id (error.code = "${code}").`);
@@ -1307,7 +1318,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             content: { "text/event-stream": { schema: { type: "string" } } },
           },
           "400": invalidRequest(),
-          "503": errorResponse(
+          "503": transient503(
             'The concurrent stream cap was reached (error.code = "stream_limit").',
           ),
         },
@@ -1556,7 +1567,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("This process has no indexer to run."),
+          "503": transient503("This process has no indexer to run."),
           "500": errorResponse("The pass threw; the message is kept for the operator."),
         },
       },
@@ -1586,7 +1597,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("The keeper is not enabled."),
+          "503": transient503("The keeper is not enabled."),
           "500": errorResponse("The pass threw; the message is kept for the operator."),
         },
       },
@@ -1616,7 +1627,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("The keeper is not enabled."),
+          "503": transient503("The keeper is not enabled."),
         },
       },
     },
@@ -1646,7 +1657,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("This process has no indexer to pause."),
+          "503": transient503("This process has no indexer to pause."),
         },
       },
     },
@@ -1676,7 +1687,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("This process has no indexer to resume."),
+          "503": transient503("This process has no indexer to resume."),
         },
       },
     },

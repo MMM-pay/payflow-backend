@@ -1,7 +1,7 @@
 import { Server } from "node:http";
 import { loadConfig, networkConfigs } from "./config.ts";
 import { openStorage } from "./lib/store/index.ts";
-import { pruneOldEvents, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
+import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -180,13 +180,19 @@ const adminHooks: AdminHooks = {
     });
     return null;
   },
-  pruneData: async (daysToKeep: number) => {
+  pruneData: async (daysToKeep?: number) => {
     const db = defaultRuntime.db;
+    // Per-table retention: `daysToKeep` is an operator override for raw events
+    // from the admin endpoint; if absent, use the per-table config defaults.
+    const rawEventDays = daysToKeep ?? (config.RAW_EVENT_RETENTION_DAYS ?? config.DATA_RETENTION_DAYS);
+    const chargeAttemptDays = config.CHARGE_ATTEMPT_RETENTION_DAYS;
     try {
-      const deleted = await pruneOldEvents(db, daysToKeep);
+      const events = await pruneOldEvents(db, rawEventDays);
+      const chargeAttempts = await pruneChargeAttempts(db, chargeAttemptDays);
+      const deleted = { events, chargeAttempts };
       await logAuditEvent(db, {
         action: "data_pruned",
-        details: { deleted, daysToKeep },
+        details: { deleted, rawEventDays, chargeAttemptDays },
         success: true,
       });
       return { deleted };
@@ -195,7 +201,7 @@ const adminHooks: AdminHooks = {
         action: "data_pruned",
         success: false,
         errorMsg: err instanceof Error ? err.message : String(err),
-        details: { daysToKeep },
+        details: { rawEventDays, chargeAttemptDays },
       });
       throw err;
     }

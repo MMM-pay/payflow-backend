@@ -47,8 +47,8 @@ const BATCH_SKIPPED_ERROR =
   "charge_many skipped this mandate (not due, not active, or unfunded)";
 /** Consecutive failed attempts that make a mandate `charge.failing` (#145). */
 const FAILING_STREAK = 3;
-/** How long a charge attempt is kept in `charge_attempts` (#144). */
-const ATTEMPT_RETENTION_S = 90 * 24 * 60 * 60;
+/** Default retention for charge attempts when not set in config (#144, #348). */
+const DEFAULT_ATTEMPT_RETENTION_DAYS = 90;
 
 /**
  * The code of a submission stellar-core rejected (`txBadSeq`,
@@ -576,10 +576,13 @@ export class Keeper {
     this.announceRetirement(results);
     this.recordPass(now, results, skipped);
     // The attempted_at index makes this a range delete, cheap on every pass.
-    await this.db.run(
-      "DELETE FROM charge_attempts WHERE attempted_at < ?",
-      [now - ATTEMPT_RETENTION_S],
-    );
+    const retentionDays = this.config.CHARGE_ATTEMPT_RETENTION_DAYS ?? DEFAULT_ATTEMPT_RETENTION_DAYS;
+    if (retentionDays > 0) {
+      await this.db.run(
+        "DELETE FROM charge_attempts WHERE attempted_at < ?",
+        [now - retentionDays * 24 * 60 * 60],
+      );
+    }
     metrics.increment("keeper_passes");
     for (const result of results) {
       if (result.status === "settled") metrics.increment("charges_settled");

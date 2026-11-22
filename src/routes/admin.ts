@@ -18,7 +18,7 @@ export interface AdminHooks {
   keeperHistory?: () => unknown;
   pauseIndexer?: () => unknown;
   resumeIndexer?: () => unknown;
-  pruneData?: (daysToKeep: number) => Promise<unknown>;
+  pruneData?: (daysToKeep?: number) => Promise<unknown>;
   getAuditLogs?: (limit: number) => unknown;
   getPastDueMandates?: () => unknown;
 }
@@ -124,7 +124,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const run = hooks.reindex;
     if (!run) {
-      sendApiError(res, req, 503, "reindex_unavailable");
+      sendApiError(res, req, 503, "reindex_unavailable", undefined, undefined, 30);
       return;
     }
     await respond(req, res, "reindex_failed", run);
@@ -138,7 +138,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const run = hooks.keeperPass;
     if (!run) {
-      sendApiError(res, req, 503, "keeper_unavailable");
+      sendApiError(res, req, 503, "keeper_unavailable", undefined, undefined, 30);
       return;
     }
     await respond(req, res, "keeper_pass_failed", run);
@@ -152,7 +152,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const read = hooks.keeperBackoff;
     if (!read) {
-      sendApiError(res, req, 503, "keeper_unavailable");
+      sendApiError(res, req, 503, "keeper_unavailable", undefined, undefined, 30);
       return;
     }
     res.json({ status: "ok", backoff: read() ?? [] });
@@ -169,7 +169,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const pause = hooks.pauseIndexer;
     if (!pause) {
-      sendApiError(res, req, 503, "indexer_unavailable");
+      sendApiError(res, req, 503, "indexer_unavailable", undefined, undefined, 30);
       return;
     }
     res.json({ status: "ok", paused: true, result: (await pause()) ?? null });
@@ -183,7 +183,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const resume = hooks.resumeIndexer;
     if (!resume) {
-      sendApiError(res, req, 503, "indexer_unavailable");
+      sendApiError(res, req, 503, "indexer_unavailable", undefined, undefined, 30);
       return;
     }
     res.json({ status: "ok", paused: false, result: (await resume()) ?? null });
@@ -192,17 +192,17 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   r.post("/data/prune", async (req, res) => {
     const prune = hooks.pruneData;
     if (!prune) {
-      sendApiError(res, req, 503, "prune_unavailable");
+      sendApiError(res, req, 503, "prune_unavailable", undefined, undefined, 30);
       return;
     }
-    const daysToKeep = Math.max(0, Number(req.query.days ?? 30));
+    const daysToKeep = req.query.days !== undefined ? Math.max(0, Number(req.query.days)) : undefined;
     await respond(req, res, "prune_failed", () => prune(daysToKeep));
   });
 
   r.get("/audit-logs", async (req, res) => {
     const read = hooks.getAuditLogs;
     if (!read) {
-      sendApiError(res, req, 503, "audit_unavailable");
+      sendApiError(res, req, 503, "audit_unavailable", undefined, undefined, 30);
       return;
     }
     const limit = Math.min(1000, Math.max(1, Number(req.query.limit ?? 100)));
@@ -212,7 +212,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   r.get("/past-due", async (req, res) => {
     const read = hooks.getPastDueMandates;
     if (!read) {
-      sendApiError(res, req, 503, "indexer_unavailable");
+      sendApiError(res, req, 503, "indexer_unavailable", undefined, undefined, 30);
       return;
     }
     res.json({ status: "ok", past_due: (await read()) ?? [] });

@@ -1578,3 +1578,74 @@ describe("keeper failing streaks", () => {
     db.close();
   });
 });
+
+/**
+ * Issue #347: the keeper reuses a single RPC client across an entire pass.
+ *
+ * The Keeper stores `server` once in its constructor and never calls makeRpc
+ * internally, so the same FailoverRpc instance handles all calls within a pass.
+ * This test measures that: with N mandates, getFeeStats is called once per pass
+ * (not once per mandate) and all getAccount calls go to the same instance,
+ * confirming no per-mandate client reconstruction occurs.
+ */
+describe("keeper RPC client reuse (#347)", () => {
+  test("a single RPC instance handles all mandates in one pass", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    insertDue(db, 2, 1_001);
+    insertDue(db, 3, 1_002);
+
+    let feeStatsCalls = 0;
+    let getAccountCalls = 0;
+    const countingRpc: KeeperRpc = {
+      getFeeStats: async () => {
+        feeStatsCalls += 1;
+        return { sorobanInclusionFee: { p90: "1000" } } as never;
+      },
+      getAccount: async (address: string) => {
+        getAccountCalls += 1;
+        return new Account(address, "1") as never;
+      },
+      prepareTransaction: async (tx) => tx as Transaction,
+      sendTransaction: async (tx) => ({
+        status: "PENDING",
+        hash: Buffer.from((tx as Transaction).hash()).toString("hex"),
+      } as never),
+      getTransaction: async () => ({ status: rpc.Api.GetTransactionStatus.SUCCESS } as never),
+    };
+
+    const keeper = new Keeper(db, countingRpc, keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+    await keeper.tick(10_000);
+
+    // getFeeStats is called once per pass, not once per mandate.
+    assert.equal(feeStatsCalls, 1, "fee stats fetched once for the whole pass, not per mandate");
+    // getAccount is called exactly once per mandate (for the sequence number).
+    assert.equal(getAccountCalls, 3, "each mandate needs one account lookup for its sequence number");
+    db.close();
+  });
+
+  test("configurable charge attempt retention uses CHARGE_ATTEMPT_RETENTION_DAYS", async () => {
+    const db = openDatabase(":memory:");
+    const now = 100_000_000;
+    const thirtyDays = 30 * 24 * 60 * 60;
+    const insert = db.prepare(
+      `INSERT INTO charge_attempts (mandate_id, attempted_at, result, failures)
+       VALUES (?, ?, 'settled', 0)`,
+    );
+    insert.run(1, now - thirtyDays - 1);
+    insert.run(2, now - thirtyDays);
+    // Config overrides the default 90-day retention to 30 days.
+    const config = keeperConfig({ KEEPER_SECRET: keyA.secret() });
+    (config as unknown as Record<string, unknown>).CHARGE_ATTEMPT_RETENTION_DAYS = 30;
+    const keeper = new Keeper(db, fakeRpc(new Set([keyA.publicKey()])), config);
+
+    await keeper.tick(now);
+
+    assert.deepEqual(
+      attemptsOf(db).map((a) => a.mandate_id),
+      [2],
+      "only the attempt from beyond 30 days is gone when CHARGE_ATTEMPT_RETENTION_DAYS=30",
+    );
+    db.close();
+  });
+});

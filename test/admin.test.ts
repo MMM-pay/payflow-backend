@@ -45,12 +45,12 @@ const call = async (
   method: string,
   path: string,
   token?: string,
-): Promise<{ status: number; body: Record<string, unknown> }> => {
+): Promise<{ status: number; body: Record<string, unknown>; headers: Headers }> => {
   const res = await fetch(base + path, {
     method,
     headers: token === undefined ? {} : { authorization: `Bearer ${token}` },
   });
-  return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  return { status: res.status, body: (await res.json()) as Record<string, unknown>, headers: res.headers };
 };
 
 describe("admin routes", () => {
@@ -209,6 +209,37 @@ describe("admin routes", () => {
       const { status, body } = await call(app.base, "POST", "/admin/indexer/pause", TOKEN);
       assert.equal(status, 503);
       assert.equal((body.error as { code: string }).code, "indexer_unavailable");
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("transient 503 responses include Retry-After header (#346)", async () => {
+    const app = await startApp(testConfig(TOKEN), {});
+    try {
+      // reindex, keeper, indexer, prune and audit are all absent — each should 503 with Retry-After.
+      const endpoints: Array<[string, string]> = [
+        ["POST", "/admin/reindex"],
+        ["POST", "/admin/keeper/run"],
+        ["GET", "/admin/keeper/backoff"],
+        ["POST", "/admin/indexer/pause"],
+        ["POST", "/admin/indexer/resume"],
+        ["POST", "/admin/data/prune"],
+        ["GET", "/admin/audit-logs"],
+        ["GET", "/admin/past-due"],
+      ];
+      for (const [method, path] of endpoints) {
+        const { status, headers } = await call(app.base, method, path, TOKEN);
+        assert.equal(status, 503, `${method} ${path} should be 503`);
+        assert.ok(
+          headers.get("retry-after") !== null,
+          `${method} ${path} 503 must carry Retry-After`,
+        );
+        assert.ok(
+          Number(headers.get("retry-after")) > 0,
+          `${method} ${path} Retry-After must be a positive number of seconds`,
+        );
+      }
     } finally {
       app.stop();
     }
