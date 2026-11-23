@@ -178,6 +178,38 @@ function healthOf(runtime: NetworkRuntime): HealthResponse {
   };
 }
 
+export function isAmbiguousHttpRequest(req: Request): boolean {
+  const rawHeaders = req.rawHeaders ?? [];
+  let contentLengthCount = 0;
+  let transferEncodingCount = 0;
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const name = rawHeaders[i]?.toLowerCase() ?? "";
+    if (name === "content-length") contentLengthCount += 1;
+    else if (name === "transfer-encoding") transferEncodingCount += 1;
+  }
+  if (contentLengthCount > 1 || transferEncodingCount > 1) return true;
+
+  const hasContentLength = req.headers["content-length"] !== undefined;
+  const hasTransferEncoding = req.headers["transfer-encoding"] !== undefined;
+  if (hasContentLength && hasTransferEncoding) return true;
+
+  if (hasTransferEncoding) {
+    const value = String(req.headers["transfer-encoding"]).trim().toLowerCase();
+    if (value !== "chunked") return true;
+  }
+
+  if (hasContentLength) {
+    const value = String(req.headers["content-length"]).trim();
+    if (!/^\d+$/.test(value)) return true;
+  }
+
+  if (req.headers["upgrade"]) return true;
+  const connection = String(req.headers["connection"] ?? "").toLowerCase();
+  if (connection.includes("upgrade")) return true;
+
+  return false;
+}
+
 export function createApp(
   runtimes: NetworkRuntime[],
   config: Config,
@@ -332,6 +364,21 @@ export function createApp(
       });
     }),
   );
+  // Reject HTTP requests whose framing is ambiguous or non-canonical. A request
+  // that carries both Content-Length and Transfer-Encoding, duplicate or
+  // malformed framing headers, an unknown transfer coding, or a connection
+  // upgrade cannot be framed unambiguously, and leaving it to the next hop to
+  // guess is exactly what request smuggling relies on. Such requests are
+  // answered with 400 and the connection is closed instead of being parsed.
+  app.use((req, res, next) => {
+    if (isAmbiguousHttpRequest(req)) {
+      res.set("Connection", "close");
+      sendApiError(res, req, 400, "invalid_request", "The request uses ambiguous HTTP framing.");
+      return;
+    }
+    next();
+  });
+
   app.use(express.json({ limit: "64kb" }));
 
   // Count every completed request. The finish event fires once the response is

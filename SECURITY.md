@@ -49,3 +49,11 @@ and impact. Acknowledgement within 72 hours.
   non-public targets. DNS is checked again for each attempt and requests are
   pinned to the checked addresses; redirects are not followed. Update any
   existing webhook whose DNS points to an internal address.
+- **HTTP request framing is strict.** A request carrying both `Content-Length`
+  and `Transfer-Encoding`, duplicate or malformed framing headers, a transfer
+  coding other than `chunked`, or a connection upgrade
+  (`Upgrade`/`Connection: upgrade`) is rejected with `400 invalid_request` and
+  the connection is closed. Clients must send a single, unambiguous framing.
+  This is defense in depth against HTTP request smuggling; keep-alive reuse of a
+  connection after such a rejection is not allowed.
+
