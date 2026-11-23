@@ -11,7 +11,9 @@
     "lastError": null,
     "mismatchedEvents": 0,
     "reconciliations": 0,
-    "corrections": 0
+    "corrections": 0,
+    "eventsLedger": 0,
+    "eventsLag": 0
   },
   "rpc": null,
   "contracts": {
@@ -33,7 +35,9 @@
         "lastError": null,
         "mismatchedEvents": 0,
         "reconciliations": 0,
-        "corrections": 0
+        "corrections": 0,
+        "eventsLedger": 0,
+        "eventsLag": 0
       },
       "rpc": null,
       "contracts": {

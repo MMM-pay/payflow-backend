@@ -639,6 +639,10 @@ export interface HealthResponse {
     reconciliations: number;
     /** Mandate rows the reconciler has brought back in line with the chain. */
     corrections: number;
+    /** Last ledger the raw event stream reaches. */
+    eventsLedger: number;
+    /** Ledgers the projection trails the raw event stream by. */
+    eventsLag: number;
   } | null;
   rpc?: {
     active: string;
@@ -670,6 +674,10 @@ export interface SyncResponse {
   lag: number | null;
   /** True when `lag` is known and within the acceptable threshold (120 ledgers). */
   in_sync: boolean;
+  /** Last ledger the raw event stream reaches. */
+  events_ledger: number;
+  /** Ledgers the projection trails the raw event stream by. */
+  events_lag: number;
 }
 
 /**

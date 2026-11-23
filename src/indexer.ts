@@ -77,6 +77,16 @@ export interface IndexerStatus {
    */
   paused?: boolean;
   /**
+   * Last ledger the raw event stream (the `events` table) reaches. The
+   * projection's cursor may trail this when raw events have been retained
+   * but not yet projected, so the two can be compared.
+   */
+  eventsLedger?: number;
+  /**
+   * Ledgers the projection trails the raw event stream by.
+   */
+  eventsLag?: number;
+  /**
    * Reconcile passes run since process start. Each pass re-reads a sample of
    * active mandates from the contract and repairs drift the indexer may have
    * missed.
@@ -106,6 +116,8 @@ export class Indexer {
     lastLedgerCloseTime: null,
     freshnessSeconds: null,
     paused: false,
+    eventsLedger: 0,
+    eventsLag: 0,
   };
   /** Events since process start that failed spec validation. */
   get mismatchedEvents(): number {
@@ -118,6 +130,18 @@ export class Indexer {
    * {@link resume} — so the API keeps serving the current projection while an
    * operator investigates.
    */
+  /** Re-read the raw event stream's tip from the events table. */
+  private async refreshEventsLedger(): Promise<void> {
+    try {
+      const row = await this.db.get<{ m: number | null }>("SELECT MAX(ledger) AS m FROM events");
+      const m = row?.m ?? 0;
+      this.status.eventsLedger = m;
+      this.status.eventsLag = Math.max(0, m - (this.status.cursor ?? 0));
+    } catch {
+      // keep previous values
+    }
+  }
+
   pause(): void {
     this.status.paused = true;
   }
@@ -443,6 +467,7 @@ export class Indexer {
     // write nothing, so the saved cursor and projection are untouched and the
     // loop resumes exactly where it left off on resume.
     if (this.status.paused) {
+      await this.refreshEventsLedger();
       await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: this.status.cursor, latest: this.status.latest };
     }
@@ -459,6 +484,7 @@ export class Indexer {
     if (start > latest) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
+      await this.refreshEventsLedger();
       await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
@@ -469,6 +495,7 @@ export class Indexer {
     if (end <= start) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
+      await this.refreshEventsLedger();
       await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
@@ -532,6 +559,7 @@ export class Indexer {
 
     this.status.cursor = cursor;
     this.updateFreshness(latestCloseTime, lastSeenCloseTime, cursor, latest);
+    await this.refreshEventsLedger();
     // Windows applied before a failed fetch are real progress, so they count.
     this.reportProgress(start, startedAt, cursor, latest, applied, mismatched);
     await this.publishMetrics(applied);

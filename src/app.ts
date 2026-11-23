@@ -165,6 +165,8 @@ function healthOf(runtime: NetworkRuntime): HealthResponse {
           mismatchedEvents: indexer.mismatchedEvents ?? 0,
           reconciliations: indexer.reconciliations ?? 0,
           corrections: indexer.corrections ?? 0,
+          eventsLedger: indexer.eventsLedger ?? 0,
+          eventsLag: indexer.eventsLag ?? 0,
         }
       : null,
     rpc: rpc && "active" in rpc && Array.isArray(rpc.endpoints) ? { active: rpc.active, endpoints: rpc.endpoints } : null,
@@ -456,11 +458,15 @@ export function createApp(
     const indexer_ledger = indexer?.cursor ?? 0;
     const chain_ledger = indexer && indexer.latest > 0 ? indexer.latest : null;
     const lag = chain_ledger !== null ? Math.max(0, chain_ledger - indexer_ledger) : null;
+    const events_ledger = indexer?.eventsLedger ?? 0;
+    const events_lag = Math.max(0, events_ledger - indexer_ledger);
     const body: SyncResponse = {
       indexer_ledger,
       chain_ledger,
       lag,
       in_sync: lag !== null && lag <= MAX_LAG,
+      events_ledger,
+      events_lag,
     };
     res.json(body);
   });
