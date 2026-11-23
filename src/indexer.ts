@@ -133,8 +133,8 @@ export class Indexer {
   /** Re-read the raw event stream's tip from the events table. */
   private async refreshEventsLedger(): Promise<void> {
     try {
-      const row = await this.db.get<{ m: number | null }>("SELECT MAX(ledger) AS m FROM events");
-      const m = row?.m ?? 0;
+      const row = await this.db.get<{ m: number | string | null }>("SELECT MAX(ledger) AS m FROM events");
+      const m = Number(row?.m ?? 0);
       this.status.eventsLedger = m;
       this.status.eventsLag = Math.max(0, m - (this.status.cursor ?? 0));
     } catch {
