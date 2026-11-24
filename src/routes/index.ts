@@ -22,6 +22,7 @@ import { streamRouter } from "./stream.ts";
 import { vaultRouter } from "./vault.ts";
 import { webhooksRouter } from "./webhooks.ts";
 import { notificationPreferencesRouter } from "./notification-preferences.ts";
+import { keysRouter } from "./keys.ts";
 
 export { defaultMerchantSummaryCache, MerchantSummaryCache };
 
@@ -117,6 +118,7 @@ export function buildRoutes(
   r.use(subscribersRouter(db, auth));
   r.use(statsRouter(db));
   r.use(tokensRouter(tokens));
+  r.use(keysRouter(db, auth));
   if (events) r.use(streamRouter(events, db));
   if (auth) r.use(authRouter(auth));
   if (webhooks) r.use(webhooksRouter(db, webhooks, auth));

@@ -1,9 +1,10 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import express, { Router, type Request, type Response } from "express";
 import { Keypair, StrKey, WebAuth, xdr } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import type { Config, NetworkConfig } from "../config.ts";
 import type { RpcLike } from "../lib/stellar.ts";
+import type { Storage } from "../lib/store/types.ts";
 import type { AuthChallengeResponse, AuthTokenResponse } from "./types.ts";
 import { sendApiError } from "./errors.ts";
 import { validate, type Validated } from "./validate.ts";
@@ -274,6 +275,22 @@ export function sep10For(
   });
 }
 
+/** Prefix that distinguishes an API key from a SEP-10 JWT bearer token. */
+export const API_KEY_PREFIX = "pfk_";
+
+/** HMAC key used to hash API keys before storing them. */
+const API_KEY_HMAC_SECRET = "payflow-api-key-v1";
+
+/** Generate a new random API key with the `pfk_` prefix. */
+export function generateApiKey(): string {
+  return `${API_KEY_PREFIX}${randomBytes(20).toString("hex")}`;
+}
+
+/** One-way hash of an API key for safe storage. */
+export function hashApiKey(key: string): string {
+  return createHmac("sha256", API_KEY_HMAC_SECRET).update(key).digest("hex");
+}
+
 /**
  * The account a request's `Authorization: Bearer` SEP-10 token was issued to.
  * `value` is null when no Authorization header was sent, so the route falls
@@ -285,6 +302,64 @@ export function sessionOf(req: Request, res: Response, auth: Sep10Auth | undefin
   if (header === undefined) return { ok: true, value: null };
   const token = /^Bearer\s+(\S+)$/i.exec(header)?.[1];
   const account = token !== undefined && auth ? auth.verify(token) : null;
+  if (account === null) {
+    sendApiError(
+      res,
+      req,
+      401,
+      "unauthorized",
+      auth ? "The bearer token is invalid or has expired; sign in again." : "SEP-10 sign-in is not enabled on this instance.",
+    );
+    return { ok: false };
+  }
+  return { ok: true, value: account };
+}
+
+/**
+ * Async variant of `sessionOf` that also accepts per-merchant API keys.
+ *
+ * Returns the authenticated merchant address when the request carries a valid
+ * SEP-10 JWT or a valid, unrevoked `pfk_` API key. Returns `null` when no
+ * `Authorization` header was sent. Sends `401` and returns `{ ok: false }`
+ * for any malformed or revoked credential.
+ *
+ * Pass `db` to enable API key look-ups; without it, only SEP-10 JWT is checked.
+ */
+export async function resolveSession(
+  req: Request,
+  res: Response,
+  auth: Sep10Auth | undefined,
+  db?: Storage,
+): Promise<Validated<string | null>> {
+  const header = req.headers.authorization;
+  if (header === undefined) return { ok: true, value: null };
+  const token = /^Bearer\s+(\S+)$/i.exec(header)?.[1];
+  if (!token) {
+    sendApiError(res, req, 401, "unauthorized", "Invalid Authorization header format.");
+    return { ok: false };
+  }
+
+  // API key path: `pfk_` prefix distinguishes a key from a JWT.
+  if (token.startsWith(API_KEY_PREFIX) && db) {
+    const keyHash = hashApiKey(token);
+    const record = await db.get<{ id: number; merchant: string; scopes: string; revoked: number }>(
+      "SELECT id, merchant, scopes, revoked FROM merchant_api_keys WHERE key_hash = ?",
+      [keyHash],
+    );
+    if (!record || record.revoked !== 0) {
+      sendApiError(res, req, 401, "unauthorized", "The API key is invalid or has been revoked.");
+      return { ok: false };
+    }
+    // Update last_used_at; fire-and-forget is acceptable here.
+    void db.run(
+      "UPDATE merchant_api_keys SET last_used_at = ? WHERE id = ?",
+      [Math.floor(Date.now() / 1000), record.id],
+    );
+    return { ok: true, value: record.merchant };
+  }
+
+  // SEP-10 JWT path.
+  const account = auth ? auth.verify(token) : null;
   if (account === null) {
     sendApiError(
       res,

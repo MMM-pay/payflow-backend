@@ -42,6 +42,8 @@ import type {
 // src/routes/types.ts serves the handlers, this client and every consumer.
 export type {
   ApiErrorResponse,
+  ApiKeyCreateResponse,
+  ApiKeyListResponse,
   ChargeAttemptPage,
   ChargeAttemptRow,
   ChargePage,
@@ -57,6 +59,7 @@ export type {
   KeeperPassSummary,
   MandatePage,
   MandateRow,
+  MerchantApiKey,
   MerchantChurnResponse,
   MerchantNotificationPreferences,
   MerchantRevenueResponse,
