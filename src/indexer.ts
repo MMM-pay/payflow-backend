@@ -16,7 +16,10 @@ import {
   type Archive,
   type DecodedEvent,
 } from "./lib/stellar.ts";
-import { logger } from "./lib/logger.ts";
+import { childLogger } from "./lib/logger.ts";
+import { withSpan } from "./lib/telemetry.ts";
+
+const logger = childLogger("indexer");
 import { metrics, publishBusinessMetrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { defaultMerchantSummaryCache, type MerchantSummaryCache } from "./routes/index.ts";
 
@@ -463,6 +466,10 @@ export class Indexer {
    * safe.
    */
   async tick(): Promise<TickResult> {
+    return withSpan("indexer.tick", () => this.tickInner());
+  }
+
+  private async tickInner(): Promise<TickResult> {
     // Held back by an operator (`POST /admin/indexer/pause`): read nothing and
     // write nothing, so the saved cursor and projection are untouched and the
     // loop resumes exactly where it left off on resume.

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import type { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -381,15 +382,22 @@ export function createApp(
 
   app.use(express.json({ limit: "64kb" }));
 
-  // Count every completed request. The finish event fires once the response is
-  // sent, so the status code is final.
+  // Count every completed request and record its latency. The finish event
+  // fires once the response is sent, so the status code and route are final.
   app.use((_req, res, next) => {
+    const start = performance.now();
     res.on("finish", () => {
       const statusClass = `${Math.floor(res.statusCode / 100)}xx`;
       metrics.increment("http_requests", 1, { method: _req.method, status_class: statusClass });
       if (res.statusCode >= 500) {
         metrics.increment("http_errors");
       }
+      const route = (_req.route as { path?: string } | undefined)?.path ?? "unknown";
+      metrics.observe("http_request_duration_seconds", (performance.now() - start) / 1000, {
+        method: _req.method,
+        route,
+        status_class: statusClass,
+      });
     });
     next();
   });

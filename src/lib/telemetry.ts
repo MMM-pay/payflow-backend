@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
+import type { Storage } from "./store/types.ts";
 
 /**
  * Minimal OpenTelemetry tracing: spans are exported as OTLP/HTTP JSON to
@@ -109,6 +110,19 @@ export function traceRpc<T extends object>(server: T): T {
       if (typeof value !== "function" || typeof prop !== "string") return value;
       return (...args: unknown[]) =>
         withSpan(`rpc.${prop}`, async () => (await (value as (...a: unknown[]) => unknown).apply(target, args)) as never);
+    },
+  });
+}
+
+/** Wrap a Storage so every `all`, `get`, `run` and `transaction` call becomes a span named `db.<method>`. */
+export function traceStore<T extends Storage>(db: T): T {
+  return new Proxy(db, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop, target) as unknown;
+      if (typeof value !== "function" || typeof prop !== "string") return value;
+      if (!["all", "get", "run", "transaction", "close"].includes(prop)) return value;
+      return (...args: unknown[]) =>
+        withSpan(`db.${prop}`, async () => (await (value as (...a: unknown[]) => unknown).apply(target, args)) as never);
     },
   });
 }

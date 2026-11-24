@@ -10,7 +10,10 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import type { Config } from "./config.ts";
-import { logger } from "./lib/logger.ts";
+import { childLogger } from "./lib/logger.ts";
+import { withSpan } from "./lib/telemetry.ts";
+
+const logger = childLogger("keeper");
 import { metrics } from "./lib/metrics.ts";
 import { simulationSource } from "./lib/simulate.ts";
 import { asStorage } from "./lib/store/index.ts";
@@ -509,6 +512,10 @@ export class Keeper {
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
+    return withSpan("keeper.tick", () => this.tickInner(now));
+  }
+
+  private async tickInner(now: number): Promise<SettleResult[]> {
     const due = await this.findDue(now);
     const { chargeable, skipped } = await this.withoutShortfalls(due);
     const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;

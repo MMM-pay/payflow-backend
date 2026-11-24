@@ -24,3 +24,8 @@ export const logger = pino({
 });
 
 export type Logger = typeof logger;
+
+/** Create a child logger that includes `component` on every log line. */
+export function childLogger(component: string): Logger {
+  return logger.child({ component }) as Logger;
+}

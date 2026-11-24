@@ -26,7 +26,7 @@ import { SECONDS_PER_MONTH } from "../routes/helpers.ts";
 import { logger } from "./logger.ts";
 
 /** Prometheus metric types this service uses. */
-export type MetricType = "counter" | "gauge";
+export type MetricType = "counter" | "gauge" | "histogram";
 
 /** Labels attached to a sample, e.g. `{ network: "testnet" }`. */
 export type MetricLabels = Record<string, string>;
@@ -44,6 +44,30 @@ export interface MetricDefinition {
   name: string;
   help: string;
   type: MetricType;
+}
+
+/**
+ * A histogram metric definition.
+ *
+ * Upper-inclusive bucket boundaries in `buckets` (seconds for latency metrics).
+ * The `+Inf` bucket is always added automatically.
+ */
+export interface HistogramDefinition {
+  key: string;
+  name: string;
+  help: string;
+  /** Upper-inclusive bucket boundaries (e.g. [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]). */
+  buckets: number[];
+}
+
+/** One histogram's accumulated state for a single label-set. */
+interface HistogramSample {
+  definition: HistogramDefinition;
+  labels: MetricLabels;
+  /** Count per bucket (index matches `definition.buckets`); `+Inf` is a separate field. */
+  counts: number[];
+  sum: number;
+  count: number;
 }
 
 /**
@@ -128,6 +152,33 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
 ];
 
 /**
+ * Default HTTP latency buckets (seconds).
+ *
+ * Covers sub-millisecond database reads through multi-second slow queries.
+ * The same set Prometheus's Go client uses for HTTP handlers.
+ */
+export const HTTP_DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
+
+/** Default DB query latency buckets (seconds). */
+export const DB_DURATION_BUCKETS = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5];
+
+/** Histogram definitions used by the service. */
+export const HISTOGRAM_DEFINITIONS: HistogramDefinition[] = [
+  {
+    key: "http_request_duration_seconds",
+    name: "payflow_http_request_duration_seconds",
+    help: "HTTP request latency in seconds, labelled by method, route and status class.",
+    buckets: HTTP_DURATION_BUCKETS,
+  },
+  {
+    key: "db_query_duration_seconds",
+    name: "payflow_db_query_duration_seconds",
+    help: "Database query latency in seconds, labelled by operation (all/get/run) and dialect.",
+    buckets: DB_DURATION_BUCKETS,
+  },
+];
+
+/**
  * A sample's value: a plain count, or — for a gauge that carries money —
  * the amount's decimal string, kept as the projection computed it so not a
  * single digit is lost to floating-point rounding.
@@ -166,19 +217,27 @@ function sampleKey(definition: MetricDefinition, labels: MetricLabels): string {
 }
 
 /**
- * A registry of counters and gauges.
+ * A registry of counters, gauges and histograms.
  *
- * Counters only go up; gauges are set. There is no reset: the process's
- * lifetime is the window, and a restart is a new series in Prometheus, which
- * is what an operator wants to see anyway.
+ * Counters only go up; gauges are set; histograms accumulate observations.
+ * There is no reset: the process's lifetime is the window, and a restart is a
+ * new series in Prometheus, which is what an operator wants to see anyway.
  */
 export class MetricsRegistry {
   private readonly definitions = new Map<string, MetricDefinition>();
   private readonly samples = new Map<string, Sample>();
+  private readonly histogramDefs = new Map<string, HistogramDefinition>();
+  private readonly histogramSamples = new Map<string, HistogramSample>();
 
-  constructor(definitions: MetricDefinition[] = METRIC_DEFINITIONS) {
+  constructor(
+    definitions: MetricDefinition[] = METRIC_DEFINITIONS,
+    histogramDefinitions: HistogramDefinition[] = HISTOGRAM_DEFINITIONS,
+  ) {
     for (const definition of definitions) {
       this.definitions.set(definition.key, definition);
+    }
+    for (const definition of histogramDefinitions) {
+      this.histogramDefs.set(definition.key, definition);
     }
   }
 
@@ -234,9 +293,44 @@ export class MetricsRegistry {
     return this.samples.get(sampleKey(definition, labels))?.value;
   }
 
+  /**
+   * Record one observation in a histogram.
+   *
+   * The value is added to the `+Inf` bucket and to every upper-boundary bucket
+   * whose bound is ≥ the value, then accumulated in `_sum` and `_count`.
+   */
+  observe(key: string, value: number, labels: MetricLabels = {}): void {
+    const definition = this.histogramDefs.get(key);
+    if (!definition) return;
+    const id = `${definition.name}|${Object.keys(labels).sort().map((k) => `${k}=${labels[k] ?? ""}`).join(",")}`;
+    let sample = this.histogramSamples.get(id);
+    if (!sample) {
+      sample = { definition, labels: { ...labels }, counts: new Array<number>(definition.buckets.length).fill(0), sum: 0, count: 0 };
+      this.histogramSamples.set(id, sample);
+    }
+    for (let i = 0; i < definition.buckets.length; i++) {
+      if (value <= (definition.buckets[i] ?? Infinity)) sample.counts[i] = (sample.counts[i] ?? 0) + 1;
+    }
+    sample.sum += value;
+    sample.count += 1;
+  }
+
+  /**
+   * The count and sum of one histogram for a label-set, for tests.
+   */
+  histogramValue(key: string, labels: MetricLabels = {}): { count: number; sum: number } | undefined {
+    const definition = this.histogramDefs.get(key);
+    if (!definition) return undefined;
+    const id = `${definition.name}|${Object.keys(labels).sort().map((k) => `${k}=${labels[k] ?? ""}`).join(",")}`;
+    const sample = this.histogramSamples.get(id);
+    if (!sample) return undefined;
+    return { count: sample.count, sum: sample.sum };
+  }
+
   /** Forget every sample; the next render starts from zero. */
   reset(): void {
     this.samples.clear();
+    this.histogramSamples.clear();
   }
 
   /**
@@ -263,6 +357,32 @@ export class MetricsRegistry {
         lines.push(`${definition.name}${renderLabels(sample.labels)} ${sample.value}`);
       }
     }
+
+    // Histograms: each metric family is announced with its HELP/TYPE lines,
+    // then each label-set emits its bucket, sum and count lines.
+    for (const definition of this.histogramDefs.values()) {
+      lines.push(`# HELP ${definition.name} ${escapeHelp(definition.help)}`);
+      lines.push(`# TYPE ${definition.name} histogram`);
+      const histSamples = [...this.histogramSamples.values()]
+        .filter((s) => s.definition.name === definition.name)
+        .sort((a, b) =>
+          Object.keys(a.labels).sort().map((k) => `${k}=${a.labels[k]}`).join(",")
+            .localeCompare(Object.keys(b.labels).sort().map((k) => `${k}=${b.labels[k]}`).join(",")),
+        );
+      for (const sample of histSamples) {
+        const base = renderLabels(sample.labels);
+        const baseParts = base.length > 0 ? base.slice(0, -1) : "{";
+        const sep = base.length > 0 ? "," : "";
+        for (let i = 0; i < definition.buckets.length; i++) {
+          const le = String(definition.buckets[i]);
+          lines.push(`${definition.name}_bucket${baseParts}${sep}le="${le}"} ${sample.counts[i] ?? 0}`);
+        }
+        lines.push(`${definition.name}_bucket${baseParts}${sep}le="+Inf"} ${sample.count}`);
+        lines.push(`${definition.name}_sum${base} ${sample.sum}`);
+        lines.push(`${definition.name}_count${base} ${sample.count}`);
+      }
+    }
+
     return lines.length > 0 ? `${lines.join("\n")}\n` : "";
   }
 }
