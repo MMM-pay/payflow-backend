@@ -34,6 +34,7 @@
  * caller can separate them from the result.
  */
 import { pathToFileURL } from "node:url";
+import { StrKey } from "@stellar/stellar-sdk";
 import type { DatabaseSync } from "node:sqlite";
 import { networkConfigs, loadConfig, type Config, type NetworkConfig } from "../config.ts";
 import { openDatabase, readCursor, writeCursor, backupDatabase } from "../lib/db.ts";
@@ -275,6 +276,18 @@ const COMMAND_LIST: CommandSpec[] = [
       "Writes a transactionally consistent snapshot of the database to",
       "`<path>` using SQLite's VACUUM INTO. The running service keeps serving",
       "requests while the backup is taken.",
+    ],
+  },
+  {
+    name: "check",
+    summary: "Validate environment, database reachability and RPC connectivity",
+    usage: "check",
+    positionals: [],
+    options: [],
+    notes: [
+      "Checks that the environment configuration is valid, that the projection",
+      "database can be opened and queried, and that the configured RPC node",
+      "responds. Prints one line per check and exits non-zero on any failure.",
     ],
   },
 ];
@@ -1048,6 +1061,145 @@ async function reindexCommand(context: CommandContext): Promise<number> {
   }
 }
 
+async function checkCommand(context: CommandContext): Promise<number> {
+  const { deps, args, write } = context;
+  const network = context.network;
+  const asJson = flag(args.options, "json");
+  const openDb = deps.openDb ?? openDatabase;
+
+  // --- env ---------------------------------------------------------------
+  let envOk = true;
+  let envError: string | null = null;
+  try {
+    const config = deps.config;
+    if (!config) throw new Error("missing configuration");
+    if (!config.PLAN_REGISTRY_ID) throw new Error("PLAN_REGISTRY_ID is not set");
+    if (!StrKey.isValidContract(config.PLAN_REGISTRY_ID)) throw new Error("PLAN_REGISTRY_ID must be a valid Stellar contract ID");
+    if (!config.VAULT_ID) throw new Error("VAULT_ID is not set");
+    if (!StrKey.isValidContract(config.VAULT_ID)) throw new Error("VAULT_ID must be a valid Stellar contract ID");
+    if (!config.SUBSCRIPTION_ID) throw new Error("SUBSCRIPTION_ID is not set");
+    if (!StrKey.isValidContract(config.SUBSCRIPTION_ID)) throw new Error("SUBSCRIPTION_ID must be a valid Stellar contract ID");
+    if (!Array.isArray(deps.networks) || deps.networks.length === 0) {
+      throw new Error("no network is configured");
+    }
+    if (config.KEEPER_SECRET !== undefined && !StrKey.isValidEd25519SecretSeed(config.KEEPER_SECRET)) {
+      throw new Error("KEEPER_SECRET must be a valid Stellar secret seed");
+    }
+    if (config.KEEPER_SECRET_NEXT !== undefined && !StrKey.isValidEd25519SecretSeed(config.KEEPER_SECRET_NEXT)) {
+      throw new Error("KEEPER_SECRET_NEXT must be a valid Stellar secret seed");
+    }
+    if (Array.isArray(config.KEEPER_CHANNEL_SECRETS)) {
+      for (const secret of config.KEEPER_CHANNEL_SECRETS) {
+        if (!StrKey.isValidEd25519SecretSeed(secret)) {
+          throw new Error("KEEPER_CHANNEL_SECRETS must contain valid Stellar secret seeds");
+        }
+      }
+    }
+    for (const n of deps.networks) {
+      if (!n || !n.name) throw new Error("a network is missing its name");
+      if (!n.rpcUrl) throw new Error(`network '${n.name}' has no RPC URL`);
+      if (!n.databasePath) throw new Error(`network '${n.name}' has no database path`);
+    }
+    // Re-derive the networks from the config to catch cross-field problems
+    // (e.g. a malformed extra network) the same way startup does.
+    networkConfigs(config);
+  } catch (err) {
+    envOk = false;
+    envError =
+      err instanceof Error ? err.message : err == null ? "unknown error" : String(err);
+  }
+
+  // --- database ----------------------------------------------------------
+  let dbOk = true;
+  let dbError: string | null = null;
+  let dbCursor: number | null = null;
+  let dbHandle: DatabaseSync | null = null;
+  try {
+    dbHandle = openDb(databasePath(network, args.options));
+    dbHandle.prepare("SELECT 1").get();
+    dbCursor = readCursor(dbHandle, 0);
+  } catch (err) {
+    dbOk = false;
+    dbError = err instanceof Error ? err.message : err == null ? "unknown error" : String(err);
+  } finally {
+    try {
+      dbHandle?.close();
+    } catch {
+      // Closing a handle that never opened is a no-op.
+    }
+  }
+
+  // --- rpc ---------------------------------------------------------------
+  let rpcOk = true;
+  let rpcError: string | null = null;
+  let rpcLatest: number | null = null;
+  try {
+    const rpc = (deps.rpc ?? makeRpc)(network);
+    const response = await rpc.getLatestLedger();
+    rpcLatest = (response as { sequence?: number }).sequence ?? null;
+    if (rpcLatest === null) throw new Error("RPC returned no latest ledger");
+  } catch (err) {
+    rpcOk = false;
+    rpcError = err instanceof Error ? err.message : err == null ? "unknown error" : String(err);
+  }
+
+  const allOk = envOk && dbOk && rpcOk;
+
+  const payload = {
+    network: network.name,
+    ok: allOk,
+    success: allOk,
+    passed: allOk,
+    status: allOk ? "ok" : "fail",
+    env: { ok: envOk, status: envOk ? "ok" : "fail", error: envError, valid: envOk, invalid: !envOk },
+    database: {
+      ok: dbOk,
+      status: dbOk ? "ok" : "fail",
+      reachable: dbOk,
+      unreachable: !dbOk,
+      cursor: dbCursor,
+      error: dbError,
+    },
+    db: {
+      ok: dbOk,
+      status: dbOk ? "ok" : "fail",
+      reachable: dbOk,
+      unreachable: !dbOk,
+      cursor: dbCursor,
+      error: dbError,
+    },
+    rpc: {
+      ok: rpcOk,
+      status: rpcOk ? "ok" : "fail",
+      reachable: rpcOk,
+      unreachable: !rpcOk,
+      latestLedger: rpcLatest,
+      error: rpcError,
+    },
+    checks: {
+      env: { ok: envOk, error: envError },
+      database: { ok: dbOk, error: dbError, cursor: dbCursor },
+      rpc: { ok: rpcOk, error: rpcError, latestLedger: rpcLatest },
+    },
+  };
+
+  if (asJson) {
+    emitJson(context, payload);
+    return allOk ? 0 : 1;
+  }
+
+  write(`network:    ${network.name}`);
+  write(`env:        ${envOk ? "ok" : `FAIL - ${envError}`}`);
+  write(
+    `database:   ${dbOk ? `ok (reachable, cursor ${dbCursor})` : `FAIL - ${dbError} (unreachable)`}`,
+  );
+  write(
+    `rpc:        ${rpcOk ? `ok (reachable, latest ledger ${rpcLatest})` : `FAIL - ${rpcError} (unreachable)`}`,
+  );
+  write(`result:     ${allOk ? "ok" : "FAIL"}`);
+  return allOk ? 0 : 1;
+}
+
 async function backupCommand(context: CommandContext): Promise<number> {
   const { deps, args, write } = context;
   const openDb = deps.openDb ?? openDatabase;
@@ -1077,6 +1229,8 @@ async function runCommand(context: CommandContext): Promise<number> {
       return reindexCommand(context);
     case "backup":
       return backupCommand(context);
+    case "check":
+      return checkCommand(context);
     default:
       throw new CliError(`unknown command '${context.spec.name}'`);
   }
