@@ -38,12 +38,18 @@ export type MetricLabels = Record<string, string>;
  * `name` is the name Prometheus sees (`payflow_indexer_cursor`). Keeping the
  * two apart means the exported names can follow the Prometheus conventions
  * (a counter ends in `_total`) without leaking into the call sites.
+ *
+ * `maxSeries` caps how many distinct label sets this metric may hold. Once the
+ * cap is reached any new label combination is silently dropped. This prevents
+ * per-mandate or per-subscriber labels from growing the registry without bound.
+ * Defaults to `DEFAULT_MAX_SERIES` when absent.
  */
 export interface MetricDefinition {
   key: string;
   name: string;
   help: string;
   type: MetricType;
+  maxSeries?: number;
 }
 
 /**
@@ -69,6 +75,17 @@ interface HistogramSample {
   sum: number;
   count: number;
 }
+
+/**
+ * Default cap on distinct label sets per metric.
+ *
+ * This is deliberately generous: legitimate high-fan-out metrics (HTTP method ×
+ * status class = ≤ 15 combinations; networks = single digits) are well inside
+ * this limit. Only metrics that would grow proportionally to business data
+ * (mandates, merchants, subscribers) approach it, and those should never carry
+ * such labels — but the cap is a safety net for future changes.
+ */
+export const DEFAULT_MAX_SERIES = 1_000;
 
 /**
  * The metrics this service exports.
@@ -149,6 +166,13 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     help: "HTTP requests that ended with a 5xx status since the process started.",
     type: "counter",
   },
+  {
+    key: "build_info",
+    name: "payflow_build_info",
+    help: "Build and version information. Always 1; labels carry version, commit and node_version.",
+    type: "gauge",
+    maxSeries: 1,
+  },
 ];
 
 /**
@@ -228,6 +252,8 @@ export class MetricsRegistry {
   private readonly samples = new Map<string, Sample>();
   private readonly histogramDefs = new Map<string, HistogramDefinition>();
   private readonly histogramSamples = new Map<string, HistogramSample>();
+  /** Count of distinct label sets currently tracked per metric key. */
+  private readonly seriesCount = new Map<string, number>();
 
   constructor(
     definitions: MetricDefinition[] = METRIC_DEFINITIONS,
@@ -239,6 +265,28 @@ export class MetricsRegistry {
     for (const definition of histogramDefinitions) {
       this.histogramDefs.set(definition.key, definition);
     }
+  }
+
+  /**
+   * Whether a new label combination can be accepted for `definition`.
+   *
+   * Returns `true` when the sample already exists (an update is always
+   * allowed) or when the metric has capacity remaining under its `maxSeries`
+   * cap. Returns `false` and logs a warning the first time the cap is hit.
+   */
+  private canAccept(definition: MetricDefinition, id: string): boolean {
+    if (this.samples.has(id)) return true;
+    const max = definition.maxSeries ?? DEFAULT_MAX_SERIES;
+    const count = this.seriesCount.get(definition.key) ?? 0;
+    if (count >= max) {
+      logger.warn(
+        { metric: definition.key, maxSeries: max },
+        "metric cardinality cap reached; new label set dropped",
+      );
+      return false;
+    }
+    this.seriesCount.set(definition.key, count + 1);
+    return true;
   }
 
   /** The definition behind a key, or undefined when the key is unknown. */
@@ -259,6 +307,7 @@ export class MetricsRegistry {
       if (typeof existing.value === "number") existing.value += value;
       return;
     }
+    if (!this.canAccept(definition, id)) return;
     this.samples.set(id, { definition, labels: { ...labels }, value });
   }
 
@@ -267,6 +316,7 @@ export class MetricsRegistry {
     const definition = this.definitions.get(key);
     if (!definition) return;
     const id = sampleKey(definition, labels);
+    if (!this.canAccept(definition, id)) return;
     this.samples.set(id, { definition, labels: { ...labels }, value });
   }
 
@@ -283,6 +333,7 @@ export class MetricsRegistry {
     const definition = this.definitions.get(key);
     if (!definition) return;
     const id = sampleKey(definition, labels);
+    if (!this.canAccept(definition, id)) return;
     this.samples.set(id, { definition, labels: { ...labels }, value: value.toString() });
   }
 
@@ -331,6 +382,7 @@ export class MetricsRegistry {
   reset(): void {
     this.samples.clear();
     this.histogramSamples.clear();
+    this.seriesCount.clear();
   }
 
   /**
@@ -468,6 +520,25 @@ export async function readBusinessMetrics(db: Storage): Promise<BusinessMetrics>
     activeMerchants: merchants.size,
     mrr: mrr.toString(),
   };
+}
+
+/**
+ * Publish the build-info gauge once at startup.
+ *
+ * The gauge is always 1; the labels carry the version, commit and Node.js
+ * version so a Prometheus query can correlate scrapes with deployments:
+ *
+ *   payflow_build_info{version="0.2.0", commit="abc1234", node_version="v22.5.0"}
+ *
+ * Because `build_info` has `maxSeries: 1` only the first call takes effect.
+ * Calling it repeatedly is therefore safe — the gauge is set once and stays.
+ */
+export function publishBuildInfo(info: { version: string; commit: string; nodeVersion: string }): void {
+  metrics.set("build_info", 1, {
+    version: info.version,
+    commit: info.commit,
+    node_version: info.nodeVersion,
+  });
 }
 
 /**

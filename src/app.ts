@@ -25,7 +25,7 @@ import type { RpcStatus } from "./lib/stellar.ts";
 import type { WebhookDispatcher } from "./lib/webhooks.ts";
 import type { Sep10Auth } from "./routes/auth.ts";
 import { logger } from "./lib/logger.ts";
-import { metrics, publishBusinessMetrics, publishIndexerMetrics } from "./lib/metrics.ts";
+import { metrics, publishBuildInfo, publishBusinessMetrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
 import { getVersionInfo } from "./lib/version.ts";
 
@@ -448,6 +448,10 @@ export function createApp(
     res.setHeader("Cache-Control", "public, max-age=3600");
     res.type("text/javascript").send(REDOC_BUNDLE);
   });
+
+  // Publish build info once per process. The gauge uses maxSeries:1 so
+  // repeated createApp calls in tests do not accumulate extra series.
+  publishBuildInfo(getVersionInfo());
 
   // Prometheus metrics. Opt-in: without METRICS_ENABLED the path does not
   // exist and answers 404 like any other unknown route.
