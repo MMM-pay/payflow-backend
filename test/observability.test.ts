@@ -15,7 +15,7 @@ import pino from "pino";
 import { MetricsRegistry } from "../src/lib/metrics.ts";
 import { timedStorage } from "../src/lib/store/index.ts";
 import { SqliteStorage } from "../src/lib/store/sqlite.ts";
-import { traceStore, initTelemetry, withSpan } from "../src/lib/telemetry.ts";
+import { traceStore, initTelemetry } from "../src/lib/telemetry.ts";
 import { childLogger, redact } from "../src/lib/logger.ts";
 import { createApp } from "../src/app.ts";
 import { metrics } from "../src/lib/metrics.ts";
@@ -280,18 +280,12 @@ describe("childLogger (issue #289)", () => {
     assert.equal(record.ledger, 42);
   });
 
-  test("childLogger returns a logger with the requested component label", () => {
-    let out = "";
-    const sink = new Writable({
-      write(chunk: Buffer, _enc, cb) {
-        out += chunk.toString();
-        cb();
-      },
-    });
-    const baseLog = pino({ redact }, sink);
-    const child = baseLog.child({ component: "keeper" }) as typeof baseLog;
-    child.info("keeper pass");
-    const record = JSON.parse(out) as Record<string, unknown>;
-    assert.equal(record.component, "keeper");
+  test("childLogger returns a child logger whose bindings include the component", () => {
+    const child = childLogger("keeper");
+    // pino child loggers expose their fixed bindings through bindings()
+    const bindings = (child as unknown as { bindings: () => Record<string, unknown> }).bindings();
+    assert.equal(bindings.component, "keeper");
+    assert.equal(typeof child.info, "function");
+    assert.equal(typeof child.warn, "function");
   });
 });
