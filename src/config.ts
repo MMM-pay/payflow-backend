@@ -46,6 +46,64 @@ const postgresUrl = z.preprocess(
     .optional(),
 );
 
+/**
+ * A browser origin: `scheme://host` with an optional port, and nothing else.
+ *
+ * The `Origin` header a browser sends is exactly that shape, so an entry with
+ * a path, query, fragment or credentials could never match it. A wildcard
+ * host is refused because the CORS middleware compares exact origins and
+ * does not expand subdomain patterns.
+ */
+function parseCorsOrigin(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`"${raw}" is not a valid origin (use scheme://host[:port])`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`"${raw}" must use http or https`);
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error(`"${raw}" must not contain credentials`);
+  }
+  if (url.hostname.includes("*")) {
+    throw new Error(`"${raw}" must not contain a wildcard; list each origin`);
+  }
+  if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    throw new Error(`"${raw}" must be an origin only (no path, query or fragment)`);
+  }
+  return url.origin;
+}
+
+/**
+ * Resolve `CORS_ORIGIN` to the browser origins allowed to call the API.
+ *
+ * Every entry is pinned to an exact origin (`https://app.example`), so only
+ * that scheme, host and port is reflected. `*` — as the whole value, never
+ * beside a list — is the explicit opt-in to allow every origin. An empty
+ * value allows none: a deployment that has not listed its frontend refuses
+ * cross-origin browser reads instead of exposing the API to every site.
+ * SEP-10 paths are exempt and always answer `*`, as that spec requires.
+ */
+export function corsOrigins(raw: string | string[] | undefined): "*" | string[] {
+  if (Array.isArray(raw)) {
+    const listed = raw.map((value) => value.trim()).filter((value) => value !== "");
+    if (listed.includes("*")) {
+      if (listed.length === 1) return "*";
+      throw new Error('"*" must be the only value, or list the exact origins');
+    }
+    return [...new Set(listed.map(parseCorsOrigin))];
+  }
+  const value = (raw ?? "").trim();
+  if (value === "*") return "*";
+  const entries = value.split(",").map((part) => part.trim()).filter((part) => part !== "");
+  if (entries.includes("*")) {
+    throw new Error('"*" must be the only value, or list the exact origins');
+  }
+  return [...new Set(entries.map(parseCorsOrigin))];
+}
+
 const adminTokensSchema = z.array(
   z.object({
     token: z.string().min(16, "each admin token needs at least 16 characters"),
@@ -224,7 +282,25 @@ const schema = z.object({
     .transform((value) => value === "true"),
   DATABASE_URL: postgresUrl,
   DATABASE_PATH: z.string().default("./payflow.db"),
-  CORS_ORIGIN: z.string().default("*"),
+  /**
+   * Comma-separated exact origins a browser may call the API from. Empty
+   * (the default) allows none; `*` allows every origin. Validated at startup
+   * so a typo fails the boot instead of silently matching no request.
+   */
+  CORS_ORIGIN: z
+    .string()
+    .default("")
+    .transform((value, ctx) => {
+      try {
+        return corsOrigins(value);
+      } catch (err) {
+        ctx.addIssue({
+          code: "custom",
+          message: err instanceof Error ? err.message : "invalid origin list",
+        });
+        return z.NEVER;
+      }
+    }),
   LOG_LEVEL: z.string().default("info"),
   // An empty value means "not set": the shipped .env.example leaves the
   // variable blank, and a container that reads it must not refuse to start

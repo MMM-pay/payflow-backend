@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -211,6 +211,22 @@ interface WebhookRow {
 
 /** How one delivery attempt went. */
 type AttemptOutcome = Omit<WebhookTestResult, "deliveryId">;
+
+/**
+ * The `Idempotency-Key` a delivery carries: stable per (webhook, event), so
+ * the same event delivered twice — and every retry of it — presents the same
+ * key to the receiver, which can drop a repeat it has already processed.
+ */
+function idempotencyKeyFor(webhookId: number, eventId: string): string {
+  const digest = createHash("sha256").update(`${webhookId}:${eventId}`, "utf8").digest("hex");
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    digest.slice(12, 16),
+    digest.slice(16, 20),
+    digest.slice(20, 32),
+  ].join("-");
+}
 
 /**
  * The `Payflow-Signature` header: `sha256=<hex>` under the current secret
@@ -453,7 +469,10 @@ export class WebhookDispatcher {
     );
     if (!webhook) return null;
     const payload = JSON.stringify({ event: "ping", webhook_id: id, merchant });
-    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, randomUUID(), payload);
+    // A ping is a one-shot event, named by a fresh id so the (webhook, event)
+    // dedupe never suppresses it.
+    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, payload);
+    if (!delivery) return null;
     return { deliveryId: delivery.id, ...(await this.attempt(delivery, webhook)) };
   }
 
@@ -646,20 +665,34 @@ export class WebhookDispatcher {
 
   /** One pending delivery and a first attempt per webhook, under one idempotency key. */
   private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
-    const idempotencyKey = randomUUID();
     for (const webhook of webhooks) {
-      await this.attempt(await this.enqueue(webhook.id, eventId, idempotencyKey, payload), webhook);
+      const delivery = await this.enqueue(webhook.id, eventId, payload);
+      if (delivery === null) continue;
+      await this.attempt(delivery, webhook);
     }
   }
 
-  /** Store a pending delivery due now, before its first attempt. */
+  /**
+   * Store a pending delivery due now, before its first attempt.
+   *
+   * A `(webhook, event)` pair is delivered at most once: if a delivery for the
+   * same event already exists, its retries (or its completed attempt) are the
+   * whole history of that event and a second row would only double-count it.
+   * Returns null for that case so the caller sends nothing.
+   */
   private async enqueue(
     webhookId: number,
     eventId: string,
-    idempotencyKey: string,
     payload: string,
-  ): Promise<DeliveryRow> {
+  ): Promise<DeliveryRow | null> {
+    const existing = await this.db.get<{ id: number }>(
+      "SELECT id FROM webhook_deliveries WHERE webhook_id = ? AND event_id = ? LIMIT 1",
+      [webhookId, eventId],
+    );
+    if (existing) return null;
+
     const now = Math.floor(Date.now() / 1000);
+    const idempotencyKey = idempotencyKeyFor(webhookId, eventId);
     const row = await this.db.get<{ id: number }>(
       `INSERT INTO webhook_deliveries
          (webhook_id, event_id, idempotency_key, attempt, status, retry_at, payload, created_at)

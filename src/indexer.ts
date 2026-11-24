@@ -557,9 +557,14 @@ export class Indexer {
         for (const raw of result.value) {
           const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
           if (ct !== null) lastSeenCloseTime = ct;
-          await this.retain(raw, storage);
+          const firstDelivery = await this.retain(raw, storage);
           const decoded = decodeEvent(raw);
           if (!decoded) continue;
+          // The event was already retained — and projected, in the transaction
+          // that stored it — so this is a redelivery from an overlapping
+          // window or a rewound cursor. Applying it again would inflate the
+          // applied metric and could notify a webhook twice, so it is dropped.
+          if (!firstDelivery) continue;
           if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
           else windowMismatched += 1;
         }
@@ -589,11 +594,23 @@ export class Indexer {
   }
 
 
-  /** Preserve every event before decoding, including unknown contract events. */
-  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<void> {
+  /**
+   * Preserve every event before decoding, including unknown contract events.
+   *
+   * Returns true when this delivery added the row, and false when the event
+   * was already retained: the RPC id is stable across overlapping windows, so
+   * the caller can drop a duplicate instead of applying and counting it
+   * again. Retention and projection commit in the same transaction, so a row
+   * that is already present means its projection has been applied too.
+   */
+  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<boolean> {
     const eventId =
       raw.id ??
       `${raw.ledger}:${raw.txHash}:${raw.topic.map((topic) => topic.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`;
+    const existing = await storage.get<{ event_id: string }>(
+      "SELECT event_id FROM events WHERE event_id = ?",
+      [eventId],
+    );
     await storage.run(
       `INSERT OR IGNORE INTO events
          (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
@@ -609,6 +626,7 @@ export class Indexer {
         parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
       ],
     );
+    return existing === undefined;
   }
 
   /** Rebuild event-derived projections locally, without querying RPC. */

@@ -1002,7 +1002,7 @@ examined without API downtime.
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
 | `API_RATE_LIMIT_MAX` | `120` | Maximum requests per IP in each API rate-limit window |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus metrics at `/metrics` |
-| `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
+| `CORS_ORIGIN` | *(empty)* | Comma-separated exact browser origins allowed to call the API (`https://app.example`). Empty refuses cross-origin reads; `*` allows every origin. SEP-10 always answers `*` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
 | `ADMIN_TOKEN` | — | Bearer token for `/admin`. Unset keeps those routes disabled |
