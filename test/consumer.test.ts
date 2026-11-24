@@ -106,6 +106,9 @@ const ROUTES: FixtureRoute[] = [
     status: "200",
   },
   { file: "stats", method: "get", path: "/api/v1/stats", status: "200" },
+  // Edge-case shapes (#294)
+  { file: "mandates_empty_page", method: "get", path: "/api/v1/mandates", status: "200" },
+  { file: "plans_empty_page", method: "get", path: "/api/v1/plans", status: "200" },
 ];
 
 /** Fixtures that are not a response of a documented API route. */

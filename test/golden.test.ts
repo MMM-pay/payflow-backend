@@ -8,6 +8,7 @@ import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
+import { testAddress } from "./addresses.ts";
 
 /**
  * Golden response fixtures.
@@ -32,6 +33,8 @@ import type { DecodedEvent } from "../src/lib/stellar.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
+/** An address that has no mandates or keys — used for empty-page and not-found fixtures. */
+const NOBODY = testAddress(99);
 
 /** Frozen unix ms; every `Date.now()` in the app and the seed reads this. */
 const FIXED_NOW_MS = 1_750_000_000_000;
@@ -80,6 +83,8 @@ interface RouteSpec {
   path: string;
   /** Expected HTTP status; the body snapshot is the shape assertion. */
   status: number;
+  /** Extra request headers, e.g. Authorization for auth-error fixtures. */
+  headers?: Record<string, string>;
 }
 
 const ROUTES: RouteSpec[] = [
@@ -109,6 +114,14 @@ const ROUTES: RouteSpec[] = [
   { file: "error_invalid_ids", method: "GET", path: "/api/mandates?ids=1,nope", status: 400 },
   { file: "error_too_many_ids", method: "GET", path: `/api/mandates?ids=${Array.from({ length: 101 }, (_, i) => i + 1).join(",")}`, status: 400 },
   { file: "error_not_found", method: "GET", path: "/api/nope", status: 404 },
+  // Auth error shapes (#294): capture 401/403 envelopes so their field set is pinned.
+  { file: "error_keys_no_auth", method: "GET", path: `/api/merchants/${MERCHANT}/keys`, status: 401 },
+  { file: "error_keys_bad_token", method: "GET", path: `/api/merchants/${MERCHANT}/keys`, status: 401,
+    headers: { authorization: "Bearer not-a-valid-token" } },
+  { file: "error_keys_bad_address", method: "POST", path: "/api/merchants/not-a-stellar-addr/keys", status: 400 },
+  // Edge-case shapes: empty pages and absent-resource summaries.
+  { file: "mandates_empty_page", method: "GET", path: `/api/mandates?subscriber=${NOBODY}`, status: 200 },
+  { file: "plans_empty_page", method: "GET", path: `/api/plans?merchant=${NOBODY}`, status: 200 },
 ];
 
 let server: Server;
@@ -160,7 +173,7 @@ async function capture(route: RouteSpec): Promise<unknown> {
   // stable across runs.
   const res = await fetch(base + route.path, {
     method: route.method,
-    headers: { "x-request-id": "golden" },
+    headers: { "x-request-id": "golden", ...route.headers },
   });
   assert.equal(res.status, route.status, `${route.method} ${route.path} status`);
   return (await res.json()) as unknown;

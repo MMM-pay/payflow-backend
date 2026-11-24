@@ -790,3 +790,30 @@ export interface SyncResponse {
  * body — consumers now read `error.code`.
  */
 export type { ApiErrorBody as ApiErrorResponse, ApiErrorCode } from "./errors.ts";
+
+/** A per-merchant API key, as listed (the raw key is never returned after creation). */
+export interface MerchantApiKey {
+  id: number;
+  merchant: string;
+  /** First 12 characters of the key — enough to identify it, not enough to authenticate. */
+  keyPrefix: string;
+  name: string;
+  /** The operations this key permits; currently only "read". */
+  scopes: string[];
+  /** Unix seconds. */
+  createdAt: number;
+  /** Unix seconds of the last authenticated request; null if never used. */
+  lastUsedAt: number | null;
+}
+
+/** `POST /merchants/:address/keys`: the new key, returned this once only. */
+export interface ApiKeyCreateResponse extends MerchantApiKey {
+  /** The full raw API key. Store it now — it cannot be recovered later. */
+  key: string;
+}
+
+/** `GET /merchants/:address/keys`: all active API keys for the merchant. */
+export interface ApiKeyListResponse {
+  merchant: string;
+  keys: MerchantApiKey[];
+}

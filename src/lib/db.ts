@@ -370,6 +370,23 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS refresh_tokens_account ON refresh_tokens(account);
 CREATE INDEX IF NOT EXISTS refresh_tokens_expires ON refresh_tokens(expires_at);
+-- Per-merchant API keys with scopes. A key is HMAC-SHA256-hashed before storage
+-- so that a database read cannot be used to authenticate. key_prefix stores the
+-- first twelve characters for display ("ends in ...") without exposing the full key.
+-- scopes is a comma-separated list of granted scopes; currently only "read".
+CREATE TABLE IF NOT EXISTS merchant_api_keys (
+  id          INTEGER PRIMARY KEY,
+  merchant    TEXT    NOT NULL,
+  key_hash    TEXT    NOT NULL UNIQUE,
+  key_prefix  TEXT    NOT NULL,
+  name        TEXT    NOT NULL DEFAULT '',
+  scopes      TEXT    NOT NULL DEFAULT 'read',
+  created_at  INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS merchant_api_keys_merchant ON merchant_api_keys(merchant);
+CREATE INDEX IF NOT EXISTS merchant_api_keys_hash ON merchant_api_keys(key_hash);
 `;
 
 /**
