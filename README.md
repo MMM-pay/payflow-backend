@@ -16,6 +16,7 @@
 > **Live demo:** https://mmm-pay.github.io/payflow-frontend/ Â·
 > **Docs:** https://mmm-pay.github.io/payflow-docs/ ·
 > **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
+> **Database schema:** [docs/DATABASE.md](docs/DATABASE.md) ·
 > **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md) ·
 > **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) ·
 > **API conventions:** [docs/API_CONVENTIONS.md](docs/API_CONVENTIONS.md) ·
@@ -59,6 +60,9 @@ replays that range on restart. Every write is designed for that:
   cannot collapse a merchant's history onto one instant.
 - Mandate updates are guarded by `WHERE charges_made < ?`, so an out-of-order
   event can never move a mandate backwards.
+
+Every table, and which event writes which rows, is described in
+[docs/DATABASE.md](docs/DATABASE.md).
 
 
 ### Mandate lifecycle timeline
