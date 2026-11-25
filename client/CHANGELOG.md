@@ -8,6 +8,10 @@ All notable changes to `@mmm-pay/payflow-client`. The format follows
 
 ### Added
 
+- `subscriberUpcoming(address, days?)` for
+  `GET /api/v1/subscribers/:address/upcoming`: the charges a subscriber will
+  be billed over the next `days`, merged across every active mandate, with
+  `UpcomingCharge` and `UpcomingChargesResponse` exported as shared types.
 - `activeSubscribers` on plan responses and `sort: "subscribers"` in `plans()`:
   counts distinct subscribers with at least one active mandate per plan.
 - `chargeAttempts(mandateId, { limit })` for `GET /api/v1/mandates/:id/attempts`:

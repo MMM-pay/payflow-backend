@@ -217,7 +217,7 @@ describe("admin routes", () => {
   test("transient 503 responses include Retry-After header (#346)", async () => {
     const app = await startApp(testConfig(TOKEN), {});
     try {
-      // reindex, keeper, indexer, prune and audit are all absent — each should 503 with Retry-After.
+      // reindex, keeper, indexer, prune, audit and vacuum are all absent — each should 503 with Retry-After.
       const endpoints: Array<[string, string]> = [
         ["POST", "/admin/reindex"],
         ["POST", "/admin/keeper/run"],
@@ -227,6 +227,7 @@ describe("admin routes", () => {
         ["POST", "/admin/data/prune"],
         ["GET", "/admin/audit-logs"],
         ["GET", "/admin/past-due"],
+        ["POST", "/admin/db/vacuum"],
       ];
       for (const [method, path] of endpoints) {
         const { status, headers } = await call(app.base, method, path, TOKEN);
@@ -311,6 +312,71 @@ describe("admin routes", () => {
       // The endpoint should respond normally (200) since the read API does not
       // validate bearer tokens on public routes.
       assert.equal(res.status, 200, "admin token must not break access to public read API");
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("vacuum/analyze the database on demand", async () => {
+    let calls = 0;
+    const app = await startApp(testConfig(TOKEN), {
+      vacuumDb: async () => {
+        calls += 1;
+        return { vacuumed: true, optimized: true };
+      },
+    });
+    try {
+      const { status, body } = await call(app.base, "POST", "/admin/db/vacuum", TOKEN);
+      assert.equal(status, 200);
+      assert.equal(body.status, "ok");
+      assert.deepEqual(body.result, { vacuumed: true, optimized: true });
+      assert.equal(calls, 1);
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("say the database vacuum is unavailable when the hook is absent", async () => {
+    const app = await startApp(testConfig(TOKEN), {});
+    try {
+      const { status, body } = await call(app.base, "POST", "/admin/db/vacuum", TOKEN);
+      assert.equal(status, 503);
+      assert.equal((body.error as { code: string }).code, "vacuum_unavailable");
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("reject an unauthenticated vacuum request before running the hook", async () => {
+    let calls = 0;
+    const app = await startApp(testConfig(TOKEN), {
+      vacuumDb: async () => {
+        calls += 1;
+        return { vacuumed: true, optimized: true };
+      },
+    });
+    try {
+      const { status, body } = await call(app.base, "POST", "/admin/db/vacuum");
+      assert.equal(status, 401);
+      assert.equal((body.error as { code: string }).code, "unauthorized");
+      assert.equal(calls, 0, "hook must not run on an unauthenticated request");
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("report a failed vacuum as 500 with its message", async () => {
+    const app = await startApp(testConfig(TOKEN), {
+      vacuumDb: async () => {
+        throw new Error("disk full");
+      },
+    });
+    try {
+      const { status, body } = await call(app.base, "POST", "/admin/db/vacuum", TOKEN);
+      assert.equal(status, 500);
+      const err = body.error as { code: string; message: string };
+      assert.equal(err.code, "vacuum_failed");
+      assert.equal(err.message, "disk full");
     } finally {
       app.stop();
     }

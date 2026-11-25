@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { test, describe } from "node:test";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { Account, Keypair, StrKey, Transaction, nativeToScVal } from "@stellar/stellar-sdk";
 import type { rpc } from "@stellar/stellar-sdk";
 import { openDatabase, readCursor, writeCursor } from "../src/lib/db.ts";
+import type { Storage } from "../src/lib/store/types.ts";
 import { logger } from "../src/lib/logger.ts";
 import { planCli, runCli, type CliDeps, type CliRpc } from "../src/cmd/cli.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
@@ -130,8 +132,10 @@ function fakeRpc(
       if (chain.failLatest) throw new Error("rpc unreachable");
       return { sequence: chain.latest, closeTime: new Date(NOW * 1000).toISOString() } as never;
     },
-    getHealth: async () =>
-      ({ oldestLedger: chain.oldest, latestLedger: chain.latest }) as never,
+    getHealth: async () => {
+      if (chain.failLatest) throw new Error("rpc unreachable");
+      return { oldestLedger: chain.oldest, latestLedger: chain.latest } as never;
+    },
     getEvents: async (request: Record<string, unknown>) => {
       // A cursor request continues after the cursor; a range request returns
       // the events in [startLedger, endLedger). The cursor the answer carries
@@ -325,6 +329,18 @@ describe("cli help", () => {
     const text = plan.kind === "help" ? plan.text : "";
     assert.match(text, /--yes/);
     assert.match(text, /--from/);
+  });
+
+  test("doctor is listed and explains what a failure means", () => {
+    const overview = planCli(["--help"]);
+    assert.match(overview.kind === "help" ? overview.text : "", /\bdoctor\b/);
+    const plan = planCli(["doctor", "--help"]);
+    assert.equal(plan.kind, "help");
+    const text = plan.kind === "help" ? plan.text : "";
+    assert.match(text, /npm run cli -- doctor/);
+    assert.match(text, /exits/);
+    assert.match(text, /warning/);
+    assert.match(text, /Secrets are never printed/);
   });
 
   test("a command can be asked for help by name", () => {
@@ -557,6 +573,193 @@ describe("cli status", () => {
       assert.equal(result.code, 0);
       assert.match(result.stdout, /api:\s+.*— unknown/);
     });
+  });
+});
+
+describe("cli doctor", () => {
+  test("reports every check and exits zero when they all pass", async () => {
+    const result = await run(["doctor"], {
+      config: cliConfig({ KEEPER_SECRET: key.secret() }),
+    });
+    assert.equal(result.code, 0);
+    assert.match(result.stdout, /^network:\s+testnet$/m);
+    assert.match(result.stdout, /^env:\s+OK\s+3 contract\(s\) on testnet/m);
+    assert.match(result.stdout, /^keeper:\s+OK\s+signing with G/m);
+    assert.match(result.stdout, /^database:\s+OK\s+sqlite :memory: — cursor 100/m);
+    assert.match(result.stdout, /^rpc:\s+OK\s+https:\/\/rpc\.invalid — latest ledger 200 \(\d+ ms\)/m);
+    assert.match(result.stdout, /^projection:\s+OK\s+lag 100$/m);
+    assert.match(result.stdout, /^check:\s+ok$/m);
+  });
+
+  test("a warning is reported without failing the command", async () => {
+    const result = await run(["doctor"]);
+    assert.equal(result.code, 0, "a deployment without a keeper key is still readable");
+    assert.match(result.stdout, /^keeper:\s+WARN\s+not configured \(no KEEPER_SECRET\)/m);
+    assert.match(result.stdout, /^check:\s+ok \(1 warning\)$/m);
+  });
+
+  test("fails when the RPC cannot be reached, and still reports the rest", async () => {
+    const result = await run(["doctor"], {
+      config: cliConfig({ KEEPER_SECRET: key.secret() }),
+      rpc: () => fakeRpc({ latest: 200, oldest: 0, failLatest: true }),
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stdout, /^env:\s+OK/m);
+    assert.match(result.stdout, /^database:\s+OK/m);
+    assert.match(
+      result.stdout,
+      /^rpc:\s+FAIL\s+https:\/\/rpc\.invalid — unreachable: rpc unreachable/m,
+    );
+    assert.match(result.stdout, /^projection:\s+WARN\s+lag unknown: the RPC did not answer/m);
+    assert.match(result.stdout, /^check:\s+failed \(1 check\)$/m);
+  });
+
+  test("fails when the database cannot be opened", async () => {
+    const result = await run(["doctor"], {
+      config: cliConfig({ KEEPER_SECRET: key.secret() }),
+      openDb: () => {
+        throw new Error("unable to open database file");
+      },
+    });
+    assert.equal(result.code, 1);
+    assert.match(
+      result.stdout,
+      /^database:\s+FAIL\s+sqlite :memory: — cannot open: unable to open database file/m,
+    );
+    assert.match(result.stdout, /^projection:\s+WARN\s+lag unknown: the cursor could not be read/m);
+    assert.match(result.stdout, /^check:\s+failed \(1 check\)$/m);
+  });
+
+  test("a missing projection file is a failure, and doctor does not create one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "payflow-doctor-"));
+    const path = join(dir, "missing.db");
+    try {
+      const result = await run(["doctor"], {
+        networks: [cliNetwork({ databasePath: path })],
+      });
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /^database:\s+FAIL\s+sqlite .*missing\.db — no such file/m);
+      assert.equal(existsSync(path), false, "the health check left no database behind");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a database that is not a Payflow projection is refused", async () => {
+    const result = await run(["doctor"], {
+      openDb: () => {
+        const db = new DatabaseSync(":memory:");
+        db.exec("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)");
+        return db;
+      },
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stdout, /^database:\s+FAIL\s+sqlite :memory: — not a Payflow projection/m);
+  });
+
+  test("an invalid contract id fails the environment check", async () => {
+    const result = await run(["doctor"], {
+      networks: [cliNetwork({ subscriptionId: "not-a-contract" })],
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stdout, /^env:\s+FAIL\s+.*SUBSCRIPTION_ID is not a valid contract id/m);
+  });
+
+  test("half-configured SEP-10 sign-in fails the environment check", async () => {
+    const result = await run(["doctor"], {
+      config: cliConfig({ SEP10_SIGNING_KEY: key.secret() }),
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stdout, /^env:\s+FAIL\s+.*SEP-10/m);
+  });
+
+  test("an unusable keeper seed fails the keeper check without echoing it", async () => {
+    const result = await run(["doctor"], {
+      config: cliConfig({ KEEPER_SECRET: "S-not-a-seed", KEEPER_CHANNEL_SECRETS: [] }),
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stdout, /^keeper:\s+FAIL\s+KEEPER_SECRET is not a valid Stellar secret seed/m);
+    assert.ok(!result.stdout.includes("S-not-a-seed"));
+  });
+
+  test("never prints a valid keeper secret", async () => {
+    const secret = key.secret();
+    const result = await run(["doctor"], {
+      config: cliConfig({ KEEPER_SECRET: secret }),
+    });
+    assert.equal(result.code, 0);
+    assert.ok(!result.stdout.includes(secret));
+    assert.ok(result.stdout.includes(key.publicKey()));
+  });
+
+  test("checks PostgreSQL through the configured store and redacts the password", async () => {
+    const url = "postgres://payflow:s3cretpw@db.invalid:5432/payflow";
+    const store: Storage = {
+      dialect: "postgres",
+      all: async () => [],
+      get: async () => ({ last_ledger: 150 }) as never,
+      run: async () => {},
+      transaction: async (work) => work(store),
+      close: async () => {},
+    };
+    const result = await run(["doctor"], {
+      networks: [cliNetwork({ databaseUrl: url })],
+      openStore: async () => store,
+    });
+    assert.equal(result.code, 0);
+    assert.match(result.stdout, /^database:\s+OK\s+postgres .*cursor 150/m);
+    assert.match(result.stdout, /^projection:\s+OK\s+lag 50$/m);
+    assert.ok(!result.stdout.includes("s3cretpw"), "the password is not printed");
+    assert.match(result.stdout, /redacted/);
+  });
+
+  test("an unreachable PostgreSQL is reported as a failed check", async () => {
+    const result = await run(["doctor"], {
+      networks: [cliNetwork({ databaseUrl: "postgres://payflow:s3cretpw@db.invalid/payflow" })],
+      openStore: async () => {
+        throw new Error("connect ECONNREFUSED");
+      },
+    });
+    assert.equal(result.code, 1);
+    assert.match(result.stdout, /^database:\s+FAIL\s+postgres .*unreachable: connect ECONNREFUSED/m);
+    assert.ok(!result.stdout.includes("s3cretpw"));
+  });
+
+  test("prints the report as JSON when asked for it", async () => {
+    const result = await run(["doctor", "--json"]);
+    assert.equal(result.code, 0);
+    const payload = JSON.parse(result.stdout) as {
+      network: string;
+      ok: boolean;
+      verdict: string;
+      lag: number;
+      checks: { name: string; status: string; detail: string }[];
+    };
+    assert.equal(payload.network, "testnet");
+    assert.equal(payload.ok, true);
+    assert.equal(payload.verdict, "ok (1 warning)");
+    assert.equal(payload.lag, 100);
+    assert.deepEqual(
+      payload.checks.map((check) => check.name),
+      ["env", "keeper", "database", "rpc", "projection"],
+    );
+    assert.equal(payload.checks.find((check) => check.name === "keeper")!.status, "warn");
+  });
+
+  test("the JSON output is the whole report, so it stays parseable", async () => {
+    const result = await run(["doctor", "--json"], {
+      rpc: () => fakeRpc({ latest: 200, oldest: 0, failLatest: true }),
+    });
+    assert.equal(result.code, 1);
+    const payload = JSON.parse(result.stdout) as { ok: boolean; checks: { name: string; status: string }[] };
+    assert.equal(payload.ok, false);
+    assert.equal(payload.checks.find((check) => check.name === "rpc")!.status, "fail");
+  });
+
+  test("refuses a network it does not know", async () => {
+    const result = await run(["doctor", "--network", "mainnet"]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /unknown network 'mainnet'/);
   });
 });
 

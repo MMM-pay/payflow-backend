@@ -22,6 +22,8 @@ const config = {
   NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
   // A throwaway testnet key; the fake RPC never submits anything.
   KEEPER_SECRET: "SBK2VIYYSVG76E7VC3QHYARNFLY2EAQXDHRC7BMXBBGIFG74ARPRMNQM",
+  // Exact retry times; the jitter has its own tests in keeper.test.ts.
+  KEEPER_BACKOFF_JITTER: 0,
 } as unknown as Config;
 
 /** The indexer reads the network it was constructed with. */

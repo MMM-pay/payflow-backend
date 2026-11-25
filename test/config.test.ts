@@ -149,6 +149,171 @@ describe("keeper channel secrets", () => {
       "a public key is not a signing secret",
     );
   });
+
+  test("a malformed channel secret fails startup without printing the secret", () => {
+    // One character off a real seed: the checksum fails, and the error
+    // must name the variable, never echo the value.
+    const real = Keypair.random().secret();
+    const broken = `${real.slice(0, -1)}${real.endsWith("A") ? "B" : "A"}`;
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_SECRET: real, KEEPER_CHANNEL_SECRETS: broken }),
+      (err: Error) => {
+        assert.match(err.message, /KEEPER_CHANNEL_SECRETS/);
+        assert.ok(!err.message.includes(broken), "the rejected secret is not in the message");
+        assert.ok(!err.message.includes(real), "no other secret is in the message either");
+        return true;
+      },
+    );
+  });
+});
+
+describe("keeper channel balance threshold", () => {
+  test("defaults to two XLM and accepts up to seven decimal places", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_CHANNEL_MIN_XLM, "2");
+    assert.equal(
+      loadConfig({ ...BASE, KEEPER_CHANNEL_MIN_XLM: "0.0000001" }).KEEPER_CHANNEL_MIN_XLM,
+      "0.0000001",
+    );
+  });
+
+  test("rejects malformed or over-precise XLM balances", () => {
+    for (const value of ["-1", "1e2", "0.00000001", "1."]) {
+      assert.throws(
+        () => loadConfig({ ...BASE, KEEPER_CHANNEL_MIN_XLM: value }),
+        /KEEPER_CHANNEL_MIN_XLM/,
+      );
+    }
+  });
+});
+
+describe("keeper backoff settings (#248)", () => {
+  test("default to 60 s doubling up to 6 h, with 10% jitter", () => {
+    const config = loadConfig({ ...BASE });
+    assert.deepEqual(
+      [config.KEEPER_BACKOFF_BASE_S, config.KEEPER_BACKOFF_MULTIPLIER, config.KEEPER_BACKOFF_MAX_S, config.KEEPER_BACKOFF_JITTER],
+      [60, 2, 21_600, 0.1],
+    );
+  });
+
+  test("accept a valid schedule, a fractional multiplier and jitter turned off", () => {
+    const config = loadConfig({
+      ...BASE,
+      KEEPER_BACKOFF_BASE_S: "30",
+      KEEPER_BACKOFF_MULTIPLIER: "1.5",
+      KEEPER_BACKOFF_MAX_S: "30",
+      KEEPER_BACKOFF_JITTER: "0",
+    });
+    assert.deepEqual(
+      [config.KEEPER_BACKOFF_BASE_S, config.KEEPER_BACKOFF_MULTIPLIER, config.KEEPER_BACKOFF_MAX_S, config.KEEPER_BACKOFF_JITTER],
+      [30, 1.5, 30, 0],
+    );
+  });
+
+  test("an invalid value fails startup with its name", () => {
+    const invalid: [Record<string, string>, RegExp][] = [
+      [{ KEEPER_BACKOFF_BASE_S: "0" }, /KEEPER_BACKOFF_BASE_S: must be at least 1 second/],
+      [{ KEEPER_BACKOFF_BASE_S: "-60" }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_BASE_S: "1.5" }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_BASE_S: "soon" }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_MULTIPLIER: "0.5" }, /KEEPER_BACKOFF_MULTIPLIER: must be at least 1/],
+      [{ KEEPER_BACKOFF_MULTIPLIER: "0" }, /KEEPER_BACKOFF_MULTIPLIER/],
+      [{ KEEPER_BACKOFF_MAX_S: "0" }, /KEEPER_BACKOFF_MAX_S/],
+      [{ KEEPER_BACKOFF_MAX_S: "604801" }, /KEEPER_BACKOFF_MAX_S: must be at most 604800/],
+      [{ KEEPER_BACKOFF_JITTER: "-0.1" }, /KEEPER_BACKOFF_JITTER/],
+      [{ KEEPER_BACKOFF_JITTER: "0.6" }, /KEEPER_BACKOFF_JITTER: must be between 0 and 0.5/],
+    ];
+    for (const [env, message] of invalid) {
+      assert.throws(() => loadConfig({ ...BASE, ...env }), message, JSON.stringify(env));
+    }
+  });
+
+  test("a cap below the base delay fails startup", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_BACKOFF_BASE_S: "600", KEEPER_BACKOFF_MAX_S: "300" }),
+      /KEEPER_BACKOFF_MAX_S=300 is below KEEPER_BACKOFF_BASE_S=600/,
+    );
+    // Equal is a flat schedule, which is allowed.
+    assert.equal(loadConfig({ ...BASE, KEEPER_BACKOFF_BASE_S: "300", KEEPER_BACKOFF_MAX_S: "300" }).KEEPER_BACKOFF_MAX_S, 300);
+  });
+
+  test("a cap that outlasts the attempt log fails startup, unless the log is kept forever", () => {
+    const env = { ...BASE, KEEPER_BACKOFF_MAX_S: String(2 * 86_400) };
+    assert.throws(
+      () => loadConfig({ ...env, CHARGE_ATTEMPT_RETENTION_DAYS: "1" }),
+      /KEEPER_BACKOFF_MAX_S=172800 outlasts CHARGE_ATTEMPT_RETENTION_DAYS=1/,
+    );
+    assert.equal(loadConfig({ ...env, CHARGE_ATTEMPT_RETENTION_DAYS: "2" }).KEEPER_BACKOFF_MAX_S, 172_800);
+    assert.equal(loadConfig({ ...env, CHARGE_ATTEMPT_RETENTION_DAYS: "0" }).KEEPER_BACKOFF_MAX_S, 172_800);
+  });
+});
+
+describe("keeper concurrency cap (KEEPER_CONCURRENCY)", () => {
+  const primary = Keypair.random().secret();
+  const channelB = Keypair.random().secret();
+  const channelC = Keypair.random().secret();
+
+  test("unset or blank means one transaction per channel", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_CONCURRENCY, undefined);
+    assert.equal(loadConfig({ ...BASE, KEEPER_CONCURRENCY: "" }).KEEPER_CONCURRENCY, undefined);
+  });
+
+  test("accepts a cap up to the number of channel accounts", () => {
+    const env = { ...BASE, KEEPER_SECRET: primary, KEEPER_CHANNEL_SECRETS: `${channelB},${channelC}` };
+    assert.equal(loadConfig({ ...env, KEEPER_CONCURRENCY: "1" }).KEEPER_CONCURRENCY, 1);
+    assert.equal(loadConfig({ ...env, KEEPER_CONCURRENCY: "3" }).KEEPER_CONCURRENCY, 3);
+  });
+
+  test("zero, negative, fractional and non-numeric caps are rejected", () => {
+    for (const bad of ["0", "-1", "1.5", "two"]) {
+      assert.throws(
+        () => loadConfig({ ...BASE, KEEPER_SECRET: primary, KEEPER_CONCURRENCY: bad }),
+        /KEEPER_CONCURRENCY/,
+        `KEEPER_CONCURRENCY=${bad} is rejected`,
+      );
+    }
+  });
+
+  test("a cap above the channel count is rejected at startup, naming counts but no secret", () => {
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          KEEPER_SECRET: primary,
+          KEEPER_CHANNEL_SECRETS: channelB,
+          KEEPER_CONCURRENCY: "3",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /KEEPER_CONCURRENCY=3 exceeds the 2 keeper channel account/);
+        for (const secret of [primary, channelB]) {
+          assert.ok(!err.message.includes(secret), "no secret is printed");
+        }
+        return true;
+      },
+    );
+  });
+
+  test("duplicate and standby keys do not count as extra channels", () => {
+    // KEEPER_SECRET_NEXT is a standby inside the primary channel, and a
+    // repeated channel key collapses, exactly as the keeper builds them.
+    const next = Keypair.random().secret();
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          KEEPER_SECRET: primary,
+          KEEPER_SECRET_NEXT: next,
+          KEEPER_CHANNEL_SECRETS: `${primary},${next},${channelB},${channelB}`,
+          KEEPER_CONCURRENCY: "3",
+        }),
+      /exceeds the 2 keeper channel account/,
+    );
+  });
+
+  test("KEEPER_CLAIM_TTL_S defaults to five minutes and refuses less than a minute", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_CLAIM_TTL_S, 300);
+    assert.equal(loadConfig({ ...BASE, KEEPER_CLAIM_TTL_S: "120" }).KEEPER_CLAIM_TTL_S, 120);
+    assert.throws(() => loadConfig({ ...BASE, KEEPER_CLAIM_TTL_S: "10" }), /KEEPER_CLAIM_TTL_S/);
+  });
 });
 
 describe("keeper inclusion fee configuration", () => {
@@ -259,6 +424,50 @@ describe("network configs", () => {
     assert.deepEqual(networks.map((network) => network.databaseUrl), [overrides.DATABASE_URL, overrides.DATABASE_URL]);
   });
 
+  test("DATABASE_URL gives every network the same pool sizing and timeouts (#263)", () => {
+    const overrides = {
+      DATABASE_URL: "postgres://payflow:secret@db.example/payflow",
+      DATABASE_POOL_MAX: "20",
+      DATABASE_ACQUIRE_TIMEOUT_MS: "2000",
+      DATABASE_STATEMENT_TIMEOUT_MS: "5000",
+      NETWORKS: "mainnet",
+      MAINNET_SOROBAN_RPC_URL: "https://mainnet.sorobanrpc.example",
+      MAINNET_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+      MAINNET_PLAN_REGISTRY_ID: VALID_CONTRACT_ID,
+      MAINNET_VAULT_ID: VALID_CONTRACT_ID,
+      MAINNET_SUBSCRIPTION_ID: VALID_CONTRACT_ID,
+    };
+    const networks = networkConfigs(loadConfig(env(overrides)), env(overrides));
+    assert.equal(networks.length, 2);
+    for (const network of networks) {
+      assert.deepEqual(network.pool, {
+        max: 20,
+        acquireTimeoutMs: 2_000,
+        statementTimeoutMs: 5_000,
+      });
+    }
+  });
+
+  test("the pool defaults are bounded: 10 connections, 10 s to acquire, 30 s per statement", () => {
+    const config = loadConfig(env());
+    assert.equal(config.DATABASE_POOL_MAX, 10);
+    assert.equal(config.DATABASE_ACQUIRE_TIMEOUT_MS, 10_000);
+    assert.equal(config.DATABASE_STATEMENT_TIMEOUT_MS, 30_000);
+  });
+
+  test("a pool of zero, more than 100, or a zero timeout is rejected", () => {
+    assert.throws(() => loadConfig(env({ DATABASE_POOL_MAX: "0" })), /DATABASE_POOL_MAX/);
+    assert.throws(() => loadConfig(env({ DATABASE_POOL_MAX: "101" })), /DATABASE_POOL_MAX/);
+    assert.throws(
+      () => loadConfig(env({ DATABASE_ACQUIRE_TIMEOUT_MS: "0" })),
+      /DATABASE_ACQUIRE_TIMEOUT_MS/,
+    );
+    assert.throws(
+      () => loadConfig(env({ DATABASE_STATEMENT_TIMEOUT_MS: "-1" })),
+      /DATABASE_STATEMENT_TIMEOUT_MS/,
+    );
+  });
+
   test("DATABASE_URL must use PostgreSQL protocol", () => {
     assert.throws(
       () => loadConfig({ ...BASE, DATABASE_URL: "https://db.example/payflow" }),
@@ -295,6 +504,52 @@ describe("network configs", () => {
     const overrides = { INDEXER_PROGRESS_LEDGERS: "0" };
     assert.equal(networkConfigs(loadConfig(env(overrides)), env(overrides))[0]!.progressLedgers, 0);
     assert.throws(() => loadConfig(env({ INDEXER_PROGRESS_LEDGERS: "-1" })), /INDEXER_PROGRESS_LEDGERS/);
+  });
+
+  test("every network carries the indexing batch size and poll interval (#241)", () => {
+    const defaults = loadConfig(env());
+    assert.equal(defaults.INDEXER_BATCH_SIZE, 8_000, "the RPC's own getEvents window");
+    assert.equal(defaults.INDEXER_INTERVAL_MS, 10_000);
+    const [network] = networkConfigs(defaults, env());
+    assert.equal(network!.batchSize, 8_000);
+    assert.equal(network!.indexerIntervalMs, 10_000);
+
+    const tuned = { INDEXER_BATCH_SIZE: "1000", INDEXER_INTERVAL_MS: "2500" };
+    const [tunedNetwork] = networkConfigs(loadConfig(env(tuned)), env(tuned));
+    assert.equal(tunedNetwork!.batchSize, 1_000);
+    assert.equal(tunedNetwork!.indexerIntervalMs, 2_500);
+  });
+
+  test("a network overrides the batch size and poll interval with its own prefix (#241)", () => {
+    const overrides = {
+      NETWORKS: "mainnet",
+      MAINNET_SOROBAN_RPC_URL: "https://mainnet.sorobanrpc.example",
+      MAINNET_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+      MAINNET_PLAN_REGISTRY_ID: VALID_CONTRACT_ID,
+      MAINNET_VAULT_ID: VALID_CONTRACT_ID,
+      MAINNET_SUBSCRIPTION_ID: VALID_CONTRACT_ID,
+      MAINNET_INDEXER_BATCH_SIZE: "1000",
+      MAINNET_INDEXER_INTERVAL_MS: "2500",
+    };
+    const networks = networkConfigs(loadConfig(env(overrides)), env(overrides));
+    const mainnet = networks.find((network) => network.name === "mainnet")!;
+    const testnet = networks.find((network) => network.name !== "mainnet")!;
+    assert.equal(mainnet.batchSize, 1_000);
+    assert.equal(mainnet.indexerIntervalMs, 2_500);
+    assert.equal(testnet.batchSize, 8_000, "the other network keeps the default");
+    assert.equal(testnet.indexerIntervalMs, 10_000);
+
+    assert.throws(
+      () => networkConfigs(loadConfig(env({ ...overrides, MAINNET_INDEXER_BATCH_SIZE: "8001" })), env({ ...overrides, MAINNET_INDEXER_BATCH_SIZE: "8001" })),
+      /MAINNET_INDEXER_BATCH_SIZE/,
+    );
+  });
+
+  test("rejects a batch size outside 1-8000 and a non-positive poll interval", () => {
+    assert.throws(() => loadConfig(env({ INDEXER_BATCH_SIZE: "0" })), /INDEXER_BATCH_SIZE/);
+    assert.throws(() => loadConfig(env({ INDEXER_BATCH_SIZE: "8001" })), /INDEXER_BATCH_SIZE/);
+    assert.throws(() => loadConfig(env({ INDEXER_BATCH_SIZE: "many" })), /INDEXER_BATCH_SIZE/);
+    assert.throws(() => loadConfig(env({ INDEXER_INTERVAL_MS: "0" })), /INDEXER_INTERVAL_MS/);
   });
 
   test("naming the default network in NETWORKS does not duplicate it", () => {

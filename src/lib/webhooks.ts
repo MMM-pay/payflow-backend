@@ -469,10 +469,8 @@ export class WebhookDispatcher {
     );
     if (!webhook) return null;
     const payload = JSON.stringify({ event: "ping", webhook_id: id, merchant });
-    // A ping is a one-shot event, named by a fresh id so the (webhook, event)
-    // dedupe never suppresses it.
-    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, payload);
-    if (!delivery) return null;
+    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, randomUUID(), payload);
+    if (!delivery) throw new Error("webhook ping unexpectedly matched an existing event");
     return { deliveryId: delivery.id, ...(await this.attempt(delivery, webhook)) };
   }
 
@@ -621,7 +619,7 @@ export class WebhookDispatcher {
     const webhooks = await this.listWebhooks(merchantAddress);
     if (webhooks.length === 0) return;
 
-    const eventId = `charge:${e.txHash}`;
+    const eventId = `charge:${e.txHash}:${num(mandateId)}`;
     const payload = JSON.stringify({
       event: e.name,
       mandate_id: num(mandateId),
@@ -666,54 +664,49 @@ export class WebhookDispatcher {
   /** One pending delivery and a first attempt per webhook, under one idempotency key. */
   private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
     for (const webhook of webhooks) {
-      const delivery = await this.enqueue(webhook.id, eventId, payload);
-      if (delivery === null) continue;
-      await this.attempt(delivery, webhook);
+      const delivery = await this.enqueue(webhook.id, eventId, randomUUID(), payload);
+      if (delivery) await this.attempt(delivery, webhook);
     }
   }
 
-  /**
-   * Store a pending delivery due now, before its first attempt.
-   *
-   * A `(webhook, event)` pair is delivered at most once: if a delivery for the
-   * same event already exists, its retries (or its completed attempt) are the
-   * whole history of that event and a second row would only double-count it.
-   * Returns null for that case so the caller sends nothing.
-   */
+  /** Store one pending delivery per webhook and event, before its first attempt. */
   private async enqueue(
     webhookId: number,
     eventId: string,
     payload: string,
   ): Promise<DeliveryRow | null> {
-    const existing = await this.db.get<{ id: number }>(
-      "SELECT id FROM webhook_deliveries WHERE webhook_id = ? AND event_id = ? LIMIT 1",
-      [webhookId, eventId],
-    );
-    if (existing) return null;
-
     const now = Math.floor(Date.now() / 1000);
-    const idempotencyKey = idempotencyKeyFor(webhookId, eventId);
-    const row = await this.db.get<{ id: number }>(
-      `INSERT INTO webhook_deliveries
-         (webhook_id, event_id, idempotency_key, attempt, status, retry_at, payload, created_at)
-       VALUES (?, ?, ?, 1, 'pending', ?, ?, ?) RETURNING id`,
-      [webhookId, eventId, idempotencyKey, now, payload, now],
-    );
-    if (!row) throw new Error("webhook delivery insert returned no id");
-    return {
-      id: row.id,
-      webhook_id: webhookId,
-      event_id: eventId,
-      idempotency_key: idempotencyKey,
-      attempt: 1,
-      status: "pending",
-      http_status: null,
-      response_body: null,
-      error: null,
-      payload,
-      retry_at: now,
-      created_at: now,
-    };
+    return this.db.transaction(async (storage) => {
+      const receipt = await storage.get<{ event_key: string }>(
+        `INSERT INTO webhook_event_receipts (webhook_id, event_key)
+         VALUES (?, ?) ON CONFLICT (webhook_id, event_key) DO NOTHING
+         RETURNING event_key`,
+        [webhookId, eventId],
+      );
+      if (!receipt) return null;
+
+      const row = await storage.get<{ id: number }>(
+        `INSERT INTO webhook_deliveries
+           (webhook_id, event_id, idempotency_key, attempt, status, retry_at, payload, created_at)
+         VALUES (?, ?, ?, 1, 'pending', ?, ?, ?) RETURNING id`,
+        [webhookId, eventId, idempotencyKey, now, payload, now],
+      );
+      if (!row) throw new Error("webhook delivery insert returned no id");
+      return {
+        id: row.id,
+        webhook_id: webhookId,
+        event_id: eventId,
+        idempotency_key: idempotencyKey,
+        attempt: 1,
+        status: "pending",
+        http_status: null,
+        response_body: null,
+        error: null,
+        payload,
+        retry_at: now,
+        created_at: now,
+      };
+    });
   }
 
   /** Attempt one delivery once: success marks it delivered, failure

@@ -1416,6 +1416,45 @@ describe("subscriber upcoming charges", () => {
     assert.equal(body.totalUpcoming, "0");
     assert.equal(body.truncated, false);
   });
+
+  test("a malformed subscriber address is refused, not answered with an empty page", async () => {
+    const { status, body } = await upGet("/api/subscribers/not-an-address/upcoming");
+    assert.equal(status, 400);
+    const error = (body as unknown as ErrorBody).error;
+    assert.equal(error.code, "invalid_request");
+    assert.equal(error.details?.[0]?.path, "address");
+  });
+
+  test("zero days is refused rather than silently read as the default", async () => {
+    const { status, body } = await upGet(`/api/subscribers/${DUE_SUB}/upcoming?days=0`);
+    assert.equal(status, 400);
+    assert.equal((body as unknown as ErrorBody).error.code, "invalid_request");
+    assert.equal((body as unknown as ErrorBody).error.details?.[0]?.path, "days");
+  });
+
+  test("the versioned and network-scoped paths serve the same upcoming view", async () => {
+    const plain = await upGet(`/api/subscribers/${DUE_SUB}/upcoming?days=2`);
+    const versioned = await upGet(`/api/v1/subscribers/${DUE_SUB}/upcoming?days=2`);
+    assert.equal(versioned.status, 200);
+    assert.equal(versioned.body.days, 2);
+    // A due mandate is projected at the request instant, so the two requests
+    // may straddle a second boundary; compare the stable fields and allow
+    // that one-second difference in the projected time.
+    assert.deepEqual(
+      versioned.body.upcoming.map((c) => [c.mandateId, c.amount]),
+      plain.body.upcoming.map((c) => [c.mandateId, c.amount]),
+    );
+    versioned.body.upcoming.forEach((charge, index) => {
+      assert.ok(Math.abs(charge.at - plain.body.upcoming[index]!.at) <= 1);
+    });
+
+    const scoped = await upGet(`/api/testnet/subscribers/${DUE_SUB}/upcoming?days=2`);
+    assert.equal(scoped.status, 200);
+    assert.deepEqual(
+      scoped.body.upcoming.map((c) => [c.mandateId, c.amount]),
+      plain.body.upcoming.map((c) => [c.mandateId, c.amount]),
+    );
+  });
 });
 describe("express 5 error boundary", () => {
   /** Listens on a random port and reports the base URL with a stop function. */

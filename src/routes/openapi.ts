@@ -637,7 +637,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["webhooks"],
         summary: "Register a webhook for charge events",
         description:
-          "Registers a URL to receive signed POSTs when one of the merchant's mandates charges. The caller proves control of the merchant's Stellar address with an ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`; the returned secret is used to verify the `Payflow-Signature` header on deliveries.",
+          "Registers a URL to receive signed POSTs when one of the merchant's mandates charges. The caller proves control of the merchant's Stellar address with an ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`; the returned secret is used to verify the `Payflow-Signature` header on deliveries. Compute HMAC-SHA256 over the exact raw request body bytes and compare it with each `sha256=<hex>` value in the comma-separated header using a constant-time comparison. During secret rotation, accept a matching signature under either active secret.",
         operationId: `registerWebhook${operationSuffix(root)}`,
         requestBody: {
           required: true,
@@ -1803,6 +1803,43 @@ function servicePaths(): Record<string, PathItemObject> {
         },
       },
     },
+    "/admin/db/vacuum": {
+      post: {
+        tags: ["admin"],
+        summary: "VACUUM and ANALYZE the database",
+        description:
+          "Runs `VACUUM` followed by `PRAGMA optimize` (the SQLite equivalent of ANALYZE) against the database. `VACUUM` rewrites the file, reclaims free pages left by `DELETE` operations and rebuilds indexes; `PRAGMA optimize` refreshes the query-planner statistics for tables whose row counts have changed. The two operations run outside any transaction and can take seconds on a large database; the endpoint answers only after both finish. Only supported on the SQLite backend; a PostgreSQL instance answers 503. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "postDbVacuum",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "The maintenance ran.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    result: {
+                      type: "object",
+                      properties: {
+                        vacuumed: { type: "boolean", enum: [true] },
+                        optimized: { type: "boolean", enum: [true] },
+                      },
+                      required: ["vacuumed", "optimized"],
+                    },
+                  },
+                  required: ["status", "result"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "503": transient503("Database maintenance is not available on this instance (e.g. PostgreSQL backend)."),
+          "500": errorResponse("The maintenance operation threw; the message is kept for the operator."),
+        },
+      },
+    },
   };
 }
 
@@ -2082,11 +2119,13 @@ function componentSchemas(): Record<string, SchemaObject> {
         },
         failures: {
           type: "integer",
-          description: "Consecutive failed attempts after this one; 0 once a charge settles.",
+          description:
+            "The mandate's failure streak after this attempt: consecutive failures that are the mandate's own (a vault shortfall, a contract refusal). Network, sequence-number and keeper-signer failures leave it unchanged. 0 once a charge settles.",
         },
         retryAt: {
           type: ["integer", "null"],
-          description: "When the keeper tries again, in unix seconds; null after a settlement.",
+          description:
+            "When the keeper tries again, in unix seconds; null after a settlement. Grows with `failures` up to the configured cap; one base delay away after a failure that left `failures` unchanged.",
         },
       },
       required: ["id", "mandateId", "attemptedAt", "result", "errorCode", "txHash", "failures", "retryAt"],

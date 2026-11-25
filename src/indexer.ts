@@ -39,9 +39,35 @@ async function insertRows(
   }
 }
 
+/**
+ * Split a fetched batch into its ledgers, keeping the RPC's ledger order. The
+ * indexer writes each ledger's rows together (#247), so this is the unit the
+ * projection is applied in.
+ */
+function groupByLedger(events: readonly rpc.Api.EventResponse[]): rpc.Api.EventResponse[][] {
+  const ledgers: rpc.Api.EventResponse[][] = [];
+  let current: rpc.Api.EventResponse[] | null = null;
+  for (const event of events) {
+    if (current === null || current[0]!.ledger !== event.ledger) {
+      current = [];
+      ledgers.push(current);
+    }
+    current.push(event);
+  }
+  return ledgers;
+}
+
 /** RPC caps a single getEvents window; stay well inside it. */
-const LEDGER_WINDOW = 8_000;
+const LEDGER_WINDOW_MAX = 8_000;
+/** Ledgers per batch when `INDEXER_BATCH_SIZE` is not set. */
+const DEFAULT_BATCH_SIZE = LEDGER_WINDOW_MAX;
 const PAGE_LIMIT = 200;
+/**
+ * Raw events retained per statement (#247). One multi-row insert per ledger
+ * replaces one round trip per event; the chunk stays far below PostgreSQL's
+ * 65,535-parameter ceiling (8 columns a row).
+ */
+const RETAIN_CHUNK = 200;
 /** Ledgers between two `indexer progress` log lines when none is configured. */
 const DEFAULT_PROGRESS_LEDGERS = 10_000;
 
@@ -201,6 +227,20 @@ export class Indexer {
    * first pass that reads ledgers.
    */
   private progress: { ledger: number; at: number; applied: number; mismatched: number } | null = null;
+
+  /**
+   * Ledgers one batch reads and applies before the cursor moves (#241). Read
+   * from the environment config or, for a network configured on its own, from
+   * the network. Clamped to the RPC's getEvents window: asking for more than
+   * it serves would make every pass fail.
+   */
+  private get batchSize(): number {
+    const setting =
+      "INDEXER_BATCH_SIZE" in this.config
+        ? this.config.INDEXER_BATCH_SIZE
+        : this.config.batchSize;
+    return Math.max(1, Math.min(LEDGER_WINDOW_MAX, setting ?? DEFAULT_BATCH_SIZE));
+  }
 
   /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
   private get progressLedgers(): number {
@@ -438,7 +478,7 @@ export class Indexer {
   }
 
   /**
-   * Index ledgers [cursor, min(cursor + LEDGER_WINDOW * concurrency, latest)).
+   * Index ledgers [cursor, min(cursor + batchSize * concurrency, latest)).
    *
    * Up to `INDEXER_FETCH_CONCURRENCY` windows are fetched in parallel, but
    * their events are applied in ledger order and the cursor only advances after
@@ -470,11 +510,11 @@ export class Indexer {
   }
 
   /**
-   * Index ledgers [cursor, min(cursor + LEDGER_WINDOW * concurrency, latest)).
+   * Index ledgers [cursor, min(cursor + batchSize * concurrency, latest)).
    *
-   * Up to `INDEXER_FETCH_CONCURRENCY` windows are fetched in parallel, but
+   * Up to `INDEXER_FETCH_CONCURRENCY` batches are fetched in parallel, but
    * their events are applied in ledger order and the cursor only advances after
-   * a window has been applied. If a fetch fails, windows already applied keep
+   * a batch has been applied. If a fetch fails, batches already applied keep
    * their cursor and the next pass resumes at the failed one. A crash mid-range
    * replays that range on restart; every apply path is idempotent so that is
    * safe.
@@ -512,7 +552,8 @@ export class Indexer {
 
     // endLedger is exclusive. Including `latest` would read a ledger that is
     // still being ingested and could miss part of it.
-    const end = Math.min(start + LEDGER_WINDOW, latest);
+    const batchSize = this.batchSize;
+    const end = Math.min(start + batchSize, latest);
     if (end <= start) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
@@ -530,8 +571,8 @@ export class Indexer {
         : undefined;
     const concurrency = Math.max(1, concurrencySetting ?? 1);
     const windows: Array<{ start: number; end: number }> = [];
-    for (let s = start; s < latest && windows.length < concurrency; s += LEDGER_WINDOW) {
-      windows.push({ start: s, end: Math.min(s + LEDGER_WINDOW, latest) });
+    for (let s = start; s < latest && windows.length < concurrency; s += batchSize) {
+      windows.push({ start: s, end: Math.min(s + batchSize, latest) });
     }
 
     const fetched = await Promise.allSettled(
@@ -550,23 +591,25 @@ export class Indexer {
         break;
       }
       const nextCursor = windows[i]!.end;
+      // Every write for this batch — the raw events, every projection row and
+      // the cursor — lands in one transaction, so the pass pays one commit and
+      // a failure anywhere rolls the whole batch back (#247). Ledger by ledger
+      // inside it, so a ledger's rows are written together and its raw events
+      // are retained in one statement instead of one round trip each.
       const windowResult = await this.db.transaction(async (storage) => {
         let windowApplied = 0;
         let windowMismatched = 0;
         const notifications: DecodedEvent[] = [];
-        for (const raw of result.value) {
-          const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
-          if (ct !== null) lastSeenCloseTime = ct;
-          const firstDelivery = await this.retain(raw, storage);
-          const decoded = decodeEvent(raw);
-          if (!decoded) continue;
-          // The event was already retained — and projected, in the transaction
-          // that stored it — so this is a redelivery from an overlapping
-          // window or a rewound cursor. Applying it again would inflate the
-          // applied metric and could notify a webhook twice, so it is dropped.
-          if (!firstDelivery) continue;
-          if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
-          else windowMismatched += 1;
+        for (const ledgerEvents of groupByLedger(result.value)) {
+          await this.retainAll(ledgerEvents, storage);
+          for (const raw of ledgerEvents) {
+            const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
+            if (ct !== null) lastSeenCloseTime = ct;
+            const decoded = decodeEvent(raw);
+            if (!decoded) continue;
+            if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
+            else windowMismatched += 1;
+          }
         }
         await storage.run(
           `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
@@ -594,39 +637,45 @@ export class Indexer {
   }
 
 
+  /** Preserve every event before decoding, including unknown contract events. */
+  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<void> {
+    await this.retainAll([raw], storage);
+  }
+
   /**
-   * Preserve every event before decoding, including unknown contract events.
-   *
-   * Returns true when this delivery added the row, and false when the event
-   * was already retained: the RPC id is stable across overlapping windows, so
-   * the caller can drop a duplicate instead of applying and counting it
-   * again. Retention and projection commit in the same transaction, so a row
-   * that is already present means its projection has been applied too.
+   * Retain one ledger's raw events in as few statements as possible: one
+   * multi-row `INSERT OR IGNORE` per chunk instead of one statement per event
+   * (#247). The row is unchanged — same event id, same XDR payload — and
+   * `INSERT OR IGNORE` keeps a replay idempotent, whichever chunk a repeated
+   * event lands in.
    */
-  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<boolean> {
-    const eventId =
-      raw.id ??
-      `${raw.ledger}:${raw.txHash}:${raw.topic.map((topic) => topic.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`;
-    const existing = await storage.get<{ event_id: string }>(
-      "SELECT event_id FROM events WHERE event_id = ?",
-      [eventId],
-    );
-    await storage.run(
-      `INSERT OR IGNORE INTO events
-         (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        eventId,
-        raw.contractId?.toString() ?? "",
-        raw.ledger,
-        raw.txHash,
-        raw.id ?? "",
-        JSON.stringify(raw.topic.map((topic) => topic.toXDR("base64"))),
-        raw.value.toXDR("base64"),
-        parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
-      ],
-    );
-    return existing === undefined;
+  private async retainAll(
+    events: readonly rpc.Api.EventResponse[],
+    storage: Storage = this.db,
+  ): Promise<void> {
+    for (let i = 0; i < events.length; i += RETAIN_CHUNK) {
+      const chunk = events.slice(i, i + RETAIN_CHUNK);
+      const values = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const parameters = chunk.flatMap((raw) => {
+        const topics = raw.topic.map((topic) => topic.toXDR("base64"));
+        return [
+          raw.id ?? `${raw.ledger}:${raw.txHash}:${topics.join(":")}:${raw.value.toXDR("base64")}`,
+          raw.contractId?.toString() ?? "",
+          raw.ledger,
+          raw.txHash,
+          raw.id ?? "",
+          JSON.stringify(topics),
+          raw.value.toXDR("base64"),
+          parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
+        ];
+      });
+      await storage.run(
+        `INSERT OR IGNORE INTO events
+           (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+         VALUES ${values}`,
+        parameters,
+      );
+    }
   }
 
   /** Rebuild event-derived projections locally, without querying RPC. */

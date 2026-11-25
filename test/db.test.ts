@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test, describe } from "node:test";
 import { openDatabase, backupDatabase, migrate, writeCursor } from "../src/lib/db.ts";
@@ -120,6 +123,41 @@ describe("forward-only schema migrations", () => {
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM plans").get() as { n: number }).n, 1);
     assert.doesNotThrow(() => migrate(db));
     db.close();
+  });
+
+  test("an existing database gains keeper_claims on open, keeps its keeper rows, and reopens cleanly (#249)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "payflow-claims-migration-"));
+    const path = join(dir, "legacy.db");
+    try {
+      // A database from before #249: a charge attempt, no claims table.
+      const legacy = new DatabaseSync(path);
+      legacy.exec(`
+        CREATE TABLE charge_attempts (
+          id INTEGER PRIMARY KEY, mandate_id INTEGER NOT NULL, attempted_at INTEGER NOT NULL,
+          result TEXT NOT NULL, error_code TEXT, tx_hash TEXT, shortfall TEXT,
+          failures INTEGER NOT NULL, retry_at INTEGER
+        );
+        INSERT INTO charge_attempts VALUES (1, 8, 100, 'failed', 'txBadSeq', NULL, NULL, 1, 160);
+      `);
+      legacy.close();
+
+      for (let open = 0; open < 2; open += 1) {
+        const db = openDatabase(path);
+        const columns = db
+          .prepare("SELECT name FROM pragma_table_info('keeper_claims') ORDER BY cid")
+          .all()
+          .map((row) => (row as { name: string }).name);
+        assert.deepEqual(columns, ["mandate_id", "due_at", "owner", "expires_at"]);
+        assert.deepEqual(
+          { ...(db.prepare("SELECT mandate_id, error_code, retry_at FROM charge_attempts").get() as object) },
+          { mandate_id: 8, error_code: "txBadSeq", retry_at: 160 },
+          "the attempt log, and so the restored backoff, survives the upgrade",
+        );
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("surfaces database errors instead of treating a failed migration as success", () => {

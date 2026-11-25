@@ -21,6 +21,7 @@ export interface AdminHooks {
   pruneData?: (daysToKeep?: number) => Promise<unknown>;
   getAuditLogs?: (limit: number) => unknown;
   getPastDueMandates?: () => unknown;
+  vacuumDb?: () => Promise<unknown>;
 }
 
 /** Scoped operation that a token is allowed to perform. */
@@ -216,6 +217,15 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
       return;
     }
     res.json({ status: "ok", past_due: (await read()) ?? [] });
+  });
+
+  r.post("/db/vacuum", async (req, res) => {
+    const run = hooks.vacuumDb;
+    if (!run) {
+      sendApiError(res, req, 503, "vacuum_unavailable", undefined, undefined, 30);
+      return;
+    }
+    await respond(req, res, "vacuum_failed", run);
   });
 
   return r;

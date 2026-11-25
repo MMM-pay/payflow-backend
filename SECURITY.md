@@ -58,6 +58,17 @@ and impact. Acknowledgement within 72 hours.
   non-public targets. DNS is checked again for each attempt and requests are
   pinned to the checked addresses; redirects are not followed. Update any
   existing webhook whose DNS points to an internal address.
+- **Production serves HTTPS only.** With `NODE_ENV=production` (set by the
+  Docker image) or `REQUIRE_HTTPS=true`, a request that did not arrive over
+  TLS is rejected with `403 forbidden` instead of redirected, since anything it
+  carried has already crossed the wire in clear. The scheme comes from
+  `X-Forwarded-Proto` set by the single trusted proxy hop, so the service must
+  sit behind a TLS-terminating proxy (Fly, Render, a load balancer).
+  `/health`, `/ready` and `/metrics` stay reachable over plaintext for
+  platform probes. Every response carries
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+  (`HSTS_MAX_AGE_S` tunes it). Set `REQUIRE_HTTPS=false` only for a deployment
+  that terminates TLS without forwarding the scheme.
 - **HTTP request framing is strict.** A request carrying both `Content-Length`
   and `Transfer-Encoding`, duplicate or malformed framing headers, a transfer
   coding other than `chunked`, or a connection upgrade

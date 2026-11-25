@@ -1,7 +1,8 @@
 import { Server } from "node:http";
 import { loadConfig, networkConfigs } from "./config.ts";
 import { openStorage } from "./lib/store/index.ts";
-import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
+import { SqliteStorage } from "./lib/store/sqlite.ts";
+import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent, vacuumDatabase } from "./lib/db.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -118,7 +119,12 @@ if (keeper) {
     );
   }
   logger.info(
-    { keeper: keeper.publicKey, channels: keeper.channelCount, network: defaultRuntime.network.name },
+    {
+      keeper: keeper.publicKey,
+      channels: keeper.channelCount,
+      concurrency: keeper.concurrency,
+      network: defaultRuntime.network.name,
+    },
     "keeper enabled",
   );
 } else {
@@ -218,6 +224,33 @@ const adminHooks: AdminHooks = {
     const db = defaultRuntime.db;
     return getPastDueMandatesFromDb(db);
   },
+  vacuumDb: async () => {
+    const db = defaultRuntime.db;
+    // `VACUUM` requires a live DatabaseSync handle; it is only available on
+    // the SQLite backend. On PostgreSQL the hook is not wired, so the route
+    // answers 503 rather than attempting to run `VACUUM` through the Storage
+    // abstraction (which cannot run DDL statements outside a transaction).
+    const sqlite = db instanceof SqliteStorage ? db.database : undefined;
+    if (!sqlite) {
+      throw new Error("VACUUM is only supported on the SQLite backend");
+    }
+    try {
+      const result = vacuumDatabase(sqlite);
+      await logAuditEvent(db, {
+        action: "db_vacuum",
+        success: true,
+        details: result,
+      });
+      return result;
+    } catch (err) {
+      await logAuditEvent(db, {
+        action: "db_vacuum",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+  },
 };
 if (keeper && runKeeperPass) {
   adminHooks.keeperPass = async () => {
@@ -275,7 +308,9 @@ const loops: Loop[] = [];
 if (runIndexer) {
   for (const rt of runtimes) {
     loops.push(
-      every(config.INDEXER_INTERVAL_MS, async () => {
+      // The poll cadence is per network (#241): a network configured on its
+      // own may pace its passes differently from the default.
+      every(rt.network.indexerIntervalMs ?? config.INDEXER_INTERVAL_MS, async () => {
         try {
           await rt.runPass();
         } catch {
@@ -368,6 +403,9 @@ async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info({ signal }, "shutting down");
+  // The keeper takes no new mandates from here on; the settlements already in
+  // flight finish and are recorded while the drain below waits for the pass.
+  activeKeeper?.stop();
   // Let a pass that is mid-write or mid-transaction finish before the database
   // closes, but never hang forever on a stuck RPC call.
   const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);

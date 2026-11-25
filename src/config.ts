@@ -159,6 +159,57 @@ const schema = z.object({
           .refine(StrKey.isValidEd25519SecretSeed, "must be a valid Stellar secret seed"),
       ),
     ),
+  /** Skip a keeper channel below this total XLM reserve and fee cushion. */
+  KEEPER_CHANNEL_MIN_XLM: z
+    .string()
+    .regex(
+      /^(?:0|[1-9]\d*)(?:\.\d{1,7})?$/,
+      "must be a non-negative XLM amount with at most 7 decimal places",
+    )
+    .default("2"),
+  /**
+   * Most settlement transactions one pass keeps in flight at once (#249).
+   * Each in-flight transaction leases its own channel account, so the cap can
+   * never exceed the number of channels (`KEEPER_SECRET` plus the distinct
+   * `KEEPER_CHANNEL_SECRETS`): a larger value is rejected at startup rather
+   * than silently clamped. Unset means one transaction per channel, the
+   * behaviour before the cap existed.
+   */
+  KEEPER_CONCURRENCY: z.preprocess(
+    (value) => (value === "" ? undefined : value),
+    z.coerce.number().int().min(1, "must be at least 1").optional(),
+  ),
+  /**
+   * Seconds a keeper instance's claim on a due charge lasts before another
+   * instance may take it over (#249). Claims stop two keepers settling the
+   * same mandate; the timeout makes a claim abandoned by a crashed keeper
+   * eligible again. It must outlast one settlement (build, simulate, submit,
+   * poll), which takes well under a minute.
+   */
+  KEEPER_CLAIM_TTL_S: z.coerce.number().int().min(60, "must be at least 60 seconds").default(300),
+  /**
+   * Per-mandate backoff after a failed charge (#248): the wait after the
+   * n-th consecutive failure is
+   * `min(KEEPER_BACKOFF_BASE_S * KEEPER_BACKOFF_MULTIPLIER^(n-1), KEEPER_BACKOFF_MAX_S)`,
+   * less a random share of up to `KEEPER_BACKOFF_JITTER` of it, so mandates
+   * that failed together do not all come back at the same instant. Only
+   * failures that are the mandate's own (an underfunded vault, a contract
+   * refusal) grow the wait; RPC, network and keeper-signer failures retry
+   * after the base delay without growing it.
+   */
+  KEEPER_BACKOFF_BASE_S: z.coerce.number().int().min(1, "must be at least 1 second").default(60),
+  KEEPER_BACKOFF_MULTIPLIER: z.coerce.number().min(1, "must be at least 1").default(2),
+  KEEPER_BACKOFF_MAX_S: z.coerce
+    .number()
+    .int()
+    .min(1, "must be at least 1 second")
+    .max(604_800, "must be at most 604800 seconds (7 days)")
+    .default(21_600),
+  KEEPER_BACKOFF_JITTER: z.coerce
+    .number()
+    .min(0, "must be between 0 and 0.5")
+    .max(0.5, "must be between 0 and 0.5")
+    .default(0.1),
   /** Use charge_many when the deployed contract supports it. */
   KEEPER_BATCH: z.string().default("true").transform((v) => v === "true"),
   /** Mandates per batch transaction, bounded by the contract's supported list size. */
@@ -208,6 +259,14 @@ const schema = z.object({
     .transform((v) => v === "true"),
 
   INDEXER_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Ledgers one indexing batch reads and applies before the cursor moves
+   * (#241). This is the tuning knob for a catch-up: a larger batch means
+   * fewer, longer RPC windows and fewer cursor commits; a smaller one keeps
+   * each pass short, so a stop or a `SIGHUP` takes effect sooner. It must
+   * stay inside the RPC's getEvents window, so 8,000 is the ceiling.
+   */
+  INDEXER_BATCH_SIZE: z.coerce.number().int().positive().max(8_000).default(8_000),
   INDEXER_START_LEDGER: z.coerce.number().int().nonnegative().default(0),
   /**
    * A full-history archive that can re-serve ledgers the RPC node no longer
@@ -281,26 +340,40 @@ const schema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   DATABASE_URL: postgresUrl,
-  DATABASE_PATH: z.string().default("./payflow.db"),
   /**
-   * Comma-separated exact origins a browser may call the API from. Empty
-   * (the default) allows none; `*` allows every origin. Validated at startup
-   * so a typo fails the boot instead of silently matching no request.
+   * Most connections one process opens to PostgreSQL (#263). Every API
+   * process and every indexer/keeper process holds its own pool, so the cap
+   * must leave room for the others inside the server's max_connections.
    */
-  CORS_ORIGIN: z
-    .string()
-    .default("")
-    .transform((value, ctx) => {
-      try {
-        return corsOrigins(value);
-      } catch (err) {
-        ctx.addIssue({
-          code: "custom",
-          message: err instanceof Error ? err.message : "invalid origin list",
-        });
-        return z.NEVER;
-      }
-    }),
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),
+  /**
+   * How long a query waits for a free pooled connection before it fails
+   * (#263). Without a bound, a saturated pool makes every request wait
+   * forever and a slow query takes the whole process down with it.
+   */
+  DATABASE_ACQUIRE_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Server-side cap on how long a single statement may run (#263). A query
+   * that exceeds it is cancelled by PostgreSQL and answers with an error
+   * instead of pinning a connection; the indexer retries on its next pass.
+   */
+  DATABASE_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  DATABASE_PATH: z.string().default("./payflow.db"),
+  CORS_ORIGIN: z.string().default("*"),
+  /** Read only to pick the `REQUIRE_HTTPS` default. */
+  NODE_ENV: z.string().default("development"),
+  /**
+   * Reject plaintext HTTP requests (#277). Unset means on when
+   * `NODE_ENV=production` (the Docker image sets it) and off otherwise, so
+   * local development keeps working over `http://localhost`. The scheme is
+   * read from `X-Forwarded-Proto` set by the first proxy hop (Fly, Render).
+   */
+  REQUIRE_HTTPS: z
+    .enum(["true", "false", ""])
+    .optional()
+    .transform((v) => (v === undefined || v === "" ? undefined : v === "true")),
+  /** `Strict-Transport-Security` max-age in seconds; 0 disables the header. */
+  HSTS_MAX_AGE_S: z.coerce.number().int().nonnegative().default(31_536_000),
   LOG_LEVEL: z.string().default("info"),
   // An empty value means "not set": the shipped .env.example leaves the
   // variable blank, and a container that reads it must not refuse to start
@@ -378,6 +451,16 @@ const schema = z.object({
 
 export type Config = z.infer<typeof schema>;
 
+/** How a process sizes and bounds its pool for one PostgreSQL network (#263). */
+export interface PoolSettings {
+  /** Most connections this process opens at once. */
+  max: number;
+  /** How long a query waits for a free connection before it fails, in ms. */
+  acquireTimeoutMs: number;
+  /** Server-side cap on one statement's runtime, in ms. */
+  statementTimeoutMs: number;
+}
+
 /** One network this instance indexes and serves. */
 export interface NetworkConfig {
   /** Route segment (`/api/<name>/...`) and log label. */
@@ -394,12 +477,67 @@ export interface NetworkConfig {
   databasePath: string;
   /** Shared PostgreSQL server, isolated by per-network schema when configured. */
   databaseUrl?: string | undefined;
+  /** Sizing and timeouts for this network's PostgreSQL pool (#263). */
+  pool?: PoolSettings | undefined;
   /** Full-history archive URL used to backfill a detected gap. */
   archiveUrl?: string | undefined;
   /** Advance the cursor past a gap the RPC cannot serve. */
   allowGaps?: boolean | undefined;
   /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
   progressLedgers?: number | undefined;
+  /** Ledgers one indexing batch reads and applies at a time (#241). */
+  batchSize?: number | undefined;
+  /** How often the indexer loop runs a pass, in milliseconds (#241). */
+  indexerIntervalMs?: number | undefined;
+}
+
+/**
+ * How many signing channels the keeper builds from `config`: `KEEPER_SECRET`
+ * (with `KEEPER_SECRET_NEXT` as a standby in the same channel) plus each
+ * distinct `KEEPER_CHANNEL_SECRETS` entry, deduplicated exactly as the keeper
+ * does. Zero without `KEEPER_SECRET`.
+ */
+export function keeperChannelCount(
+  config: Pick<Config, "KEEPER_SECRET" | "KEEPER_SECRET_NEXT"> & {
+    KEEPER_CHANNEL_SECRETS?: readonly string[] | undefined;
+  },
+): number {
+  if (!config.KEEPER_SECRET) return 0;
+  const seen = new Set([config.KEEPER_SECRET, config.KEEPER_SECRET_NEXT].filter(Boolean));
+  let channels = 1;
+  for (const secret of config.KEEPER_CHANNEL_SECRETS ?? []) {
+    if (!secret || seen.has(secret)) continue;
+    seen.add(secret);
+    channels += 1;
+  }
+  return channels;
+}
+
+/**
+ * What is wrong with the keeper's backoff settings taken together, or null
+ * when they fit (#248). Each value is range-checked by the schema; this
+ * checks them against each other: the cap may not sit below the first wait,
+ * and a wait may not outlive the attempt log that remembers it — a mandate's
+ * newest `charge_attempts` row is its backoff state, so pruning it early
+ * would let the mandate retry before its time.
+ */
+export function keeperBackoffProblem(
+  config: Pick<Config, "KEEPER_BACKOFF_BASE_S" | "KEEPER_BACKOFF_MAX_S" | "CHARGE_ATTEMPT_RETENTION_DAYS">,
+): string | null {
+  if (config.KEEPER_BACKOFF_MAX_S < config.KEEPER_BACKOFF_BASE_S) {
+    return (
+      `KEEPER_BACKOFF_MAX_S=${config.KEEPER_BACKOFF_MAX_S} is below ` +
+      `KEEPER_BACKOFF_BASE_S=${config.KEEPER_BACKOFF_BASE_S}; the cap must be at least the first wait`
+    );
+  }
+  const retentionDays = config.CHARGE_ATTEMPT_RETENTION_DAYS;
+  if (retentionDays > 0 && config.KEEPER_BACKOFF_MAX_S > retentionDays * 86_400) {
+    return (
+      `KEEPER_BACKOFF_MAX_S=${config.KEEPER_BACKOFF_MAX_S} outlasts ` +
+      `CHARGE_ATTEMPT_RETENTION_DAYS=${retentionDays}; a backoff must end before its attempt is pruned`
+    );
+  }
+  return null;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -413,13 +551,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (parsed.data.KEEPER_ENABLED && !parsed.data.KEEPER_SECRET) {
     throw new Error("KEEPER_ENABLED=true requires KEEPER_SECRET to be set");
   }
+  const concurrency = parsed.data.KEEPER_CONCURRENCY;
+  if (concurrency !== undefined && parsed.data.KEEPER_SECRET) {
+    const channels = keeperChannelCount(parsed.data);
+    if (concurrency > channels) {
+      // Counts only: a secret never appears in the message.
+      throw new Error(
+        `KEEPER_CONCURRENCY=${concurrency} exceeds the ${channels} keeper channel account(s) configured ` +
+          "(KEEPER_SECRET plus distinct KEEPER_CHANNEL_SECRETS); add channel accounts or lower the cap",
+      );
+    }
+  }
+  const backoffProblem = keeperBackoffProblem(parsed.data);
+  if (backoffProblem) throw new Error(backoffProblem);
   if (
     parsed.data.SEP10_SIGNING_KEY &&
     (!parsed.data.SEP10_JWT_SECRET || !parsed.data.SEP10_HOME_DOMAIN)
   ) {
     throw new Error("SEP10_SIGNING_KEY requires SEP10_JWT_SECRET and SEP10_HOME_DOMAIN to be set");
   }
-  return parsed.data;
+  return {
+    ...parsed.data,
+    REQUIRE_HTTPS: parsed.data.REQUIRE_HTTPS ?? parsed.data.NODE_ENV === "production",
+  };
 }
 
 /** Route segments have to survive a URL path: lowercase letters, digits, dashes. */
@@ -463,6 +617,14 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
     archiveUrl: config.ARCHIVE_URL,
     allowGaps: config.ALLOW_GAPS,
     progressLedgers: config.INDEXER_PROGRESS_LEDGERS,
+    // A network may pace its own passes; otherwise it follows the defaults.
+    batchSize: network.batchSize ?? config.INDEXER_BATCH_SIZE,
+    indexerIntervalMs: network.indexerIntervalMs ?? config.INDEXER_INTERVAL_MS,
+    pool: {
+      max: config.DATABASE_POOL_MAX,
+      acquireTimeoutMs: config.DATABASE_ACQUIRE_TIMEOUT_MS,
+      statementTimeoutMs: config.DATABASE_STATEMENT_TIMEOUT_MS,
+    },
   }));
 }
 
@@ -475,6 +637,13 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     [`${prefix}_VAULT_ID`]: contractId,
     [`${prefix}_SUBSCRIPTION_ID`]: contractId,
     [`${prefix}_INDEXER_START_LEDGER`]: z.coerce.number().int().nonnegative().default(0),
+    [`${prefix}_INDEXER_BATCH_SIZE`]: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(8_000)
+      .optional(),
+    [`${prefix}_INDEXER_INTERVAL_MS`]: z.coerce.number().int().positive().optional(),
     [`${prefix}_DATABASE_PATH`]: z.string().min(1).optional(),
   });
   const parsed = schema.safeParse(env);
@@ -494,6 +663,12 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     vaultId: String(data[`${prefix}_VAULT_ID`]),
     subscriptionId: String(data[`${prefix}_SUBSCRIPTION_ID`]),
     startLedger: Number(data[`${prefix}_INDEXER_START_LEDGER`] ?? 0),
+    ...(data[`${prefix}_INDEXER_BATCH_SIZE`] === undefined
+      ? {}
+      : { batchSize: Number(data[`${prefix}_INDEXER_BATCH_SIZE`]) }),
+    ...(data[`${prefix}_INDEXER_INTERVAL_MS`] === undefined
+      ? {}
+      : { indexerIntervalMs: Number(data[`${prefix}_INDEXER_INTERVAL_MS`]) }),
     databasePath:
       databasePath === undefined ? databasePathFor(base.DATABASE_PATH, name) : String(databasePath),
     databaseUrl: base.DATABASE_URL,

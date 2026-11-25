@@ -52,17 +52,16 @@ function authorized(
   signature: string,
   timestamp: number,
 ): boolean {
+  // `details` belongs to `invalid_request` only (see the README's "Error
+  // responses" table and the OpenAPI Error schema), so a 401 carries copy
+  // but no field list.
   if (!fresh(timestamp)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.", [
-      { path: "timestamp", message: "must be within ten minutes of the server's clock" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.");
     return false;
   }
   const bytes = signatureBytes(signature);
   if (bytes === null || !Keypair.fromPublicKey(merchant).verify(Buffer.from(message, "utf8"), bytes)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.", [
-      { path: "signature", message: "signature does not prove control of the merchant address" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.");
     return false;
   }
   return true;
@@ -77,9 +76,7 @@ function sessionMatches(
   const session = sessionOf(req, res, auth);
   if (!session.ok) return { ok: false };
   if (session.value !== null && session.value !== merchant) {
-    sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.", [
-      { path: "address", message: "must be the account the bearer token was issued to" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.");
     return { ok: false };
   }
   return { ok: true, authenticated: session.value !== null };
