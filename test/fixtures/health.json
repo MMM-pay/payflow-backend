@@ -13,7 +13,9 @@
     "reconciliations": 0,
     "corrections": 0,
     "eventsLedger": 0,
-    "eventsLag": 0
+    "eventsLag": 0,
+    "rawEventRetentionDays": null,
+    "lastPrunedAt": null
   },
   "rpc": null,
   "contracts": {
@@ -37,7 +39,9 @@
         "reconciliations": 0,
         "corrections": 0,
         "eventsLedger": 0,
-        "eventsLag": 0
+        "eventsLag": 0,
+        "rawEventRetentionDays": null,
+        "lastPrunedAt": null
       },
       "rpc": null,
       "contracts": {

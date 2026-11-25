@@ -13,7 +13,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { SqliteStorage } from "./lib/store/sqlite.ts";
 import { asStorage } from "./lib/store/index.ts";
 import type { Storage } from "./lib/store/types.ts";
-import type { Config, NetworkConfig } from "./config.ts";
+import { corsOrigins, type Config, type NetworkConfig } from "./config.ts";
 import type { IndexerStatus } from "./indexer.ts";
 import { buildAdminRoutes, type AdminHooks, type AdminToken } from "./routes/admin.ts";
 import { buildApiRouter, MerchantSummaryCache } from "./routes/index.ts";
@@ -120,6 +120,36 @@ const SEP10_PATH = /^\/api\/(?:v1\/)?(?:[a-z][a-z0-9-]*\/)?auth(?:\?|$)/;
 /** Ledgers the indexer may trail the network by before it is considered behind. */
 const MAX_LAG = 120;
 
+/**
+ * The Content-Security-Policy applied to every response.
+ *
+ * Helmet's defaults are widened in one place only: `style-src` keeps
+ * `'unsafe-inline'` because ReDoc injects the documentation's styles, and
+ * scripts stay same-origin with no `'unsafe-inline'` or `'unsafe-eval'`, so
+ * injected markup cannot run code. The API itself serves JSON, so the policy
+ * mostly protects the one HTML page at `/api/docs`.
+ */
+const CSP_DIRECTIVES = {
+  "default-src": ["'self'"],
+  "base-uri": ["'self'"],
+  "connect-src": ["'self'"],
+  "font-src": ["'self'", "https:", "data:"],
+  "form-action": ["'self'"],
+  "frame-ancestors": ["'none'"],
+  "frame-src": ["'none'"],
+  "img-src": ["'self'", "data:"],
+  "object-src": ["'none'"],
+  "script-src": ["'self'"],
+  "script-src-attr": ["'none'"],
+  "style-src": ["'self'", "https:", "'unsafe-inline'"],
+};
+
+/** The documentation page, which may also spawn ReDoc's Blob worker. */
+const DOCS_CSP_DIRECTIVES = {
+  ...CSP_DIRECTIVES,
+  "worker-src": ["'self'", "blob:"],
+};
+
 /** Ledgers the projection trails the network by; null until the first pass. */
 function lagOf(indexer: IndexerStatus | undefined): number | null {
   return indexer && indexer.latest > 0 ? Math.max(0, indexer.latest - indexer.cursor) : null;
@@ -168,6 +198,8 @@ function healthOf(runtime: NetworkRuntime): HealthResponse {
           corrections: indexer.corrections ?? 0,
           eventsLedger: indexer.eventsLedger ?? 0,
           eventsLag: indexer.eventsLag ?? 0,
+          rawEventRetentionDays: indexer.rawEventRetentionDays ?? null,
+          lastPrunedAt: indexer.lastPrunedAt ?? null,
         }
       : null,
     rpc: rpc && "active" in rpc && Array.isArray(rpc.endpoints) ? { active: rpc.active, endpoints: rpc.endpoints } : null,
@@ -315,12 +347,29 @@ export function createApp(
   const app = express();
 
   app.set("trust proxy", 1);
+  // Security headers on every response, including errors: a strict CSP,
+  // `nosniff` (a JSON body must never be sniffed as HTML), frame denial (the
+  // header and the CSP's `frame-ancestors`), no referrer, HSTS and the
+  // cross-origin isolation headers. `helmet()` alone would leave the policy
+  // implicit; spelling it out keeps the JSON API and the docs page on the
+  // same, auditable baseline.
+  //
   // HSTS tells browsers to use HTTPS for every later request (#277). The
-  // header is ignored over plaintext, so sending it unconditionally is safe.
+  // header is ignored over plaintext, so sending it unconditionally is safe;
+  // `HSTS_MAX_AGE_S=0` turns it off for a deployment served without TLS.
+  app.disable("x-powered-by");
   const hstsMaxAge = config.HSTS_MAX_AGE_S ?? 31_536_000;
   app.use(
     helmet({
+      contentSecurityPolicy: { useDefaults: false, directives: CSP_DIRECTIVES },
+      crossOriginOpenerPolicy: { policy: "same-origin" },
+      crossOriginResourcePolicy: { policy: "same-origin" },
+      referrerPolicy: { policy: "no-referrer" },
       strictTransportSecurity: hstsMaxAge > 0 ? { maxAge: hstsMaxAge, includeSubDomains: true } : false,
+      xContentTypeOptions: true,
+      xDnsPrefetchControl: { allow: false },
+      xFrameOptions: { action: "deny" },
+      xPermittedCrossDomainPolicies: { permittedPolicies: "none" },
     }),
   );
   if (config.REQUIRE_HTTPS === true) {
@@ -354,15 +403,13 @@ export function createApp(
   );
 
   // ReDoc runs its search index in a web worker created from a Blob URL.
-  // Every other directive stays helmet's default: the bundle and the
-  // bootstrap are same-origin modules (`script-src 'self'`), and ReDoc's
-  // injected styles are covered by the default `style-src 'unsafe-inline'`.
-  // This is the only addition the documentation page needs.
+  // Every other directive stays the baseline policy above: the bundle and
+  // the bootstrap are same-origin modules (`script-src 'self'`), and ReDoc's
+  // injected styles are covered by `style-src 'unsafe-inline'`. This is the
+  // only addition the documentation page needs.
   app.use(
     "/api/docs",
-    helmet.contentSecurityPolicy({
-      directives: { "worker-src": ["'self'", "blob:"] },
-    }),
+    helmet.contentSecurityPolicy({ useDefaults: false, directives: DOCS_CSP_DIRECTIVES }),
   );
 
   app.use(
@@ -388,13 +435,18 @@ export function createApp(
       });
     });
   });
-  const corsOrigin = config.CORS_ORIGIN === "*" ? true : config.CORS_ORIGIN.split(",");
+  // Pinned to the configured origins: the middleware reflects `Origin` only
+  // when it exactly matches an entry, so a site the operator did not list
+  // gets no `Access-Control-Allow-Origin` and the browser refuses the read.
+  // An empty list (`CORS_ORIGIN` unset) leaves the API same-origin only; `*`
+  // is the explicit opt-in to every origin.
+  const corsAllowed = corsOrigins(config.CORS_ORIGIN);
   app.use(
     cors((req, callback) => {
       callback(null, {
         // SEP-10 requires `Access-Control-Allow-Origin: *` on its endpoints,
         // errors included, so any wallet can sign in from a browser.
-        origin: SEP10_PATH.test(req.url ?? "") ? "*" : corsOrigin,
+        origin: SEP10_PATH.test(req.url ?? "") ? "*" : corsAllowed,
         // Browsers hide non-safelisted response headers from scripts unless exposed.
         exposedHeaders: ["X-Request-Id"],
       });

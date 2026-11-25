@@ -23,6 +23,7 @@
     "indexer": "node --experimental-strip-types src/cmd/indexer.ts",
     "keeper": "node --experimental-strip-types src/cmd/keeper.ts",
     "load-test": "node --experimental-strip-types test/load-test.ts",
+    "bench:indexer": "node --experimental-strip-types bench/indexer-writes.ts",
     "mutation-test": "node --experimental-strip-types --test test/mutation.ts",
     "cli": "node --experimental-strip-types src/cmd/cli.ts",
     "seed": "node --experimental-strip-types src/cmd/seed.ts",

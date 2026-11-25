@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -220,6 +220,22 @@ interface WebhookRow {
 
 /** How one delivery attempt went. */
 type AttemptOutcome = Omit<WebhookTestResult, "deliveryId">;
+
+/**
+ * The `Idempotency-Key` a delivery carries: stable per (webhook, event), so
+ * the same event delivered twice — and every retry of it — presents the same
+ * key to the receiver, which can drop a repeat it has already processed.
+ */
+function idempotencyKeyFor(webhookId: number, eventId: string): string {
+  const digest = createHash("sha256").update(`${webhookId}:${eventId}`, "utf8").digest("hex");
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    digest.slice(12, 16),
+    digest.slice(16, 20),
+    digest.slice(20, 32),
+  ].join("-");
+}
 
 /**
  * The `Payflow-Signature` header: `sha256=<hex>` under the current secret
@@ -462,7 +478,7 @@ export class WebhookDispatcher {
     );
     if (!webhook) return null;
     const payload = JSON.stringify({ event: "ping", webhook_id: id, merchant });
-    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, randomUUID(), payload);
+    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, payload);
     if (!delivery) throw new Error("webhook ping unexpectedly matched an existing event");
     return { deliveryId: delivery.id, ...(await this.attempt(delivery, webhook)) };
   }
@@ -657,7 +673,7 @@ export class WebhookDispatcher {
   /** One pending delivery and a first attempt per webhook, under one idempotency key. */
   private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
     for (const webhook of webhooks) {
-      const delivery = await this.enqueue(webhook.id, eventId, randomUUID(), payload);
+      const delivery = await this.enqueue(webhook.id, eventId, payload);
       if (delivery) await this.attempt(delivery, webhook);
     }
   }
@@ -666,9 +682,9 @@ export class WebhookDispatcher {
   private async enqueue(
     webhookId: number,
     eventId: string,
-    idempotencyKey: string,
     payload: string,
   ): Promise<DeliveryRow | null> {
+    const idempotencyKey = idempotencyKeyFor(webhookId, eventId);
     const now = Math.floor(Date.now() / 1000);
     return this.db.transaction(async (storage) => {
       const receipt = await storage.get<{ event_key: string }>(

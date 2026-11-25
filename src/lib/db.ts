@@ -380,6 +380,33 @@ const ADDED_INDEXES: ReadonlyArray<[table: string, name: string, columns: string
   // (ledger, event_id) order from the page cursor, so the range, the filter
   // and the order all come from the index instead of every contract's rows.
   ["events", "events_contract_ledger", "contract_id, ledger, event_id"],
+  // listMandates with merchant + status filter: mandates_merchant does not
+  // include the status column, so SQLite re-checks status on every row it
+  // fetches from the table. The combined (merchant, status, id) index covers
+  // the equality predicates and the cursor (id < ?) without a table visit for
+  // the status check, cutting the per-page cost from O(merchant rows) to
+  // O(matching rows).
+  ["mandates", "mandates_merchant_status_id", "merchant, status, id"],
+  // getProtocolStats counts distinct active merchants with
+  // COUNT(DISTINCT merchant) WHERE status = 'Active'. mandates_due is
+  // (status, next_charge) and does not include merchant, so the planner falls
+  // back to a full scan of that index with a temp B-tree to deduplicate.
+  // A covering (status, merchant) index lets the planner seek status = 'Active'
+  // and read merchant directly from the index — no table access, no temp tree.
+  ["mandates", "mandates_status_merchant", "status, merchant"],
+  // listMandateCharges orders by ledger DESC. charges_mandate_created_at is
+  // (mandate_id, created_at) and serves the lookup but not the ORDER BY
+  // (created_at ≠ ledger), so SQLite builds a temp B-tree to sort the results.
+  // Adding (mandate_id, ledger DESC, tx_hash) covers the mandate_id equality,
+  // yields rows already in ORDER BY ledger DESC, tx_hash direction, and
+  // includes tx_hash so the tiebreak needs no extra sort step.
+  ["charges", "charges_mandate_ledger", "mandate_id, ledger DESC, tx_hash"],
+  // getSubscriberExport reads one subscriber's charges ordered by ledger ASC,
+  // tx_hash ASC. charges_subscriber_created_at is (subscriber, created_at) so
+  // the lookup hits the index but the ORDER BY (ledger, tx_hash) forces a temp
+  // B-tree. The (subscriber, ledger, tx_hash) index serves both the equality
+  // filter and the ascending sort without a sort step.
+  ["charges", "charges_subscriber_ledger", "subscriber, ledger, tx_hash"],
 ];
 
 export function migrate(db: DatabaseSync): void {
@@ -526,14 +553,52 @@ export async function logAuditEvent(db: Storage, entry: AuditLogEntry): Promise<
   ]);
 }
 
-export async function pruneOldEvents(db: Storage, daysToKeep: number = 30): Promise<number> {
+/**
+ * Coordination between pruning and the projection (#246). Raw events are the
+ * source the projection is rebuilt from, so a prune must never remove events
+ * the projection has not consumed yet: `maxLedger` is the projection cursor,
+ * and events at or above it are kept however old they are.
+ */
+export interface PruneOptions {
+  /**
+   * Never prune events at or above this ledger. Pass the projection cursor so
+   * an event that has been retained but not yet projected survives the prune.
+   */
+  maxLedger?: number | undefined;
+}
+
+/**
+ * Delete raw contract events older than `daysToKeep` days.
+ *
+ * A `daysToKeep` of 0 (or a negative value) keeps everything: the documented
+ * meaning of `RAW_EVENT_RETENTION_DAYS=0` is "indefinite retention", so it
+ * must never delete the whole table. Events whose close time is unknown are
+ * kept as well — their ledger position cannot be compared with the cutoff.
+ *
+ * `options.maxLedger` is the projection cursor: events at or above it have
+ * not been projected yet (a backfill in flight, a crashed pass whose cursor
+ * did not advance), so they are never removed, which keeps the prune
+ * coordinated with the projection (#246).
+ */
+export async function pruneOldEvents(
+  db: Storage,
+  daysToKeep: number = 30,
+  options: PruneOptions = {},
+): Promise<number> {
+  if (!Number.isFinite(daysToKeep) || daysToKeep <= 0) return 0;
   const cutoffTime = Math.floor((Date.now() - daysToKeep * 24 * 60 * 60 * 1000) / 1000);
+  const maxLedger = options.maxLedger;
   // `RETURNING` reports the deleted rows on both backends, so the count needs
   // no second statement: node:sqlite's `changes` is not on the Storage boundary.
-  const deleted = await db.all<{ event_id: string }>(
-    "DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ? RETURNING event_id",
-    [cutoffTime],
-  );
+  const deleted = maxLedger === undefined
+    ? await db.all<{ event_id: string }>(
+        "DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ? RETURNING event_id",
+        [cutoffTime],
+      )
+    : await db.all<{ event_id: string }>(
+        "DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ? AND ledger < ? RETURNING event_id",
+        [cutoffTime, maxLedger],
+      );
   return deleted.length;
 }
 
@@ -564,6 +629,28 @@ export async function getPastDueMandates(db: Storage): Promise<Array<{ mandate_i
   return db.all<{ mandate_id: number; first_past_due_at: number }>(
     "SELECT mandate_id, first_past_due_at FROM past_due_mandates WHERE still_past_due = 1 ORDER BY first_past_due_at ASC",
   );
+}
+
+/**
+ * Run `VACUUM` and then `PRAGMA optimize` against the database.
+ *
+ * `VACUUM` rewrites the entire database file, reclaims free pages left by
+ * DELETEs and rebuilds indexes. `PRAGMA optimize` updates the statistics SQLite
+ * uses to choose query plans (the equivalent of PostgreSQL's ANALYZE), which
+ * is cheap — it only analyses tables whose statistics are out of date — and
+ * safe to run while the database is live.
+ *
+ * The two operations are run outside any transaction (`VACUUM` requires that).
+ * On a WAL-mode database `VACUUM` also checkpoints and resets the WAL, so the
+ * call implicitly combines what `PRAGMA wal_checkpoint(TRUNCATE)` does.
+ *
+ * Returns a summary of what was done so the admin response carries useful
+ * diagnostic information.
+ */
+export function vacuumDatabase(db: DatabaseSync): { vacuumed: true; optimized: true } {
+  db.exec("VACUUM");
+  db.exec("PRAGMA optimize");
+  return { vacuumed: true, optimized: true };
 }
 
 /** Back up the database to `backupPath` with a transactionally consistent snapshot. */

@@ -213,7 +213,11 @@ export interface ChargeAttemptRow {
   txHash: string | null;
   /** For a `skipped` attempt: what the vault was missing, token's smallest unit. */
   shortfall?: string;
-  /** Consecutive failed attempts after this one; 0 once a charge settles. */
+  /**
+   * The failure streak after this attempt: consecutive failures that are the
+   * mandate's own. Network, sequence-number and keeper-signer failures leave
+   * it unchanged (#248). 0 once a charge settles.
+   */
   failures: number;
   /** When the keeper tries again, in unix seconds; null after a settlement. */
   retryAt: number | null;
@@ -652,6 +656,13 @@ export interface HealthResponse {
     eventsLedger: number;
     /** Ledgers the projection trails the raw event stream by. */
     eventsLag: number;
+    /**
+     * Days raw events are kept before they are pruned. Zero means indefinite.
+     * Null when the indexer has not reported the policy yet.
+     */
+    rawEventRetentionDays: number | null;
+    /** Unix seconds when the last automatic prune completed; null until the first prune. */
+    lastPrunedAt: number | null;
   } | null;
   rpc?: {
     active: string;

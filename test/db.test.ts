@@ -407,3 +407,81 @@ describe("report query indexes", () => {
     db.close();
   });
 });
+
+describe("hot-path indexes (#264)", () => {
+  test("migrate creates the new covering indexes", () => {
+    const db = openDatabase(":memory:");
+    const names = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as {
+        name: string;
+      }[]
+    ).map((r) => r.name);
+
+    assert.ok(names.includes("mandates_merchant_status_id"), "mandates_merchant_status_id");
+    assert.ok(names.includes("mandates_status_merchant"), "mandates_status_merchant");
+    assert.ok(names.includes("charges_mandate_ledger"), "charges_mandate_ledger");
+    assert.ok(names.includes("charges_subscriber_ledger"), "charges_subscriber_ledger");
+    db.close();
+  });
+
+  test("listMandates merchant+status paging uses a (merchant, status) index", () => {
+    const db = openDatabase(":memory:");
+    // The keyset page listMandates runs with both merchant and status filters.
+    const plan = queryPlan(
+      db,
+      `SELECT * FROM mandates WHERE merchant = ? AND status = ? AND id < ? ORDER BY id DESC LIMIT ?`,
+      ["M", "Active", 100, 51],
+    );
+    // The planner may choose either mandates_merchant_status_id (merchant, status, id)
+    // or mandates_status_merchant (status, merchant); both cover the two equality
+    // predicates and use the rowid for the cursor — the key assertion is that
+    // neither the mandates_merchant-only index (which ignores status) nor a
+    // full table scan is used.
+    assert.doesNotMatch(plan, /SCAN mandates\b/);
+    assert.match(plan, /USING INDEX mandates_(merchant_status_id|status_merchant)/);
+    db.close();
+  });
+
+  test("COUNT(DISTINCT merchant) for active mandates uses a covering index", () => {
+    const db = openDatabase(":memory:");
+    // getProtocolStats counts distinct active merchants.
+    const plan = queryPlan(
+      db,
+      `SELECT COUNT(DISTINCT merchant) AS n FROM mandates WHERE status = 'Active'`,
+    );
+    // The (status, merchant) covering index lets the planner read merchant
+    // straight from the index without touching the table.
+    assert.match(plan, /COVERING INDEX mandates_status_merchant/);
+    assert.doesNotMatch(plan, /SCAN mandates\b/);
+    db.close();
+  });
+
+  test("listMandateCharges ORDER BY ledger DESC uses the (mandate_id, ledger, tx_hash) index", () => {
+    const db = openDatabase(":memory:");
+    // The endpoint reads one mandate's charges newest-first by ledger.
+    const plan = queryPlan(
+      db,
+      `SELECT * FROM charges WHERE mandate_id = ? ORDER BY ledger DESC LIMIT ?`,
+      [1, 50],
+    );
+    assert.match(plan, /SEARCH charges USING INDEX charges_mandate_ledger \(mandate_id=\?\)/);
+    // Index already delivers rows in ledger DESC order: no sort step.
+    assert.doesNotMatch(plan, /TEMP B-TREE/);
+    db.close();
+  });
+
+  test("getSubscriberExport charges ORDER BY ledger ASC uses the (subscriber, ledger, tx_hash) index", () => {
+    const db = openDatabase(":memory:");
+    // The export reads all of a subscriber's charges oldest-first by ledger.
+    const plan = queryPlan(
+      db,
+      `SELECT tx_hash, mandate_id, subscriber, merchant, amount, fee, ledger, created_at
+         FROM charges WHERE subscriber = ? ORDER BY ledger ASC, tx_hash ASC`,
+      ["S"],
+    );
+    assert.match(plan, /SEARCH charges USING INDEX charges_subscriber_ledger \(subscriber=\?\)/);
+    // Index already delivers rows in ledger ASC, tx_hash ASC order.
+    assert.doesNotMatch(plan, /TEMP B-TREE/);
+    db.close();
+  });
+});

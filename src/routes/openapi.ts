@@ -1803,6 +1803,145 @@ function servicePaths(): Record<string, PathItemObject> {
         },
       },
     },
+    "/admin/db/vacuum": {
+      post: {
+        tags: ["admin"],
+        summary: "VACUUM and ANALYZE the database",
+        description:
+          "Runs `VACUUM` followed by `PRAGMA optimize` (the SQLite equivalent of ANALYZE) against the database. `VACUUM` rewrites the file, reclaims free pages left by `DELETE` operations and rebuilds indexes; `PRAGMA optimize` refreshes the query-planner statistics for tables whose row counts have changed. The two operations run outside any transaction and can take seconds on a large database; the endpoint answers only after both finish. Only supported on the SQLite backend; a PostgreSQL instance answers 503. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "postDbVacuum",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "The maintenance ran.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    result: {
+                      type: "object",
+                      properties: {
+                        vacuumed: { type: "boolean", enum: [true] },
+                        optimized: { type: "boolean", enum: [true] },
+                      },
+                      required: ["vacuumed", "optimized"],
+                    },
+                  },
+                  required: ["status", "result"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "503": transient503("Database maintenance is not available on this instance (e.g. PostgreSQL backend)."),
+          "500": errorResponse("The maintenance operation threw; the message is kept for the operator."),
+        },
+      },
+    },
+    "/admin/data/prune": {
+      post: {
+        tags: ["admin"],
+        summary: "Prune old raw events and charge attempts",
+        description:
+          "Deletes raw contract events older than the configured retention window (`RAW_EVENT_RETENTION_DAYS`, falling back to `DATA_RETENTION_DAYS`, default 30 days) and charge-attempt logs older than `CHARGE_ATTEMPT_RETENTION_DAYS` (default 90 days). Pass `?days=N` to override the raw-event window for this call only; `days=0` keeps everything. Events not yet consumed by the projection are always kept, regardless of age. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "postDataPrune",
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "days",
+            in: "query",
+            required: false,
+            description: "Override the raw-event retention window for this call only, in days. 0 keeps everything.",
+            schema: { type: "integer", minimum: 0 },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "The prune ran; the body reports how many rows were deleted.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    result: {
+                      type: "object",
+                      properties: {
+                        deleted: {
+                          type: "object",
+                          properties: {
+                            events: { type: "integer", description: "Raw contract events deleted." },
+                            chargeAttempts: { type: "integer", description: "Charge-attempt log rows deleted." },
+                          },
+                          required: ["events", "chargeAttempts"],
+                        },
+                      },
+                      required: ["deleted"],
+                    },
+                  },
+                  required: ["status", "result"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "503": transient503("The prune operation is not available on this instance."),
+          "500": errorResponse("The prune threw; the message is kept for the operator."),
+        },
+      },
+    },
+    "/admin/data/retention": {
+      get: {
+        tags: ["admin"],
+        summary: "Current raw-event retention policy",
+        description:
+          "Returns the configured retention windows (`rawEventRetentionDays`, `chargeAttemptRetentionDays`), when the last automatic prune ran, and the current count of raw events in the `events` table. Zero means indefinite retention. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "getDataRetention",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "The retention policy.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    result: {
+                      type: "object",
+                      properties: {
+                        rawEventRetentionDays: {
+                          type: "integer",
+                          description: "Days raw contract events are kept. 0 means indefinite.",
+                        },
+                        chargeAttemptRetentionDays: {
+                          type: "integer",
+                          description: "Days keeper charge-attempt rows are kept. 0 means indefinite.",
+                        },
+                        lastPrunedAt: {
+                          type: ["integer", "null"],
+                          description: "Unix seconds when the last automatic prune completed; null until the first prune.",
+                        },
+                        rawEventCount: {
+                          type: "integer",
+                          description: "Current number of raw events in the events table.",
+                        },
+                      },
+                      required: ["rawEventRetentionDays", "chargeAttemptRetentionDays", "lastPrunedAt", "rawEventCount"],
+                    },
+                  },
+                  required: ["status", "result"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "503": transient503("The retention policy is not available on this instance."),
+        },
+      },
+    },
   };
 }
 
@@ -2082,11 +2221,13 @@ function componentSchemas(): Record<string, SchemaObject> {
         },
         failures: {
           type: "integer",
-          description: "Consecutive failed attempts after this one; 0 once a charge settles.",
+          description:
+            "The mandate's failure streak after this attempt: consecutive failures that are the mandate's own (a vault shortfall, a contract refusal). Network, sequence-number and keeper-signer failures leave it unchanged. 0 once a charge settles.",
         },
         retryAt: {
           type: ["integer", "null"],
-          description: "When the keeper tries again, in unix seconds; null after a settlement.",
+          description:
+            "When the keeper tries again, in unix seconds; null after a settlement. Grows with `failures` up to the configured cap; one base delay away after a failure that left `failures` unchanged.",
         },
       },
       required: ["id", "mandateId", "attemptedAt", "result", "errorCode", "txHash", "failures", "retryAt"],

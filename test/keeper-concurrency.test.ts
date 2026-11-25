@@ -37,7 +37,9 @@ type Db = ReturnType<typeof openDatabase>;
 
 function config(
   secrets: { KEEPER_SECRET: string; KEEPER_CHANNEL_SECRETS?: string[] },
-  extra: Partial<Record<"KEEPER_CONCURRENCY" | "KEEPER_CLAIM_TTL_S" | "KEEPER_BATCH", unknown>> = {},
+  extra: Partial<
+    Record<"KEEPER_CONCURRENCY" | "KEEPER_CLAIM_TTL_S" | "KEEPER_BATCH" | "KEEPER_BACKOFF_JITTER", unknown>
+  > = {},
 ): Config {
   return {
     PLAN_REGISTRY_ID: CONTRACT,
@@ -48,6 +50,7 @@ function config(
     KEEPER_MAX_FEE: "100000",
     KEEPER_BATCH: false,
     KEEPER_BATCH_SIZE: 10,
+    KEEPER_BACKOFF_JITTER: 0,
     ...secrets,
     ...extra,
   } as unknown as Config;
@@ -582,6 +585,52 @@ describe("keeper claims prevent double settlement (#249)", () => {
     } finally {
       await storage.close();
     }
+  });
+});
+
+describe("keeper backoff with claims (#248, #249)", () => {
+  test("when a backoff ends, two keepers racing for the mandate settle it exactly once", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 2, 3);
+    const t = trace();
+    // Mandate 1's first submission is lost to the network (a base-delay
+    // retry); once the wait is over it settles.
+    const node = fakeNode(t, ([id], previous) => (id === 1 && previous === 0 ? "networkError" : "settle"), 10);
+    const first = new Keeper(db, node, channelConfig(keys(2)));
+    const second = new Keeper(db, node, channelConfig(keys(2)));
+    await first.tick(NOW);
+    const retryAt = attempts(db).find((row) => row.mandate_id === 1)!.retry_at!;
+    assert.equal(retryAt, NOW + 60);
+
+    // Before the retry time neither keeper loads it, whoever recorded it.
+    const early = await Promise.all([first.tick(retryAt - 1), second.tick(retryAt - 1)]);
+    assert.deepEqual(early.flat(), []);
+
+    const [a, b] = await Promise.all([first.tick(retryAt), second.tick(retryAt)]);
+    assert.deepEqual([...a, ...b].map((r) => [r.mandateId, r.status]), [[1, "settled"]]);
+    assert.equal(t.sends.filter((send) => send.mandates[0] === 1).length, 2, "one failed, then one settling submission");
+    db.close();
+  });
+
+  test("a jittered retry time is the claim's expiry too, so other keepers wait exactly as long", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1);
+    const failing = new Keeper(
+      db,
+      fakeNode(trace(), () => "contractError"),
+      channelConfig(keys(1), { KEEPER_BACKOFF_JITTER: 0.5 }),
+      undefined,
+      { random: () => 0.5 },
+    );
+    await failing.tick(NOW);
+    // 60 s less a quarter (0.5 jitter x 0.5 draw).
+    assert.deepEqual(attempts(db).map((row) => row.retry_at), [NOW + 45]);
+    assert.deepEqual(claims(db).map((row) => row.expires_at), [NOW + 45]);
+
+    const other = new Keeper(db, fakeNode(trace()), channelConfig(keys(1)));
+    assert.deepEqual(await other.tick(NOW + 44), []);
+    assert.deepEqual((await other.tick(NOW + 45)).map((r) => r.status), ["settled"]);
+    db.close();
   });
 });
 

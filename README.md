@@ -1,5 +1,6 @@
 <h1 align="center">Payflow â€” Backend</h1>
 
+
 <p align="center">
   <strong>Event indexer, settlement keeper, and read API for the Payflow protocol.</strong>
 </p>
@@ -263,12 +264,19 @@ in the builder, production dependencies only in the final image.
   (the ledger the contracts were deployed at); with neither, the oldest ledger
   the RPC node still serves. A cursor older than the node's retention window is
   moved forward with a warning, since RPC rejects ranges that start before it.
-- **Exact ranges.** Each pass reads `[cursor, cursor + 8000)` windows and
-  never a ledger the RPC node is still closing. Up to
-  `INDEXER_FETCH_CONCURRENCY` windows are fetched at once, but they are
-  applied in ledger order and the cursor advances only after a window is
+- **Exact ranges.** Each pass reads `[cursor, cursor + INDEXER_BATCH_SIZE)`
+  batches and never a ledger the RPC node is still closing. Up to
+  `INDEXER_FETCH_CONCURRENCY` batches are fetched at once, but they are
+  applied in ledger order and the cursor advances only after a batch is
   applied. Paging continues until a page is empty or passes the range end: a
   short page does not mean the range is exhausted.
+- **One transaction per batch.** A batch's raw events, its projection rows and
+  its cursor are written in one transaction, and within it each ledger is
+  written together: one multi-row `INSERT OR IGNORE` carries a ledger's raw
+  events instead of one round trip per event. Batching the whole pass into one
+  transaction was rejected on purpose: a fetch failure after some batches have
+  been applied must leave their cursor in place, so the next pass resumes at the
+  failed one instead of re-reading everything.
 - **Catch-up progress is logged at a steady cadence.** Each time the cursor
   moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000) the indexer logs
   one `indexer progress` line with `network`, `cursor`, `latest`, `behind`,
@@ -279,7 +287,9 @@ in the builder, production dependencies only in the final image.
 - **Failing mandates back off.** A mandate whose charge fails (usually an
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
-  queue would block every other mandate.
+  queue would block every other mandate. See
+  [Per-mandate backoff](#per-mandate-backoff) for the formula, its settings and
+  which failures count.
 - **Dry run before the first real pass.** `KEEPER_DRY_RUN=true` makes a pass
   rehearse settlement: every due charge is built and simulated exactly as a
   real pass would — account lookup, inclusion fee, vault-balance skips and
@@ -314,6 +324,66 @@ in the builder, production dependencies only in the final image.
   the exact problems, counted in `/health`'s `indexer.mismatchedEvents`, and
   never silently stored as zeros. Update the spec file together with the
   contracts.
+
+### Per-mandate backoff
+
+A mandate whose charge keeps failing — most often a vault that stays short of
+funds — is not retried on every pass. After its *n*-th failure in a row it
+waits
+
+```
+delay = min(KEEPER_BACKOFF_BASE_S × KEEPER_BACKOFF_MULTIPLIER^(n−1), KEEPER_BACKOFF_MAX_S)
+```
+
+seconds, less a random share of up to `KEEPER_BACKOFF_JITTER` of that delay,
+so mandates that failed in the same pass do not all come back at the same
+instant. Jitter only shortens a wait, so the cap always holds. With the
+defaults (`60`, `2`, `21600`, `0.1`) the waits are about 1, 2, 4, 8 … minutes,
+up to 6 hours. A settlement resets the streak, and the next failure starts
+from the base delay again.
+
+The state lives in the database, not in the keeper's memory: every attempt is
+a row in `charge_attempts` carrying the mandate's streak (`failures`) and
+next attempt (`retry_at`), with the reason (`error_code`) and time
+(`attempted_at`). The due query leaves out any mandate whose newest row names
+a `retry_at` still ahead, so a backed-off mandate never takes a place in the
+batch, and a restarted keeper, or another keeper on the same database, honours
+the same backoff. The keeper's claim on the charge is held until the same
+`retry_at`.
+
+Not every failure is the mandate's fault, so not every failure grows it:
+
+| Failure | Examples | Streak | Next attempt |
+|---|---|---|---|
+| The mandate's own | vault shortfall (`INSUFFICIENT_BALANCE`), the vault's `InsufficientBalance` / allowance errors, any other contract refusal, a transaction that failed on chain, anything unrecognised | +1 | the schedule above |
+| Permanent | `MandateNotFound`, `MandateNotActive`, `MaxChargesReached`, `PlanNotFound` | +1 | `KEEPER_BACKOFF_MAX_S` at once |
+| The keeper's signer | `Error(Auth, …)`, `txBadAuth`, `txInsufficientBalance`, a missing or unfunded keeper account | unchanged | `KEEPER_BACKOFF_BASE_S` |
+| Infrastructure | RPC unreachable or timing out, `TRY_AGAIN_LATER`, `NOT_FOUND` after polling, `txBadSeq` after its retries, `txInsufficientFee`, `ProtocolPaused` | unchanged | `KEEPER_BACKOFF_BASE_S` |
+
+- **Infrastructure failures do not count** so an RPC outage cannot push every
+  mandate hours into the future: each keeps coming back after the base delay,
+  and settles on the first pass after the network recovers.
+- **Keeper-signer failures do not count either.** `charge` is permissionless,
+  so a refused authorization or an unusable keeper account means the keeper is
+  misconfigured, and every mandate would fail the same way. Penalising each
+  of them would delay every subscriber by hours after the operator fixes the
+  key. These are logged at `error` level so the cause is obvious. They cost
+  nothing to retry, because they fail before anything is submitted.
+- **Permanent refusals wait the cap.** The projection still lists the mandate
+  as active, but the contract says otherwise. The indexer drops it from the due
+  list as soon as it projects the cancellation or completion (and the
+  reconciler repairs one it missed), so the keeper stops asking instead of
+  repeating the refusal. No new mandate status is introduced.
+- A failure that does not grow the streak never sends `charge.failing` again.
+
+There is no grace period or attempt limit to respect: the contract accepts a
+charge any time after `next_charge` and sets the next one to `now + period`,
+so a late charge delays billing but never skips a period. Each backoff is
+logged (`mandate backing off after a failed charge`, with `mandateId`,
+`failures`, `reason`, `errorCode` and `retryAt`) and counted in
+`payflow_keeper_backoffs_total` by `reason`. `GET /api/mandates/:id/attempts`
+shows each attempt's streak and next retry, and `GET /admin/keeper/backoff`
+lists the mandates waiting.
 
 ### Reconciling the projection with the chain
 
@@ -423,18 +493,25 @@ flight. Unset, it is one per channel — the behaviour before the cap existed.
 - **Sequence numbers.** Each channel uses its own account sequence, read from
   the network before every transaction. A submission refused with `txBadSeq`
   (something else used the account) re-reads the sequence and resubmits, at
-  most twice; after that the mandate fails and backs off like any other
-  failure.
+  most twice; after that the mandate fails and retries after the base delay,
+  without growing its backoff ([why](#per-mandate-backoff)).
 - **Failures stay isolated.** A failed charge (contract error, network error,
   timeout, refused authorization) is recorded in `charge_attempts` with its
-  code and backs off on the usual schedule; its channel goes back to the pool
-  and the other workers carry on. `charge` is permissionless, so the keeper
-  supplies no Soroban authorization; a refused authorization is recorded with
-  its host error (for example `Error(Auth, InvalidAction)`) and backs off
-  rather than retrying in a loop.
+  code and backs off ([per its cause](#per-mandate-backoff)); its channel
+  goes back to the pool and the other workers carry on. `charge` is
+  permissionless, so the keeper supplies no Soroban authorization; a refused
+  authorization is recorded with its host error (for example
+  `Error(Auth, InvalidAction)`) and waits the base delay rather than retrying
+  in a loop.
 - **Shutdown.** On `SIGTERM`/`SIGINT` the keeper takes no new mandates; the
   transactions in flight finish and are recorded before the process exits
-  (bounded by `SHUTDOWN_TIMEOUT_MS`).
+  (bounded by `SHUTDOWN_TIMEOUT_MS`). This holds for the long-running process
+  (including a pass triggered from `/admin`) and for the one-shot
+  `npm run keeper` command. Charges claimed but not yet submitted when the
+  signal lands are released at once, so another keeper can settle them
+  without waiting out `KEEPER_CLAIM_TTL_S`; a charge still stuck at the
+  deadline is abandoned, the one-shot command exits non-zero, and its claim
+  lapses after the TTL.
 
 `payflow_keeper_in_flight` reports the transactions in flight right now, and
 each `mandate settled` log line names the channel (public key) that signed it.
@@ -623,6 +700,7 @@ deployment that does not scrape them should not expose them.
 | `payflow_charges_settled_total` | counter | Charges the keeper settled |
 | `payflow_charges_failed_total` | counter | Charges the keeper could not settle |
 | `payflow_keeper_passes_total` | counter | Keeper passes run |
+| `payflow_keeper_backoffs_total` | counter | Failed charges given a retry time, by `reason`: `mandate` and `permanent` grow the mandate's backoff, `keeper` and `infrastructure` do not |
 | `payflow_keeper_in_flight` | gauge | Settlement transactions in flight right now; never above `KEEPER_CONCURRENCY` |
 
 Every gauge carries a `network` label — and only that label, so the series
@@ -1120,6 +1198,10 @@ examined without API downtime.
 | `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
 | `KEEPER_CONCURRENCY` | *(one per channel)* | Most settlement transactions in flight at once (at least 1). May not exceed the number of channels (`KEEPER_SECRET` plus distinct `KEEPER_CHANNEL_SECRETS`); a larger value fails startup. See [the concurrency cap](#the-concurrency-cap-and-double-settlement) |
 | `KEEPER_CLAIM_TTL_S` | `300` | Seconds a keeper's claim on a due charge lasts (at least 60); a claim left by a crashed keeper lapses after this |
+| `KEEPER_BACKOFF_BASE_S` | `60` | Wait after a mandate's first failed charge, in seconds (at least 1). Also the retry delay for failures that are not the mandate's own. See [Per-mandate backoff](#per-mandate-backoff) |
+| `KEEPER_BACKOFF_MULTIPLIER` | `2` | Growth of the wait per consecutive failure (at least 1; fractions allowed) |
+| `KEEPER_BACKOFF_MAX_S` | `21600` | Longest wait, in seconds: at least `KEEPER_BACKOFF_BASE_S`, at most 604800 (7 days), and within `CHARGE_ATTEMPT_RETENTION_DAYS` |
+| `KEEPER_BACKOFF_JITTER` | `0.1` | Largest share of a wait taken off at random (0–0.5); `0` turns jitter off |
 | `KEEPER_CHANNEL_MIN_XLM` | `2` | Minimum total XLM balance to keep a channel account in rotation; at most 7 decimal places. Raise it for additional account reserves or fee headroom |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
@@ -1129,7 +1211,8 @@ examined without API downtime.
 | `KEEPER_BATCH` | `true` | Settle due mandates through the contract's `charge_many` in groups, falling back to single `charge` transactions when the contract does not support it |
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
-| `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
+| `INDEXER_BATCH_SIZE` | `8000` | Ledgers one batch reads and applies before the cursor moves (1–8000, the RPC's getEvents window) |
+| `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger batches one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_PROGRESS_LEDGERS` | `10000` | Ledgers between two `indexer progress` log lines (cursor, lag, events, ledgers per second); `0` turns them off |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
@@ -1137,13 +1220,16 @@ examined without API downtime.
 | `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
 | `DATABASE_URL` | — | `postgres://` or `postgresql://` connection string; when set, PostgreSQL is used instead of SQLite |
+| `DATABASE_POOL_MAX` | `10` | PostgreSQL connections per process (1–100); every API, indexer and keeper process holds its own pool |
+| `DATABASE_ACQUIRE_TIMEOUT_MS` | `10000` | How long a query waits for a free connection before failing with a `DATABASE_ACQUIRE_TIMEOUT_MS` error |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `30000` | `statement_timeout` sent to PostgreSQL with every connection, so a runaway query is cancelled server-side |
 | `REDIS_URL` | — | Optional `redis://`/`rediss://` shared cache for merchant summaries and token metadata; defaults to in-memory cache |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
 | `API_RATE_LIMIT_MAX` | `120` | Maximum requests per IP in each API rate-limit window |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus metrics at `/metrics` |
-| `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
+| `CORS_ORIGIN` | *(empty)* | Comma-separated exact browser origins allowed to call the API (`https://app.example`). Empty refuses cross-origin reads; `*` allows every origin. SEP-10 always answers `*` |
 | `REQUIRE_HTTPS` | on when `NODE_ENV=production` | Reject plaintext requests with `403 forbidden`, judged by the proxy's `X-Forwarded-Proto`. `/health`, `/ready` and `/metrics` are exempt for platform probes |
 | `HSTS_MAX_AGE_S` | `31536000` | `Strict-Transport-Security` max-age (with `includeSubDomains`); `0` drops the header |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
@@ -1204,7 +1290,10 @@ MAINNET_SUBSCRIPTION_ID=C...
 MAINNET_INDEXER_START_LEDGER=5110418
 ```
 
-Each network runs its own indexer with its own cursor and projection. With
+Each network runs its own indexer with its own cursor, projection and poll
+cadence: `<NAME>_INDEXER_INTERVAL_MS` and `<NAME>_INDEXER_BATCH_SIZE` override
+the defaults for that network only, so a busy mainnet indexer can keep the
+8,000-ledger batches while a quiet testnet polls less often. With
 `DATABASE_URL`, each network is isolated in its own PostgreSQL schema; otherwise
 it uses a SQLite file derived from `DATABASE_PATH` (`./payflow.db` becomes
 `./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise. Ledger

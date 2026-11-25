@@ -1,7 +1,8 @@
 import { Server } from "node:http";
 import { loadConfig, networkConfigs } from "./config.ts";
 import { openStorage } from "./lib/store/index.ts";
-import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
+import { SqliteStorage } from "./lib/store/sqlite.ts";
+import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent, vacuumDatabase } from "./lib/db.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -191,8 +192,10 @@ const adminHooks: AdminHooks = {
     // from the admin endpoint; if absent, use the per-table config defaults.
     const rawEventDays = daysToKeep ?? (config.RAW_EVENT_RETENTION_DAYS ?? config.DATA_RETENTION_DAYS);
     const chargeAttemptDays = config.CHARGE_ATTEMPT_RETENTION_DAYS;
+    // Guard: never prune events the projection has not consumed yet (#246).
+    const cursor = defaultRuntime.indexer.status.cursor;
     try {
-      const events = await pruneOldEvents(db, rawEventDays);
+      const events = await pruneOldEvents(db, rawEventDays, { maxLedger: cursor });
       const chargeAttempts = await pruneChargeAttempts(db, chargeAttemptDays);
       const deleted = { events, chargeAttempts };
       await logAuditEvent(db, {
@@ -211,6 +214,19 @@ const adminHooks: AdminHooks = {
       throw err;
     }
   },
+  getRetentionPolicy: async () => {
+    const db = defaultRuntime.db;
+    const indexerStatus = defaultRuntime.indexer.status;
+    const rawEventDays = config.RAW_EVENT_RETENTION_DAYS ?? config.DATA_RETENTION_DAYS;
+    const chargeAttemptDays = config.CHARGE_ATTEMPT_RETENTION_DAYS;
+    const countRow = await db.get<{ n: number }>("SELECT COUNT(*) AS n FROM events");
+    return {
+      rawEventRetentionDays: rawEventDays,
+      chargeAttemptRetentionDays: chargeAttemptDays,
+      lastPrunedAt: indexerStatus.lastPrunedAt ?? null,
+      rawEventCount: countRow?.n ?? 0,
+    };
+  },
   getAuditLogs: async (limit: number) => {
     const db = defaultRuntime.db;
     return db.all(
@@ -222,6 +238,33 @@ const adminHooks: AdminHooks = {
   getPastDueMandates: async () => {
     const db = defaultRuntime.db;
     return getPastDueMandatesFromDb(db);
+  },
+  vacuumDb: async () => {
+    const db = defaultRuntime.db;
+    // `VACUUM` requires a live DatabaseSync handle; it is only available on
+    // the SQLite backend. On PostgreSQL the hook is not wired, so the route
+    // answers 503 rather than attempting to run `VACUUM` through the Storage
+    // abstraction (which cannot run DDL statements outside a transaction).
+    const sqlite = db instanceof SqliteStorage ? db.database : undefined;
+    if (!sqlite) {
+      throw new Error("VACUUM is only supported on the SQLite backend");
+    }
+    try {
+      const result = vacuumDatabase(sqlite);
+      await logAuditEvent(db, {
+        action: "db_vacuum",
+        success: true,
+        details: result,
+      });
+      return result;
+    } catch (err) {
+      await logAuditEvent(db, {
+        action: "db_vacuum",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   },
 };
 if (keeper && runKeeperPass) {
@@ -280,7 +323,9 @@ const loops: Loop[] = [];
 if (runIndexer) {
   for (const rt of runtimes) {
     loops.push(
-      every(config.INDEXER_INTERVAL_MS, async () => {
+      // The poll cadence is per network (#241): a network configured on its
+      // own may pace its passes differently from the default.
+      every(rt.network.indexerIntervalMs ?? config.INDEXER_INTERVAL_MS, async () => {
         try {
           await rt.runPass();
         } catch {
@@ -375,10 +420,12 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "shutting down");
   // The keeper takes no new mandates from here on; the settlements already in
   // flight finish and are recorded while the drain below waits for the pass.
-  activeKeeper?.stop();
+  // Waiting on the keeper itself (not only its loop) also covers a pass an
+  // operator triggered from /admin (#255).
+  const keeperDrain: Loop[] = activeKeeper ? [{ stop: () => activeKeeper.stop() }] : [];
   // Let a pass that is mid-write or mid-transaction finish before the database
   // closes, but never hang forever on a stuck RPC call.
-  const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);
+  const outcome = await drain([...keeperDrain, ...loops], config.SHUTDOWN_TIMEOUT_MS);
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
   const closeAll = async () => {

@@ -11,7 +11,12 @@ import type { Config, NetworkConfig } from "../src/config.ts";
 import { Indexer } from "../src/indexer.ts";
 import { getMerchantSummary, getPlanById, getProtocolStats, listChargeAttempts, listMandateCharges, listPlans, listMandates } from "../src/lib/queries.ts";
 import { claimCharge, holdClaim, pruneClaims } from "../src/lib/claims.ts";
-import { PostgresStorage } from "../src/lib/store/postgres.ts";
+import {
+  DEFAULT_POOL_SETTINGS,
+  PostgresStorage,
+  explainCheckoutTimeout,
+  poolConfigFor,
+} from "../src/lib/store/postgres.ts";
 import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 import type { Storage } from "../src/lib/store/types.ts";
 import { WebhookDispatcher } from "../src/lib/webhooks.ts";
@@ -42,6 +47,37 @@ if (DATABASE_URL) {
       ),
   });
 }
+
+test("the PostgreSQL pool is sized and bounded by the configured timeouts (#263)", () => {
+  const config = poolConfigFor("postgres://payflow:secret@db.example/payflow", "payflow_testnet", {
+    max: 20,
+    acquireTimeoutMs: 2_000,
+    statementTimeoutMs: 5_000,
+  });
+
+  assert.equal(config.max, 20, "the pool holds at most the configured connections");
+  assert.equal(config.connectionTimeoutMillis, 2_000, "a checkout cannot wait forever");
+  assert.equal(config.statement_timeout, 5_000, "PostgreSQL cancels a runaway statement");
+  assert.match(String(config.options), /search_path=payflow_testnet/, "the network's schema is kept");
+});
+
+/** The error a pool checkout timeout answers with, restated with the setting's name. */
+test("a pool checkout timeout names DATABASE_ACQUIRE_TIMEOUT_MS", () => {
+  const err = explainCheckoutTimeout(
+    new Error("timeout exceeded when trying to connect"),
+    { max: 4, acquireTimeoutMs: 750, statementTimeoutMs: 1_000 },
+  );
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /750 ms/);
+  assert.match(err.message, /DATABASE_ACQUIRE_TIMEOUT_MS/);
+  assert.match(err.message, /DATABASE_POOL_MAX\)/);
+  assert.ok(err.cause instanceof Error, "the driver's error is kept as the cause");
+
+  // Anything else is passed through untouched, so a real query error keeps its own message.
+  const query = new Error("duplicate key value violates unique constraint");
+  assert.equal(explainCheckoutTimeout(query, DEFAULT_POOL_SETTINGS), query);
+  assert.equal(explainCheckoutTimeout("not an error", DEFAULT_POOL_SETTINGS), "not an error");
+});
 
 function event(
   name: string,
@@ -183,6 +219,43 @@ for (const backend of backends) {
     }
   });
 }
+
+test("the server enforces the configured statement timeout (#263)", { skip: !DATABASE_URL }, async () => {
+  const storage = await PostgresStorage.open(
+    DATABASE_URL!,
+    `timeout_${process.pid}_${randomBytes(4).toString("hex")}`,
+    { max: 2, acquireTimeoutMs: 5_000, statementTimeoutMs: 1_234 },
+  );
+  try {
+    const [row] = await storage.all<{ statement_timeout: string }>("SHOW statement_timeout");
+    assert.equal(row?.statement_timeout, "1234ms", "the startup packet carried the timeout");
+  } finally {
+    await storage.close();
+  }
+});
+
+test("a saturated pool fails a query instead of queueing forever (#263)", { skip: !DATABASE_URL }, async () => {
+  const storage = await PostgresStorage.open(
+    DATABASE_URL!,
+    `saturated_${process.pid}_${randomBytes(4).toString("hex")}`,
+    { max: 1, acquireTimeoutMs: 200, statementTimeoutMs: 10_000 },
+  );
+  try {
+    const held = storage.transaction(async (tx) => {
+      await tx.all("SELECT pg_sleep(0.6)");
+    });
+    // Let the transaction take the pool's only connection before contending.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await assert.rejects(
+      storage.all("SELECT 1"),
+      /DATABASE_ACQUIRE_TIMEOUT_MS/,
+      "the second query times out acquiring the held connection",
+    );
+    await held;
+  } finally {
+    await storage.close();
+  }
+});
 
 test("SQLite and PostgreSQL return identical projection responses", { skip: !DATABASE_URL }, async () => {
   const sqlite = await SqliteStorage.open(":memory:");

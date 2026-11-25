@@ -7,6 +7,37 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **Graceful keeper shutdown finishes in-flight charges (#255).** `Keeper.stop()`
+  now returns a promise that resolves once every running pass — scheduled or
+  triggered from `/admin` — has finished, and the API process's shutdown waits
+  on it (bounded by `SHUTDOWN_TIMEOUT_MS`). The one-shot `npm run keeper`
+  command, which used to die mid-transaction on `SIGTERM`, now stops picking
+  up mandates, lets the charges in flight confirm and be recorded, and closes
+  the database afterwards; past the deadline it exits non-zero. Charges a
+  worker had claimed but not yet submitted when the signal landed are released
+  immediately instead of being held for `KEEPER_CLAIM_TTL_S`. The HTTP API is
+  unchanged.
+- **Tests: a failed transfer never advances a mandate's due date (#256).** A
+  charge that fails on chain, is rejected on submission, is refused by the
+  contract or by authorization, never confirms, or cannot reach the RPC leaves
+  the mandate row untouched and the same due charge is retried once its
+  backoff lapses — including the failing member of a `charge_many`.
+- **Configurable indexing batch size and poll interval (#241).**
+  `INDEXER_BATCH_SIZE` sets how many ledgers one batch reads and applies
+  before the cursor moves (default 8,000, the RPC's getEvents window; 1–8,000),
+  replacing the hard-coded window, and each network may pace itself with
+  `<NAME>_INDEXER_BATCH_SIZE` and `<NAME>_INDEXER_INTERVAL_MS`. A smaller batch
+  commits more often and replays less after a crash; a larger one still starts
+  no later than the RPC allows. Responses are unchanged.
+- **PostgreSQL pooling is sized and bounded (#263).**
+  `DATABASE_POOL_MAX` (default 10) caps the connections one process holds,
+  `DATABASE_ACQUIRE_TIMEOUT_MS` (default 10,000) bounds the wait for a free
+  connection — a saturated pool fails with an error naming that variable
+  instead of queueing forever — and `DATABASE_STATEMENT_TIMEOUT_MS`
+  (default 30,000) is sent as `statement_timeout` with every connection, so
+  PostgreSQL cancels a runaway query instead of pinning the connection. The
+  schema-creation connection at startup uses one connection and the same
+  timeouts.
 - **Concurrent settlement with a bounded worker pool (#249).**
   `KEEPER_CONCURRENCY` caps the settlement transactions a keeper pass keeps in
   flight (default: one per channel account; a cap above the number of channels
@@ -326,6 +357,19 @@ All notable changes to payflow-backend. The format follows
   SECURITY.md.
 
 ### Changed
+
+- **The indexer writes a batch in one transaction, ledger by ledger (#247).**
+  A batch's raw events, projection rows and cursor still commit together in a
+  single transaction, and inside it each ledger is now written as a group: one
+  multi-row `INSERT OR IGNORE` retains a ledger's raw events instead of one
+  statement per event, then that ledger's decoded events are applied. One
+  transaction per pass was rejected deliberately — a fetch failure after some
+  batches have been applied has to leave their cursor in place, so the next
+  pass resumes at the failed batch. Retain statements for a 4,000-event window
+  drop from 4,000 to 400 (`npm run bench:indexer`), and indexing the same
+  window through the real indexer went from 8,193 ms to 3,517 ms on PostgreSQL
+  16 (2.33×) and from 730 ms to 541 ms on file-backed SQLite (1.35×).
+  Responses and cursor semantics are unchanged.
 
 - **The raw event feed reads one page per request (#364).** `GET /api/events`
   without a `name` filter now asks the database for one page plus one row
