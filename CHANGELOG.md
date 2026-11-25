@@ -86,6 +86,32 @@ All notable changes to payflow-backend. The format follows
   projection file on its own does not hold. `reindex --from` refuses to move
   the cursor *forwards*, because the ledgers in between would never be applied;
   `--skip-ahead` is how an operator accepts that gap on purpose.
+- **A `doctor` command (#300).** `npm run cli -- doctor` is the pre-flight
+  check: it validates the environment, validates the keeper's signing keys
+  (printing only public keys), opens the projection — SQLite from its file, or
+  PostgreSQL through the same store the service uses — probes every configured
+  RPC endpoint through the failover client, and reports the projection's lag.
+  Each check is its own line with `OK`, `WARN` or `FAIL`; a failure exits
+  non-zero so a deployment probe can gate on it, while a warning (no keeper
+  key, or a node that is catching up) does not. `--json` prints the same
+  report as a machine-readable object, and secrets and PostgreSQL passwords
+  never reach either form.
+- **The error envelope is checked across routes (#297).** `test/error-envelope.test.ts`
+  exercises one error path from every mounted router — plans, mandates,
+  merchants, the fallthrough 404 and the unauthenticated admin 401 — and
+  asserts the single documented `{ error: { code, message, requestId } }`
+  shape, the status code, the JSON content type and the echoed request id on
+  both `/api/v1` and its `/api` alias.
+- **A raised, enforced coverage gate (#298).** `npm run test:coverage` now
+  fails below 95% lines, 90% functions and 85% branches of `src/` instead of
+  the line-only 94% gate, so a new branch or handler without a test is caught
+  by CI rather than by review.
+- **Simultaneous writes are tested (#299).** `test/concurrency.test.ts` sends
+  a burst of parallel PUTs to the notification-preferences endpoint — across
+  merchants and to one merchant — and asserts every write lands, the upsert
+  leaves exactly one row per merchant, each stored set is one complete
+  submission rather than a torn mixture, and a burst of badly signed writes
+  is refused with 401 and leaves nothing behind.
 - **An API changelog and a deprecation policy (#172).** `API_CHANGELOG.md`
   records what changed in the HTTP API apart from the service's own changelog,
   and states how long a deprecated field or route keeps working: one minor

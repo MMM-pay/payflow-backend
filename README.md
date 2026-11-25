@@ -171,6 +171,7 @@ written through the same code, so it cannot drift from what the service does.
 | Command | What it does |
 |---|---|
 | `status` | The indexer's and the API's health for a network: cursor, lag, counts, due mandates, keeper channels |
+| `doctor` | One line per check — environment, keeper key, database reachability, RPC connectivity and projection lag |
 | `mandate <id>` | One mandate, its plan, its token and the charges it has settled |
 | `due` | The mandates that are due for charging, each with the `funded` flag the last indexed vault balance gives |
 | `charge <id>` | Trigger a charge for one mandate, through the keeper |
@@ -198,6 +199,25 @@ Two rules shape it:
 `status`, `mandate` and `due` read the projection only and need no network;
 `--offline` keeps `status` from asking the RPC for the latest ledger at all.
 `charge` and `reindex` need the network, and `charge` needs `KEEPER_SECRET`.
+
+`doctor` is the pre-flight check: it validates the environment, opens the
+projection (SQLite or, through the same store the service uses, PostgreSQL),
+probes the RPC and reports the lag. A failed check exits non-zero, so a
+deployment can gate on it; a warning does not:
+
+```bash
+npm run cli -- doctor
+```
+
+```text
+network:      testnet
+env:          OK    3 contract(s) on testnet, passphrase "Test SDF Network ; September 2015"
+keeper:       WARN  not configured (no KEEPER_SECRET)
+database:     OK    sqlite ./payflow.db — cursor 4286195
+rpc:          OK    https://soroban-testnet.stellar.org — latest ledger 4286201 (84 ms)
+projection:   OK    lag 6
+check:        ok (1 warning)
+```
 
 Point `status` at a running API to see what the service thinks of itself:
 
