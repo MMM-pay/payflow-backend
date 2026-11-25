@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { createApp } from "../src/app.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import { Indexer } from "../src/indexer.ts";
-import { getMerchantSummary, getPlanById, getProtocolStats, listMandateCharges, listPlans, listMandates } from "../src/lib/queries.ts";
+import { getMerchantSummary, getPlanById, getProtocolStats, listChargeAttempts, listMandateCharges, listPlans, listMandates } from "../src/lib/queries.ts";
 import { PostgresStorage } from "../src/lib/store/postgres.ts";
 import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 import type { Storage } from "../src/lib/store/types.ts";
@@ -14,6 +14,9 @@ import { WebhookDispatcher } from "../src/lib/webhooks.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
 import { asReader, TokenMetadataService } from "../src/lib/tokens.ts";
 import { MerchantSummaryCache } from "../src/routes/index.ts";
+import { sep10For } from "../src/routes/auth.ts";
+import { Keypair, Networks, TransactionBuilder, xdr, type rpc } from "@stellar/stellar-sdk";
+import { createHmac } from "node:crypto";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
@@ -329,3 +332,289 @@ test("PostgreSQL stores and delivers webhook events", { skip: !DATABASE_URL }, a
     await storage.close();
   }
 });
+
+/**
+ * Issue #262: run the same store contract tests against SQLite and
+ * PostgreSQL so the two backends stay behaviourally parallel.
+ *
+ * The `backends` list above always runs SQLite and optionally PostgreSQL when
+ * DATABASE_URL is set; the `skip: !DATABASE_URL` tests compare the two
+ * directly. Every store contract below is exercised on both backends.
+ */
+
+/** Writes three keeper charge attempts for mandate 1, newest insert last. */
+async function recordChargeAttempts(storage: Storage): Promise<void> {
+  await storage.transaction(async (tx) => {
+    await tx.run(
+      `INSERT INTO charge_attempts (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [1, 1_700_000_000, "settled", null, "tx-a", null, 0, null],
+    );
+    await tx.run(
+      `INSERT INTO charge_attempts (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [1, 1_700_000_100, "skipped", "insufficient_funds", null, "5000000", 1, 1_700_000_200],
+    );
+    await tx.run(
+      `INSERT INTO charge_attempts (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [1, 1_700_000_050, "failed", "tx_failed", "tx-b", null, 2, null],
+    );
+  });
+}
+
+for (const backend of backends) {
+  test(`${backend.name}: keeper charge attempts are written and read back newest-first`, async () => {
+    const storage = await backend.open();
+    try {
+      await recordChargeAttempts(storage);
+      const attempts = await listChargeAttempts(storage, 1, 10);
+      assert.equal(attempts.length, 3, "all three attempts are stored");
+      // Reads are ordered by id DESC, so the last insert comes back first.
+      assert.equal(attempts[0]!.result, "failed");
+      assert.equal(attempts[0]!.errorCode, "tx_failed");
+      assert.equal(attempts[0]!.txHash, "tx-b");
+      assert.equal(attempts[0]!.failures, 2);
+      assert.equal(attempts[0]!.retryAt, null);
+      assert.equal(attempts[1]!.result, "skipped");
+      assert.equal(attempts[1]!.errorCode, "insufficient_funds");
+      assert.equal(attempts[1]!.txHash, null);
+      assert.equal(attempts[1]!.shortfall, "5000000");
+      assert.equal(attempts[1]!.failures, 1);
+      assert.equal(attempts[1]!.retryAt, 1_700_000_200);
+      assert.equal(attempts[2]!.result, "settled");
+      assert.equal(attempts[2]!.errorCode, null);
+      assert.equal(attempts[2]!.txHash, "tx-a");
+      assert.equal(attempts[2]!.failures, 0);
+      assert.equal(attempts[2]!.retryAt, null);
+    } finally {
+      await storage.close();
+    }
+  });
+}
+
+test("SQLite and PostgreSQL return identical charge attempts", { skip: !DATABASE_URL }, async () => {
+  const sqlite = await SqliteStorage.open(":memory:");
+  const postgres = await PostgresStorage.open(
+    DATABASE_URL!,
+    `attempts_${process.pid}_${randomBytes(4).toString("hex")}`,
+  );
+  try {
+    await recordChargeAttempts(sqlite);
+    await recordChargeAttempts(postgres);
+    assert.deepEqual(
+      await listChargeAttempts(sqlite, 1, 10),
+      await listChargeAttempts(postgres, 1, 10),
+      "both backends return the same attempts",
+    );
+  } finally {
+    await Promise.all([sqlite.close(), postgres.close()]);
+  }
+});
+
+for (const backend of backends) {
+  test(`${backend.name}: duplicate charge write is idempotent`, async () => {
+    const storage = await backend.open();
+    try {
+      await storage.run(
+        `INSERT INTO charges (tx_hash, mandate_id, subscriber, merchant, amount, fee, charges_made, next_charge, ledger, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tx_hash, mandate_id) DO NOTHING`,
+        ["tx-1", 1, SUBSCRIBER, MERCHANT, "100", "10", 1, 200, 10, 1000],
+      );
+      await storage.run(
+        `INSERT INTO charges (tx_hash, mandate_id, subscriber, merchant, amount, fee, charges_made, next_charge, ledger, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tx_hash, mandate_id) DO NOTHING`,
+        ["tx-1", 1, SUBSCRIBER, MERCHANT, "100", "10", 1, 200, 10, 1000],
+      );
+      const rows = await storage.all<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM charges WHERE tx_hash = ? AND mandate_id = ?",
+        ["tx-1", 1],
+      );
+      assert.equal(rows[0]!.n, 1, "replayed charge keeps a single row");
+    } finally {
+      await storage.close();
+    }
+  });
+
+  test(`${backend.name}: duplicate mandate_events write is idempotent`, async () => {
+    const storage = await backend.open();
+    try {
+      await storage.run(
+        `INSERT OR IGNORE INTO mandate_events (mandate_id, slot, merchant, kind, at, ledger) VALUES (?, ?, ?, ?, ?, ?)`,
+        [1, "start", MERCHANT, "started", 1_700_000_000, 10],
+      );
+      await storage.run(
+        `INSERT OR IGNORE INTO mandate_events (mandate_id, slot, merchant, kind, at, ledger) VALUES (?, ?, ?, ?, ?, ?)`,
+        [1, "start", MERCHANT, "started", 1_700_000_000, 10],
+      );
+      const rows = await storage.all<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM mandate_events WHERE mandate_id = ? AND slot = ?",
+        [1, "start"],
+      );
+      assert.equal(rows[0]!.n, 1, "replayed churn event keeps a single row");
+    } finally {
+      await storage.close();
+    }
+  });
+
+  test(`${backend.name}: raw duplicate primary key insert is rejected`, async () => {
+    const storage = await backend.open();
+    try {
+      await storage.run(
+        `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [1, MERCHANT, "Plan", TOKEN, "100", 60, 1, 10],
+      );
+      await assert.rejects(
+        storage.run(
+          `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [1, MERCHANT, "Plan", TOKEN, "100", 60, 1, 10],
+        ),
+        (err: unknown) => /duplicate|unique|constraint/i.test(String((err as Error)?.message ?? err)),
+        "duplicate primary key is rejected",
+      );
+    } finally {
+      await storage.close();
+    }
+  });
+}
+
+const JWT_SECRET = "a-jwt-secret-that-is-at-least-32-characters";
+
+/** Sign a SEP-10 challenge envelope with the client's keys, as a wallet does. */
+function signTx(envelope: string, ...keys: Keypair[]): string {
+  const tx = TransactionBuilder.fromXDR(envelope, Networks.TESTNET);
+  tx.sign(...keys);
+  return tx.toXDR();
+}
+
+/** An HS256 JWT signed with `secret`, for forging tampered tokens. */
+function forgeToken(claims: Record<string, unknown>, secret = JWT_SECRET): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const body = `${header}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}`;
+  return `${body}.${createHmac("sha256", secret).update(body).digest("base64url")}`;
+}
+
+/** Build an API serving SEP-10 sign-in and merchant webhook routes over `storage`. */
+async function makeAuthApp(storage: Storage): Promise<{ server: Server; base: string }> {
+  const network: NetworkConfig = {
+    name: "testnet",
+    rpcUrl: "https://rpc.invalid",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    planRegistryId: "C".repeat(56),
+    vaultId: "C".repeat(56),
+    subscriptionId: "C".repeat(56),
+    startLedger: 0,
+    databasePath: ":memory:",
+  };
+  const tokens = new TokenMetadataService(asReader(undefined), {
+    networkPassphrase: network.networkPassphrase,
+  });
+  const serverKey = Keypair.random();
+  const config = {
+    CORS_ORIGIN: "*",
+    SEP10_SIGNING_KEY: serverKey.secret(),
+    SEP10_JWT_SECRET: JWT_SECRET,
+    SEP10_HOME_DOMAIN: "payflow.example",
+    SEP10_WEB_AUTH_DOMAIN: "api.payflow.example",
+    SEP10_JWT_TTL_S: 900,
+  } as unknown as Config;
+  // No account exists on the fake RPC, so a master-key signature is enough to sign in.
+  const fakeRpc = {
+    getLedgerEntries: async (..._keys: xdr.LedgerKey[]): Promise<rpc.Api.GetLedgerEntriesResponse> =>
+      ({ entries: [], latestLedger: 1 } as never),
+  };
+  const auth = sep10For(config, network, fakeRpc)!;
+  const dispatcher = new WebhookDispatcher({
+    db: storage,
+    fetchImpl: async () => new Response("ok", { status: 200 }),
+    lookupImpl: async () => [{ address: "93.184.216.34", family: 4 }],
+  });
+  const app = createApp(
+    [{ config: network, db: storage, tokens, webhooks: dispatcher, auth }],
+    config,
+  );
+  const server = await new Promise<Server>((resolve) => {
+    const listening = app.listen(0, () => resolve(listening));
+  });
+  const port = (server.address() as AddressInfo).port;
+  return { server, base: `http://127.0.0.1:${port}` };
+}
+
+for (const backend of backends) {
+  test(`${backend.name}: SEP-10 sign-in and bearer-token merchant routes`, async () => {
+    const storage = await backend.open();
+    let server: Server | undefined;
+    try {
+      const { server: http, base } = await makeAuthApp(storage);
+      server = http;
+
+      const challenge = async (account: string): Promise<string> => {
+        const res = await fetch(`${base}/api/auth?account=${account}`);
+        assert.equal(res.status, 200, `${account} challenge`);
+        return ((await res.json()) as { transaction: string }).transaction;
+      };
+      const exchange = async (transaction: string) => {
+        const res = await fetch(`${base}/api/auth`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ transaction }),
+        });
+        return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+      };
+      const signIn = async (key: Keypair): Promise<string> => {
+        const res = await exchange(signTx(await challenge(key.publicKey()), key));
+        assert.equal(res.status, 200, "sign-in");
+        return res.body.token as string;
+      };
+
+      const merchant = Keypair.random();
+      const token = await signIn(merchant);
+
+      // A bearer token registers a webhook for the token's account.
+      const registered = await fetch(`${base}/api/webhooks`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ url: "https://merchant.example/hooks" }),
+      });
+      assert.equal(registered.status, 200, "register webhook with bearer token");
+      const hook = (await registered.json()) as { id: number; merchant: string };
+      assert.equal(hook.merchant, merchant.publicKey(), "the merchant is the token's account");
+
+      // The same token lists that merchant's webhooks.
+      const listed = await fetch(`${base}/api/webhooks?merchant=${merchant.publicKey()}`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      assert.equal(listed.status, 200, "list webhooks with bearer token");
+      const listedBody = (await listed.json()) as { merchant: string; webhooks: Array<{ id: number }> };
+      assert.equal(listedBody.merchant, merchant.publicKey());
+      assert.ok(listedBody.webhooks.some((w) => w.id === hook.id));
+
+      // A token for one account cannot act for another.
+      const other = Keypair.random();
+      const refused = await fetch(`${base}/api/webhooks?merchant=${other.publicKey()}`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      assert.equal(refused.status, 401, "cross-account merchant refused");
+
+      // A token signed with another secret is refused (the HMAC no longer verifies).
+      const claims = JSON.parse(
+        Buffer.from(token.split(".")[1]!, "base64url").toString("utf8"),
+      ) as Record<string, unknown>;
+      const foreign = forgeToken(claims, "another-secret-that-is-also-32-characters");
+      const bad = await fetch(`${base}/api/webhooks`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${foreign}` },
+        body: JSON.stringify({ url: "https://merchant.example/hooks" }),
+      });
+      assert.equal(bad.status, 401, "foreign-secret token refused");
+    } finally {
+      await storage.close();
+      const httpServer = server;
+      if (httpServer) {
+        await new Promise<void>((resolve, reject) => httpServer.close((err) => (err ? reject(err) : resolve())));
+      }
+    }
+  });
+}
