@@ -76,4 +76,17 @@ and impact. Acknowledgement within 72 hours.
   the connection is closed. Clients must send a single, unambiguous framing.
   This is defense in depth against HTTP request smuggling; keep-alive reuse of a
   connection after such a rejection is not allowed.
+- **Logs never carry a full subscriber or merchant account, or a client IP.**
+  Every line at `info` and above, access lines included, shortens Stellar
+  accounts (`G...`, muxed `M...`) to their first and last four characters
+  (`GABC...WXYZ`) wherever they appear: the request path and query, `Referer`,
+  and the keeper, reconciler and webhook lines. Client IPs (the socket address
+  and `X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`, `True-Client-IP`) are
+  cut to their /24 (IPv4) or /48 (IPv6); `Forwarded`, `Cookie` and
+  `Set-Cookie` are redacted. Webhook failure lines name the endpoint's host,
+  not its full URL. Contract ids, transaction hashes and the keeper's own
+  channel keys are logged as before. **Operator change:** a log search or
+  alert that matched a full account or client IP must instead match the
+  masked form, or correlate by `mandateId`, `webhookId` or the request's
+  `X-Request-Id` and look the account up in the database.
 

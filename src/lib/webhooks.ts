@@ -17,7 +17,7 @@ import type {
   WebhookSummary,
   WebhookTestResult,
 } from "../routes/types.ts";
-import { logger } from "./logger.ts";
+import { logger, maskAccount } from "./logger.ts";
 
 /** Most delivery attempts before a webhook is marked failed. */
 const MAX_ATTEMPTS = 5;
@@ -154,6 +154,15 @@ function postToPinnedAddress(
     if (typeof init.body === "string") request.write(init.body);
     request.end();
   });
+}
+
+/** A webhook URL's host, for a log line; never its path or query. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "[invalid url]";
+  }
 }
 
 function backoffSeconds(attempt: number): number {
@@ -750,10 +759,12 @@ export class WebhookDispatcher {
       logger.warn(
         {
           webhookId: webhook.id,
-          merchant: webhook.merchant,
-          url: webhook.url,
+          merchant: maskAccount(webhook.merchant),
+          // The path and query of a merchant's endpoint can carry its own
+          // tokens; the host is enough to tell endpoints apart.
+          host: hostOf(webhook.url),
           attempts: nextAttempt,
-          lastError: error,
+          lastError: error === null ? null : maskAccount(error),
         },
         "webhook marked failed after exhausting delivery retries",
       );

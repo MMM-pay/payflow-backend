@@ -24,7 +24,7 @@ import type { HealthResponse, SyncResponse } from "./routes/types.ts";
 import type { RpcStatus } from "./lib/stellar.ts";
 import type { WebhookDispatcher } from "./lib/webhooks.ts";
 import type { Sep10Auth } from "./routes/auth.ts";
-import { logger } from "./lib/logger.ts";
+import { logger, requestForLog } from "./lib/logger.ts";
 import { metrics, publishBusinessMetrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { withSpan } from "./lib/telemetry.ts";
 import { getVersionInfo } from "./lib/version.ts";
@@ -368,6 +368,9 @@ export function createApp(
   app.use(
     pinoHttp({
       logger,
+      // Access lines are logged at info: mask the accounts in the path and
+      // query and cut client IPs to their network (#285).
+      serializers: { req: requestForLog },
       // Accept a caller's id (bounded, so it cannot flood logs) or mint one.
       genReqId: (req, res) => {
         const given = req.headers["x-request-id"];

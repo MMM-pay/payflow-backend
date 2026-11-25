@@ -414,6 +414,16 @@ All notable changes to payflow-backend. The format follows
 
 ### Security
 
+- **No PII in logs at info level (#285).** Subscriber and merchant accounts
+  are masked to `GABC...WXYZ` in access lines and in keeper, reconciler and
+  webhook lines; client IPs are cut to their /24 or /48, `Forwarded`, `Cookie`
+  and `Set-Cookie` are redacted, and webhook failures log the endpoint's host
+  instead of its URL. Log searches that matched a full account must match the
+  masked form; see SECURITY.md.
+- **The bearer-token check is fuzzed (#284).** `test/auth-fuzz.test.ts` feeds
+  `Sep10Auth.verify` and the `Authorization` header on merchant routes
+  thousands of seeded malformed, expired, tampered and foreign tokens and
+  asserts every one is refused the same way.
 - Patched transitive advisories in `proxy-addr` (critical) and `qs`
   (moderate) with `npm audit fix`; the production audit is clean.
 

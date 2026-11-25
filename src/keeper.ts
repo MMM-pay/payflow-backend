@@ -13,7 +13,7 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import type { Config } from "./config.ts";
-import { childLogger } from "./lib/logger.ts";
+import { childLogger, maskAccount } from "./lib/logger.ts";
 import { withSpan } from "./lib/telemetry.ts";
 
 const logger = childLogger("keeper");
@@ -911,7 +911,7 @@ export class Keeper {
       const res = await this.server.simulateTransaction(tx);
       if ("error" in res && res.error) {
         logger.warn(
-          { subscriber, token, reason: res.error.slice(0, 200).replace(/\s+/g, " ") },
+          { subscriber: maskAccount(subscriber), token, reason: maskAccount(res.error.slice(0, 200).replace(/\s+/g, " ")) },
           "vault balance unavailable; settling as before",
         );
         return null;
@@ -925,7 +925,7 @@ export class Keeper {
       return null;
     } catch (err) {
       logger.warn(
-        { subscriber, token, err: err instanceof Error ? err.message : String(err) },
+        { subscriber: maskAccount(subscriber), token, err: maskAccount(err instanceof Error ? err.message : String(err)) },
         "vault balance unavailable; settling as before",
       );
       return null;
