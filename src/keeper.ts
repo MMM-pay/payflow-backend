@@ -1201,6 +1201,7 @@ export class Keeper {
           return "unusable";
         }
         if (balance?.kind === "available" && balance.stroops < minimum) {
+          metrics.increment("keeper_low_fee_balance", 1, { channel: key.publicKey() });
           logger.warn(
             {
               channel: key.publicKey(),

@@ -150,6 +150,12 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     type: "gauge",
   },
   {
+    key: "keeper_low_fee_balance",
+    name: "payflow_keeper_low_fee_balance_total",
+    help: "Times a keeper signing account XLM balance was observed below the configured minimum threshold.",
+    type: "counter",
+  },
+  {
     key: "http_requests",
     name: "payflow_http_requests_total",
     help: "HTTP requests handled since the process started, labelled by method and status class (2xx, 4xx, 5xx).",
