@@ -92,7 +92,7 @@ const runtimes = await Promise.all(networks.map(async (network) => {
     (merchant) => { void indexer.merchantCache.invalidate(merchant); },
   );
   // SEP-10 sign-in reads the signing account's signers through the same RPC.
-  const auth = sep10For(config, network, server);
+  const auth = sep10For(config, network, server, db);
   return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth, summaryCache, tokenCache };
 }));
 const defaultRuntime = runtimes[0]!;

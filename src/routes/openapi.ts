@@ -861,6 +861,37 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/auth/rotate")]: {
+      post: {
+        tags: ["auth"],
+        summary: "Rotate a refresh token for a new JWT",
+        description:
+          "Exchanges a refresh token for a new short-lived JWT and the next refresh token. The consumed refresh token is revoked, so a stolen refresh token can be used only once; its second use fails because its hash is already revoked. Only served when SEP10_SIGNING_KEY is set.",
+        operationId: `rotateAuthToken${operationSuffix(root)}`,
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  refresh_token: { type: "string", description: "The refresh token returned at sign-in or at the last rotation." },
+                },
+                required: ["refresh_token"],
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "The new JWT and the next refresh token.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AuthToken" } } },
+          },
+          "400": invalidRequest(),
+          "401": errorResponse('The refresh token is unknown, revoked or expired (error.code = "unauthorized").'),
+        },
+      },
+    },
     [p("/due")]: {
       get: {
         tags: ["keeper"],
@@ -2407,8 +2438,12 @@ function componentSchemas(): Record<string, SchemaObject> {
       type: "object",
       properties: {
         token: { type: "string", description: "A JWT to send as `Authorization: Bearer <token>` to merchant-only routes." },
+        refresh_token: {
+          type: "string",
+          description: "A refresh token, returned once: rotate it at `POST /api/auth/rotate` for a new JWT and the next refresh token.",
+        },
       },
-      required: ["token"],
+      required: ["token", "refresh_token"],
     },
     UpcomingCharges: {
       type: "object",

@@ -298,6 +298,12 @@ const schema = z.object({
     .refine((value) => value === undefined || isDomain(value, 64), "must be a domain of at most 64 characters"),
   /** Lifetime of an issued JWT in seconds; short-lived by design. */
   SEP10_JWT_TTL_S: z.coerce.number().int().min(60).max(86_400).default(3_600),
+  /**
+   * Lifetime of a refresh token in seconds. Refresh tokens rotate on use:
+   * each rotation consumes one and issues the next, so a leaked refresh
+   * token's blast radius is bounded to one rotation window.
+   */
+  SEP10_REFRESH_TTL_S: z.coerce.number().int().min(300).max(604_800).default(604_800),
 });
 
 export type Config = z.infer<typeof schema>;

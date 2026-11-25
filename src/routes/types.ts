@@ -609,7 +609,10 @@ export interface AuthChallengeResponse {
 
 /** `POST /api/auth`: a SEP-10 JWT, sent as `Authorization: Bearer <token>`. */
 export interface AuthTokenResponse {
+  /** A JWT to send as `Authorization: Bearer <token>` to merchant-only routes. */
   token: string;
+  /** A refresh token, returned once: rotate it at `POST /api/auth/rotate` for a new JWT and the next refresh token. */
+  refresh_token: string;
 }
 
 export interface StatsResponse {

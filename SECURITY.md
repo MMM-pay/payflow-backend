@@ -44,6 +44,13 @@ and impact. Acknowledgement within 72 hours.
   no read-API route can reach, and no read-API credential (including a SEP-10 JWT)
   is accepted there. Keep `ADMIN_TOKEN` in the host's secret store; rotate it if
   it is ever exposed, without touching `SEP10_SIGNING_KEY` or `SEP10_JWT_SECRET`.
+- **SEP-10 JWTs are short-lived** (`SEP10_JWT_TTL_S`, an hour by default), so a
+  leaked JWT's blast radius is small. `POST /api/auth` issues a JWT together
+  with a single-use refresh token; `POST /api/auth/rotate` exchanges a refresh
+  token for a new JWT and the next refresh token, revoking the consumed one. A
+  stolen refresh token can therefore be used only once. Refresh tokens live
+  `SEP10_REFRESH_TTL_S` (seven days by default) and their hashes—not
+  plaintexts—are stored.
 - **Merchant notification preferences are account-scoped.** Reads and writes
   require a fresh signature from the merchant's Stellar key or a SEP-10 JWT
   issued to that same account. The update only accepts the supported webhook

@@ -300,6 +300,20 @@ CREATE TABLE IF NOT EXISTS past_due_mandates (
   still_past_due INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS past_due_mandates_first_past_due ON past_due_mandates(first_past_due_at DESC);
+
+-- Short-lived service token rotation (#282). Refresh tokens are single-use:
+-- rotating consumes one and issues the next, so a leaked refresh token's
+-- blast radius is bounded to one rotation window. Hashes are stored, never
+-- plaintext, so a database read cannot impersonate a caller.
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+  token_hash TEXT PRIMARY KEY,
+  account    TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS refresh_tokens_account ON refresh_tokens(account);
+CREATE INDEX IF NOT EXISTS refresh_tokens_expires ON refresh_tokens(expires_at);
 `;
 
 /**
