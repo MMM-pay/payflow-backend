@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
@@ -7,6 +10,7 @@ import { createApp } from "../src/app.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import { Indexer } from "../src/indexer.ts";
 import { getMerchantSummary, getPlanById, getProtocolStats, listChargeAttempts, listMandateCharges, listPlans, listMandates } from "../src/lib/queries.ts";
+import { claimCharge, holdClaim, pruneClaims } from "../src/lib/claims.ts";
 import { PostgresStorage } from "../src/lib/store/postgres.ts";
 import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 import type { Storage } from "../src/lib/store/types.ts";
@@ -615,6 +619,86 @@ for (const backend of backends) {
       if (httpServer) {
         await new Promise<void>((resolve, reject) => httpServer.close((err) => (err ? reject(err) : resolve())));
       }
+    }
+  });
+}
+
+/**
+ * Issue #249: the keeper's claim upsert is the only thing standing between
+ * two keeper processes and a double settlement, so it is checked on both
+ * backends with two *separate* connections racing for the same due charges.
+ */
+type ClaimPair = { name: string; skip: boolean; open: () => Promise<[Storage, Storage, () => Promise<void>]> };
+
+const claimPairs: ClaimPair[] = [
+  {
+    name: "SQLite",
+    skip: false,
+    open: async () => {
+      const dir = mkdtempSync(join(tmpdir(), "payflow-claims-store-"));
+      const path = join(dir, "payflow.db");
+      const left = SqliteStorage.open(path);
+      const right = SqliteStorage.open(path);
+      return [left, right, async () => {
+        await left.close();
+        await right.close();
+        rmSync(dir, { recursive: true, force: true });
+      }];
+    },
+  },
+  {
+    name: "PostgreSQL",
+    skip: !DATABASE_URL,
+    open: async () => {
+      const network = `claims_${process.pid}_${randomBytes(4).toString("hex")}`;
+      // Opened one after the other: each open creates the schema if missing.
+      const left = await PostgresStorage.open(DATABASE_URL!, network);
+      const right = await PostgresStorage.open(DATABASE_URL!, network);
+      return [left, right, async () => {
+        await left.close();
+        await right.close();
+      }];
+    },
+  },
+];
+
+for (const pair of claimPairs) {
+  test(`${pair.name}: two connections racing for the same due charges claim each exactly once`, { skip: pair.skip }, async () => {
+    const [left, right, close] = await pair.open();
+    try {
+      const ids = Array.from({ length: 40 }, (_, i) => i + 1);
+      const request = (mandateId: number, owner: string) => ({
+        mandateId,
+        dueAt: 1_000 + mandateId,
+        owner,
+        now: 10_000,
+        ttlSeconds: 300,
+      });
+      const outcomes = await Promise.all(
+        ids.flatMap((id) => [
+          claimCharge(left, request(id, "keeper-a")).then((won) => ({ id, won })),
+          claimCharge(right, request(id, "keeper-b")).then((won) => ({ id, won })),
+        ]),
+      );
+      for (const id of ids) {
+        assert.equal(
+          outcomes.filter((outcome) => outcome.id === id && outcome.won).length,
+          1,
+          `due charge ${id} has exactly one winner`,
+        );
+      }
+
+      // A claim past its expiry is taken over by the other connection.
+      assert.equal(await claimCharge(right, { ...request(1, "keeper-c"), now: 10_299 }), false);
+      assert.equal(await claimCharge(right, { ...request(1, "keeper-c"), now: 10_300 }), true);
+      // Re-timing only touches the owner's own claim.
+      await holdClaim(left, { mandateId: 1, dueAt: 1_001, owner: "keeper-a", until: 0 });
+      assert.equal(await claimCharge(left, { ...request(1, "keeper-a"), now: 10_301 }), false);
+
+      await pruneClaims(left, 100_000);
+      assert.deepEqual(await right.all("SELECT mandate_id FROM keeper_claims"), []);
+    } finally {
+      await close();
     }
   });
 }

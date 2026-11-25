@@ -118,7 +118,12 @@ if (keeper) {
     );
   }
   logger.info(
-    { keeper: keeper.publicKey, channels: keeper.channelCount, network: defaultRuntime.network.name },
+    {
+      keeper: keeper.publicKey,
+      channels: keeper.channelCount,
+      concurrency: keeper.concurrency,
+      network: defaultRuntime.network.name,
+    },
     "keeper enabled",
   );
 } else {
@@ -368,6 +373,9 @@ async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info({ signal }, "shutting down");
+  // The keeper takes no new mandates from here on; the settlements already in
+  // flight finish and are recorded while the drain below waits for the pass.
+  activeKeeper?.stop();
   // Let a pass that is mid-write or mid-transaction finish before the database
   // closes, but never hang forever on a stuck RPC call.
   const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);

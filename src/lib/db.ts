@@ -263,6 +263,23 @@ CREATE TABLE IF NOT EXISTS charge_attempts (
 CREATE INDEX IF NOT EXISTS charge_attempts_mandate ON charge_attempts(mandate_id, id);
 CREATE INDEX IF NOT EXISTS charge_attempts_attempted_at ON charge_attempts(attempted_at);
 
+-- Settlement claims (#249): a keeper instance claims one due charge — a
+-- mandate at one next_charge — with a single atomic upsert before it submits
+-- anything, so two workers or two keeper processes never settle the same
+-- charge. "expires_at" is when anyone may take the claim over: the claim TTL
+-- while it is in flight (so a crashed keeper's claim lapses), the backoff
+-- after a failure, and the TTL again after a settlement while the indexer
+-- catches up. Operational, not a projection; expired rows are pruned by the
+-- keeper on each pass.
+CREATE TABLE IF NOT EXISTS keeper_claims (
+  mandate_id INTEGER NOT NULL,
+  due_at     INTEGER NOT NULL,   -- the mandate's next_charge being settled
+  owner      TEXT    NOT NULL,   -- the keeper instance holding the claim
+  expires_at INTEGER NOT NULL,   -- unix seconds
+  PRIMARY KEY (mandate_id, due_at)
+);
+CREATE INDEX IF NOT EXISTS keeper_claims_expires_at ON keeper_claims(expires_at);
+
 -- Contract upgrade history. Records when contracts are upgraded with new code.
 CREATE TABLE IF NOT EXISTS contract_upgrades (
   contract_id TEXT    NOT NULL,

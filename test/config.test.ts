@@ -149,6 +149,91 @@ describe("keeper channel secrets", () => {
       "a public key is not a signing secret",
     );
   });
+
+  test("a malformed channel secret fails startup without printing the secret", () => {
+    // One character off a real seed: the checksum fails, and the error
+    // must name the variable, never echo the value.
+    const real = Keypair.random().secret();
+    const broken = `${real.slice(0, -1)}${real.endsWith("A") ? "B" : "A"}`;
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_SECRET: real, KEEPER_CHANNEL_SECRETS: broken }),
+      (err: Error) => {
+        assert.match(err.message, /KEEPER_CHANNEL_SECRETS/);
+        assert.ok(!err.message.includes(broken), "the rejected secret is not in the message");
+        assert.ok(!err.message.includes(real), "no other secret is in the message either");
+        return true;
+      },
+    );
+  });
+});
+
+describe("keeper concurrency cap (KEEPER_CONCURRENCY)", () => {
+  const primary = Keypair.random().secret();
+  const channelB = Keypair.random().secret();
+  const channelC = Keypair.random().secret();
+
+  test("unset or blank means one transaction per channel", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_CONCURRENCY, undefined);
+    assert.equal(loadConfig({ ...BASE, KEEPER_CONCURRENCY: "" }).KEEPER_CONCURRENCY, undefined);
+  });
+
+  test("accepts a cap up to the number of channel accounts", () => {
+    const env = { ...BASE, KEEPER_SECRET: primary, KEEPER_CHANNEL_SECRETS: `${channelB},${channelC}` };
+    assert.equal(loadConfig({ ...env, KEEPER_CONCURRENCY: "1" }).KEEPER_CONCURRENCY, 1);
+    assert.equal(loadConfig({ ...env, KEEPER_CONCURRENCY: "3" }).KEEPER_CONCURRENCY, 3);
+  });
+
+  test("zero, negative, fractional and non-numeric caps are rejected", () => {
+    for (const bad of ["0", "-1", "1.5", "two"]) {
+      assert.throws(
+        () => loadConfig({ ...BASE, KEEPER_SECRET: primary, KEEPER_CONCURRENCY: bad }),
+        /KEEPER_CONCURRENCY/,
+        `KEEPER_CONCURRENCY=${bad} is rejected`,
+      );
+    }
+  });
+
+  test("a cap above the channel count is rejected at startup, naming counts but no secret", () => {
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          KEEPER_SECRET: primary,
+          KEEPER_CHANNEL_SECRETS: channelB,
+          KEEPER_CONCURRENCY: "3",
+        }),
+      (err: Error) => {
+        assert.match(err.message, /KEEPER_CONCURRENCY=3 exceeds the 2 keeper channel account/);
+        for (const secret of [primary, channelB]) {
+          assert.ok(!err.message.includes(secret), "no secret is printed");
+        }
+        return true;
+      },
+    );
+  });
+
+  test("duplicate and standby keys do not count as extra channels", () => {
+    // KEEPER_SECRET_NEXT is a standby inside the primary channel, and a
+    // repeated channel key collapses, exactly as the keeper builds them.
+    const next = Keypair.random().secret();
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          KEEPER_SECRET: primary,
+          KEEPER_SECRET_NEXT: next,
+          KEEPER_CHANNEL_SECRETS: `${primary},${next},${channelB},${channelB}`,
+          KEEPER_CONCURRENCY: "3",
+        }),
+      /exceeds the 2 keeper channel account/,
+    );
+  });
+
+  test("KEEPER_CLAIM_TTL_S defaults to five minutes and refuses less than a minute", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_CLAIM_TTL_S, 300);
+    assert.equal(loadConfig({ ...BASE, KEEPER_CLAIM_TTL_S: "120" }).KEEPER_CLAIM_TTL_S, 120);
+    assert.throws(() => loadConfig({ ...BASE, KEEPER_CLAIM_TTL_S: "10" }), /KEEPER_CLAIM_TTL_S/);
+  });
 });
 
 describe("keeper inclusion fee configuration", () => {

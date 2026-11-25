@@ -208,6 +208,18 @@ CREATE TABLE IF NOT EXISTS charge_attempts (
 );
 CREATE INDEX IF NOT EXISTS charge_attempts_mandate ON charge_attempts(mandate_id, id);
 CREATE INDEX IF NOT EXISTS charge_attempts_attempted_at ON charge_attempts(attempted_at);
+
+-- Settlement claims (#249): one row per due charge a keeper instance is
+-- settling, taken with a single atomic upsert so two keepers never settle
+-- the same charge. See the SQLite schema in src/lib/db.ts.
+CREATE TABLE IF NOT EXISTS keeper_claims (
+  mandate_id BIGINT NOT NULL,
+  due_at     BIGINT NOT NULL,
+  owner      TEXT   NOT NULL,
+  expires_at BIGINT NOT NULL,
+  PRIMARY KEY (mandate_id, due_at)
+);
+CREATE INDEX IF NOT EXISTS keeper_claims_expires_at ON keeper_claims(expires_at);
 `;
 
 const schemaName = /^[a-z_][a-z0-9_]*$/;

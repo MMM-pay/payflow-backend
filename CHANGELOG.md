@@ -7,6 +7,18 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **Concurrent settlement with a bounded worker pool (#249).**
+  `KEEPER_CONCURRENCY` caps the settlement transactions a keeper pass keeps in
+  flight (default: one per channel account; a cap above the number of channels
+  fails startup). Each in-flight transaction leases its own channel account
+  from a pool, so no account ever has two transactions in flight, and a
+  `txBadSeq` re-reads the channel's sequence and resubmits up to twice. Before
+  submitting, each due charge is claimed in the new `keeper_claims` table with
+  one atomic upsert, so two workers or two keeper processes sharing a database
+  never settle the same mandate; an abandoned claim lapses after
+  `KEEPER_CLAIM_TTL_S` (default 300 s). On shutdown the keeper starts nothing
+  new and lets in-flight settlements finish. New gauge:
+  `payflow_keeper_in_flight`. The HTTP API is unchanged.
 - **A versioned API (#173).** Every route is served under `/api/v1/...` and
   `/api/...` remains an alias, mounted from the same router, so an existing
   client keeps working and a breaking change lands in the next version. The
@@ -390,7 +402,10 @@ All notable changes to payflow-backend. The format follows
   line.
 
 ### Fixed
-
+- **A `charge_many` fallback no longer collides on its own channel (#249).**
+  When a batch fell back to single charges, they were submitted side by side
+  from the same account and raced for one sequence number; they now go one
+  after another.
 - **Merchant totals no longer mix tokens (#56).** `/api/merchants/:address/summary`
   summed every charge into one figure even when the merchant's plans used
   several tokens. Revenue and MRR are now also grouped per token in a `tokens`

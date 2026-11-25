@@ -376,10 +376,13 @@ one pass distributes the due mandates across them:
   fees, so sequence numbers live on separate accounts and cannot collide.
   Channel keys need only XLM for fees: `charge` is permissionless, so no
   channel key holds user funds or any on-chain authority.
-- Due mandates are pulled from one shared queue by one worker per channel —
-  strictly one transaction at a time *within* a channel, several channels in
-  parallel. With a single channel the pass is exactly the old sequential
-  behaviour, and `KEEPER_SECRET` is always the first channel.
+- Due mandates are pulled from one shared queue by a bounded pool of workers
+  (see [the concurrency cap](#the-concurrency-cap-and-double-settlement)).
+  Each in-flight transaction leases one channel and returns it when the
+  transaction is finished, so a channel never has two transactions in flight —
+  strictly one at a time *within* a channel, several channels in parallel.
+  With a single channel the pass is exactly the old sequential behaviour, and
+  `KEEPER_SECRET` is always the first channel.
 - Before distributing, each channel's account is checked with one `getAccount`.
   A channel that cannot pay (unfunded, deleted) is skipped for the pass —
   logged by public key — and its share settles through the live channels
@@ -389,6 +392,77 @@ one pass distributes the due mandates across them:
 A fee-bump design (main key pays every fee) was deliberately rejected: a
 Stellar fee-bump consumes the *fee source's* sequence number, so every
 transaction would sequence against the one main account and serialize again.
+
+#### The concurrency cap and double settlement
+
+`KEEPER_CONCURRENCY` caps how many settlement transactions one pass keeps in
+flight. Unset, it is one per channel — the behaviour before the cap existed.
+
+- **Cap versus channels.** Every in-flight transaction needs its own channel,
+  so the cap can never exceed the number of channels: `KEEPER_SECRET` plus each
+  distinct `KEEPER_CHANNEL_SECRETS` key (`KEEPER_SECRET_NEXT` is a standby in
+  the primary channel, not an extra channel). A larger cap, or a cap below 1,
+  is a configuration error and the service refuses to start (a `SIGHUP` reload
+  with such a cap is refused and the running keeper keeps its old settings). A
+  cap *below* the channel count is fine: the workers rotate over every channel,
+  so fees spread across all of them. When a channel is skipped for a pass
+  because it cannot pay, that pass runs with fewer workers.
+- **No double settlement.** Before a transaction is built, the keeper claims
+  each mandate's due charge (the mandate at its current `next_charge`) in the
+  `keeper_claims` table with one atomic upsert, on SQLite and PostgreSQL alike.
+  A charge another worker or another keeper process already holds is skipped,
+  so several keepers can share one database without charging a mandate twice.
+  After an attempt the claim is held until the backoff's retry time (failure)
+  or for `KEEPER_CLAIM_TTL_S` (settlement, while the indexer catches up). A
+  claim left behind by a crashed keeper lapses after `KEEPER_CLAIM_TTL_S`
+  (default 300 s), and the mandate becomes eligible again.
+- **Sequence numbers.** Each channel uses its own account sequence, read from
+  the network before every transaction. A submission refused with `txBadSeq`
+  (something else used the account) re-reads the sequence and resubmits, at
+  most twice; after that the mandate fails and backs off like any other
+  failure.
+- **Failures stay isolated.** A failed charge (contract error, network error,
+  timeout, refused authorization) is recorded in `charge_attempts` with its
+  code and backs off on the usual schedule; its channel goes back to the pool
+  and the other workers carry on. `charge` is permissionless, so the keeper
+  supplies no Soroban authorization; a refused authorization is recorded with
+  its host error (for example `Error(Auth, InvalidAction)`) and backs off
+  rather than retrying in a loop.
+- **Shutdown.** On `SIGTERM`/`SIGINT` the keeper takes no new mandates; the
+  transactions in flight finish and are recorded before the process exits
+  (bounded by `SHUTDOWN_TIMEOUT_MS`).
+
+`payflow_keeper_in_flight` reports the transactions in flight right now, and
+each `mandate settled` log line names the channel (public key) that signed it.
+
+#### Creating and funding channel accounts
+
+A channel is an ordinary Stellar account that only pays fees, so it needs the
+minimum balance plus fee money and nothing else.
+
+- **Testnet:** generate and fund each account with Friendbot, for example with
+  the Stellar CLI the dev container installs:
+
+  ```bash
+  stellar keys generate channel-1 --network testnet --fund
+  stellar keys show channel-1      # the S... secret for KEEPER_CHANNEL_SECRETS
+  ```
+
+- **Mainnet:** create each account with a `create_account` operation from an
+  account you control (any wallet, or `stellar tx new create-account`),
+  starting with a few XLM: the 1 XLM base reserve plus fees. Keep each funded
+  like the main keeper key; a channel that runs dry is skipped for the pass
+  and logged by public key.
+
+Then list the secrets and, optionally, a cap:
+
+```bash
+KEEPER_CHANNEL_SECRETS=SA...,SB...   # two channels besides KEEPER_SECRET
+KEEPER_CONCURRENCY=2                 # at most 3 here; unset means 3
+```
+
+Treat channel secrets like `KEEPER_SECRET`: they are redacted from logs and
+pass history, and only public keys are ever logged.
 
 ## API
 
@@ -545,6 +619,7 @@ deployment that does not scrape them should not expose them.
 | `payflow_charges_settled_total` | counter | Charges the keeper settled |
 | `payflow_charges_failed_total` | counter | Charges the keeper could not settle |
 | `payflow_keeper_passes_total` | counter | Keeper passes run |
+| `payflow_keeper_in_flight` | gauge | Settlement transactions in flight right now; never above `KEEPER_CONCURRENCY` |
 
 Every gauge carries a `network` label — and only that label, so the series
 stay bounded however many merchants there are — so an instance that serves
@@ -1001,6 +1076,8 @@ examined without API downtime.
 | `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
 | `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
+| `KEEPER_CONCURRENCY` | *(one per channel)* | Most settlement transactions in flight at once (at least 1). May not exceed the number of channels (`KEEPER_SECRET` plus distinct `KEEPER_CHANNEL_SECRETS`); a larger value fails startup. See [the concurrency cap](#the-concurrency-cap-and-double-settlement) |
+| `KEEPER_CLAIM_TTL_S` | `300` | Seconds a keeper's claim on a due charge lasts (at least 60); a claim left by a crashed keeper lapses after this |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
 | `KEEPER_MERCHANTS` | *(empty)* | Only settle mandates payable to these merchants, comma-separated `G...` addresses. Empty settles every merchant |

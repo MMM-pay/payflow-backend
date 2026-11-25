@@ -101,6 +101,26 @@ const schema = z.object({
           .refine(StrKey.isValidEd25519SecretSeed, "must be a valid Stellar secret seed"),
       ),
     ),
+  /**
+   * Most settlement transactions one pass keeps in flight at once (#249).
+   * Each in-flight transaction leases its own channel account, so the cap can
+   * never exceed the number of channels (`KEEPER_SECRET` plus the distinct
+   * `KEEPER_CHANNEL_SECRETS`): a larger value is rejected at startup rather
+   * than silently clamped. Unset means one transaction per channel, the
+   * behaviour before the cap existed.
+   */
+  KEEPER_CONCURRENCY: z.preprocess(
+    (value) => (value === "" ? undefined : value),
+    z.coerce.number().int().min(1, "must be at least 1").optional(),
+  ),
+  /**
+   * Seconds a keeper instance's claim on a due charge lasts before another
+   * instance may take it over (#249). Claims stop two keepers settling the
+   * same mandate; the timeout makes a claim abandoned by a crashed keeper
+   * eligible again. It must outlast one settlement (build, simulate, submit,
+   * poll), which takes well under a minute.
+   */
+  KEEPER_CLAIM_TTL_S: z.coerce.number().int().min(60, "must be at least 60 seconds").default(300),
   /** Use charge_many when the deployed contract supports it. */
   KEEPER_BATCH: z.string().default("true").transform((v) => v === "true"),
   /** Mandates per batch transaction, bounded by the contract's supported list size. */
@@ -326,6 +346,28 @@ export interface NetworkConfig {
   progressLedgers?: number | undefined;
 }
 
+/**
+ * How many signing channels the keeper builds from `config`: `KEEPER_SECRET`
+ * (with `KEEPER_SECRET_NEXT` as a standby in the same channel) plus each
+ * distinct `KEEPER_CHANNEL_SECRETS` entry, deduplicated exactly as the keeper
+ * does. Zero without `KEEPER_SECRET`.
+ */
+export function keeperChannelCount(
+  config: Pick<Config, "KEEPER_SECRET" | "KEEPER_SECRET_NEXT"> & {
+    KEEPER_CHANNEL_SECRETS?: readonly string[] | undefined;
+  },
+): number {
+  if (!config.KEEPER_SECRET) return 0;
+  const seen = new Set([config.KEEPER_SECRET, config.KEEPER_SECRET_NEXT].filter(Boolean));
+  let channels = 1;
+  for (const secret of config.KEEPER_CHANNEL_SECRETS ?? []) {
+    if (!secret || seen.has(secret)) continue;
+    seen.add(secret);
+    channels += 1;
+  }
+  return channels;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const parsed = schema.safeParse(env);
   if (!parsed.success) {
@@ -336,6 +378,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (parsed.data.KEEPER_ENABLED && !parsed.data.KEEPER_SECRET) {
     throw new Error("KEEPER_ENABLED=true requires KEEPER_SECRET to be set");
+  }
+  const concurrency = parsed.data.KEEPER_CONCURRENCY;
+  if (concurrency !== undefined && parsed.data.KEEPER_SECRET) {
+    const channels = keeperChannelCount(parsed.data);
+    if (concurrency > channels) {
+      // Counts only: a secret never appears in the message.
+      throw new Error(
+        `KEEPER_CONCURRENCY=${concurrency} exceeds the ${channels} keeper channel account(s) configured ` +
+          "(KEEPER_SECRET plus distinct KEEPER_CHANNEL_SECRETS); add channel accounts or lower the cap",
+      );
+    }
   }
   if (
     parsed.data.SEP10_SIGNING_KEY &&

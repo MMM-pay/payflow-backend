@@ -1475,6 +1475,9 @@ describe("keeper backoff schedule", () => {
     assert.equal(last.retry_at, null);
 
     // A later failure is a fresh streak, not a continuation of the old one.
+    // The indexer advances next_charge after a settlement, so the next
+    // attempt is for a new due charge (the settled one stays claimed, #249).
+    db.prepare("UPDATE mandates SET next_charge = ? WHERE id = 1").run(now);
     state.failing = true;
     const next = now + 1;
     await keeper.tick(next);

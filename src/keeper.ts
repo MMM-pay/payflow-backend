@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
 import {
   BASE_FEE,
@@ -15,6 +17,8 @@ import { withSpan } from "./lib/telemetry.ts";
 
 const logger = childLogger("keeper");
 import { metrics } from "./lib/metrics.ts";
+import { ChannelPool } from "./lib/channel-pool.ts";
+import { claimCharge, holdClaim, pruneClaims } from "./lib/claims.ts";
 import { simulationSource } from "./lib/simulate.ts";
 import { asStorage } from "./lib/store/index.ts";
 import type { Storage } from "./lib/store/types.ts";
@@ -52,6 +56,25 @@ const BATCH_SKIPPED_ERROR =
 const FAILING_STREAK = 3;
 /** Default retention for charge attempts when not set in config (#144, #348). */
 const DEFAULT_ATTEMPT_RETENTION_DAYS = 90;
+/** Claim lifetime when `KEEPER_CLAIM_TTL_S` is not set (#249). */
+const DEFAULT_CLAIM_TTL_S = 300;
+/**
+ * Times one settlement re-reads its channel's sequence number and resubmits
+ * after the network answered `txBadSeq` (#249). Bounded so an account whose
+ * sequence keeps moving underneath the keeper fails the mandate (and backs
+ * off) instead of looping.
+ */
+const BAD_SEQ_RETRIES = 2;
+
+/**
+ * Whether a failed submission was refused for a stale sequence number: the
+ * result code `txBadSeq`, or that code (in either spelling) in the message
+ * when only text is available.
+ */
+function isBadSequence(code: string | undefined, message: string | undefined): boolean {
+  if (code === "txBadSeq") return true;
+  return /\btx_?bad_?seq\b/i.test(message ?? "");
+}
 
 /**
  * The code of a submission stellar-core rejected (`txBadSeq`,
@@ -163,6 +186,8 @@ type BatchAttempt =
   | { kind: "results"; results: SettleResult[] }
   /** The node said TRY_AGAIN_LATER; retry the batch once with a higher fee. */
   | { kind: "congestion" }
+  /** The channel's sequence number was stale; refresh it and resubmit. */
+  | { kind: "badSeq" }
   /** Nothing usable; the caller settles the same ids with single charges. */
   | { kind: "unavailable" };
 
@@ -246,6 +271,36 @@ export interface Channel {
  * channel is dropped for the pass, logged by public key, so its mandates
  * settle through the live channels instead of backing off against a dead key.
  *
+ * ### Bounded worker pool (#249)
+ *
+ * `KEEPER_CONCURRENCY` caps how many settlement transactions a pass keeps in
+ * flight; unset, it is one per channel (the behaviour above). The cap may not
+ * exceed the number of channels — config validation and the constructor both
+ * reject that — and within a pass the effective concurrency is the smaller
+ * of the cap and the channels that passed the liveness check.
+ *
+ * - **Channel exclusivity.** Each in-flight transaction leases a channel from
+ *   a {@link ChannelPool} and returns it when the transaction is finished
+ *   (settled, failed or timed out), so no account ever has two transactions
+ *   in flight. Within one leased channel a `charge_many` that falls back to
+ *   single charges submits them one after the other, never side by side.
+ * - **Stale sequences.** A submission refused with `txBadSeq` re-reads the
+ *   channel's sequence from the network and resubmits, at most
+ *   {@link BAD_SEQ_RETRIES} times; after that the mandate fails and backs
+ *   off like any other failure.
+ * - **No double settlement.** Before a group is submitted each mandate's due
+ *   charge is claimed in `keeper_claims` with one atomic upsert (see
+ *   `src/lib/claims.ts`); a charge another worker or keeper process holds is
+ *   skipped. After the attempt the claim is re-timed: to the backoff's retry
+ *   time after a failure, so other keepers honour the backoff too, and to
+ *   `KEEPER_CLAIM_TTL_S` after a settlement while the indexer catches up. A
+ *   claim left by a crash lapses after `KEEPER_CLAIM_TTL_S`.
+ * - **Failure isolation.** Workers are awaited with `allSettled`, so one
+ *   worker's unexpected error never abandons the others mid-transaction; the
+ *   pass waits for every in-flight transaction before it reports the error.
+ * - **Shutdown.** {@link stop} stops workers taking new mandates; the ones in
+ *   flight finish, and the pass ends once they have.
+ *
  * ### Dry run (#38)
  *
  * With `KEEPER_DRY_RUN=true` a pass rehearses settlement: it builds and
@@ -305,6 +360,16 @@ export class Keeper {
    */
   private batchEntryMissing = false;
   private readonly passes: KeeperPassSummary[] = [];
+  /**
+   * Names this keeper instance in `keeper_claims`: host, PID and a random
+   * suffix, so two keepers on one host (or a restarted one) never mistake
+   * each other's claims for their own. Never derived from a secret.
+   */
+  readonly instanceId = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+  /** Set by {@link stop}: workers take no new mandates once it is. */
+  private stopping = false;
+  /** Settlement transactions in flight right now, across every worker. */
+  private inFlightCount = 0;
   /** Resolves when the persisted backoff has been loaded into memory. */
   readonly ready: Promise<void>;
 
@@ -321,7 +386,7 @@ export class Keeper {
     if (!config.KEEPER_SECRET) {
       throw new Error("Keeper requires KEEPER_SECRET");
     }
-    this.buildChannels(config);
+    this.channels = Keeper.checkedChannels(config);
     // The backoff a previous process left behind is read once per start; the
     // pass methods await `ready` so a first pass never runs ahead of it.
     this.ready = this.restoreBackoff();
@@ -373,17 +438,48 @@ export class Keeper {
   }
 
   /**
+   * Most settlement transactions a pass keeps in flight: `KEEPER_CONCURRENCY`
+   * when set (never more than the channels; the constructor enforces it),
+   * otherwise one per channel.
+   */
+  get concurrency(): number {
+    return this.config.KEEPER_CONCURRENCY ?? this.channels.length;
+  }
+
+  /** Settlement transactions in flight right now. */
+  get inFlight(): number {
+    return this.inFlightCount;
+  }
+
+  /**
+   * Begin a graceful shutdown: workers take no new mandates, while the
+   * transactions already in flight finish (or time out) and are recorded.
+   * The pass in progress resolves once they have; later passes do nothing.
+   */
+  stop(): void {
+    if (this.stopping) return;
+    this.stopping = true;
+    logger.info(
+      { inFlight: this.inFlightCount },
+      "keeper stopping: in-flight settlements will finish, no new ones start",
+    );
+  }
+
+  /**
    * Replaces the signing keys from a (re)loaded config without restarting.
    * A changed `KEEPER_SECRET` is treated as a completed rotation: the next
    * successful pass logs that the previous key can be retired.
    */
   reloadFromConfig(config: Config): void {
+    // Validate before touching anything, so a rejected reload keeps the
+    // running keeper exactly as it was.
+    const channels = Keeper.checkedChannels(config);
     this.config = config;
     // The reloaded config may point at a contract that does support
     // `charge_many`; support is re-detected on the next batch attempt.
     this.batchEntryMissing = false;
     const previous = this.primary.keys[0]?.publicKey() ?? null;
-    this.buildChannels(config);
+    this.channels = channels;
     if (previous && previous !== this.primary.keys[0]!.publicKey()) {
       this.pendingRetirement = previous;
       logger.info(
@@ -402,7 +498,7 @@ export class Keeper {
    * Only called with config that already passed zod validation (or a test's
    * hand-built equivalent); secrets are never logged.
    */
-  private buildChannels(config: Config): void {
+  private static buildChannels(config: Config): Channel[] {
     const seen = new Set<string>();
     const channels: Channel[] = [];
     const addChannel = (secrets: Array<string | undefined>): void => {
@@ -419,7 +515,28 @@ export class Keeper {
       throw new Error("Keeper requires KEEPER_SECRET");
     }
     for (const secret of config.KEEPER_CHANNEL_SECRETS ?? []) addChannel([secret]);
-    this.channels = channels;
+    return channels;
+  }
+
+  /**
+   * The channels `config` describes, after checking that `KEEPER_CONCURRENCY`
+   * fits them: a cap above the channel count is a configuration error, not
+   * something to clamp silently. `loadConfig` rejects it too; this covers a
+   * hand-built config. The message carries counts only, never a secret.
+   */
+  private static checkedChannels(config: Config): Channel[] {
+    const channels = Keeper.buildChannels(config);
+    const cap = config.KEEPER_CONCURRENCY;
+    if (cap !== undefined && (!Number.isInteger(cap) || cap < 1)) {
+      throw new Error(`KEEPER_CONCURRENCY must be a whole number of at least 1, got ${String(cap)}`);
+    }
+    if (cap !== undefined && cap > channels.length) {
+      throw new Error(
+        `KEEPER_CONCURRENCY=${cap} exceeds the ${channels.length} keeper channel account(s) configured; ` +
+          "add channel accounts or lower the cap",
+      );
+    }
+    return channels;
   }
 
   /**
@@ -511,11 +628,51 @@ export class Keeper {
     return this.config.KEEPER_BATCH_SIZE ?? DEFAULT_BATCH_SIZE;
   }
 
+  /** Seconds a claim on a due charge lasts; see `KEEPER_CLAIM_TTL_S`. */
+  private claimTtl(): number {
+    return this.config.KEEPER_CLAIM_TTL_S ?? DEFAULT_CLAIM_TTL_S;
+  }
+
+  /** Track the in-flight count and publish it as the `keeper_in_flight` gauge. */
+  private adjustInFlight(delta: number): void {
+    this.inFlightCount += delta;
+    metrics.set("keeper_in_flight", this.inFlightCount);
+  }
+
+  /**
+   * Claim each mandate's due charge for this instance and answer the ones
+   * won, in order. A charge another worker or keeper process holds is
+   * skipped for this pass — it is being settled already — and logged.
+   */
+  private async claimGroup(group: DueMandate[], now: number): Promise<DueMandate[]> {
+    const claimed: DueMandate[] = [];
+    for (const mandate of group) {
+      const won = await claimCharge(this.db, {
+        mandateId: mandate.id,
+        dueAt: mandate.next_charge,
+        owner: this.instanceId,
+        now,
+        ttlSeconds: this.claimTtl(),
+      });
+      if (won) {
+        claimed.push(mandate);
+        continue;
+      }
+      logger.info(
+        { mandateId: mandate.id, dueAt: mandate.next_charge },
+        "due charge is claimed by another keeper; skipping it",
+      );
+    }
+    return claimed;
+  }
+
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
     return withSpan("keeper.tick", () => this.tickInner(now));
   }
 
   private async tickInner(now: number): Promise<SettleResult[]> {
+    // A stopping keeper starts nothing new, not even a fresh pass.
+    if (this.stopping) return [];
     const due = await this.findDue(now);
     const { chargeable, skipped } = await this.withoutShortfalls(due);
     const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
@@ -543,17 +700,33 @@ export class Keeper {
         "keeper dry run: simulating each charge; nothing will be submitted",
       );
     }
-    // One worker per channel pulls from the shared queue: within a channel
-    // mandates settle strictly one after the other (one account, one sequence
-    // stream), across channels they run in parallel. The cursor and the
-    // result list are only touched between awaits, so plain increments are
-    // safe here; results are re-sorted by due order so the summary does not
+    // A bounded pool of workers pulls from the shared queue (#249): at most
+    // `concurrency` transactions are in flight, each on a channel it leased
+    // from the pool, so one account never has two transactions in flight
+    // while separate channels settle in parallel. The cursor and the result
+    // list are only touched between awaits, so plain increments are safe
+    // here; results are re-sorted by due order so the summary does not
     // depend on which channel finished first.
+    const workers = Math.min(this.concurrency, channels.length);
+    if (chargeable.length > 0) {
+      logger.info(
+        { mandates: chargeable.length, concurrency: workers, channels: channels.length },
+        "keeper pass settling due mandates",
+      );
+    }
+    const pool = new ChannelPool(channels);
+    const position = new Map(chargeable.map((mandate, index) => [mandate.id, index]));
+    // Claims are timed by the wall clock as the pass moves on, anchored to
+    // `now`, so a group claimed late in a long pass still gets its full TTL.
+    const passStarted = Date.now();
+    const clock = (): number => now + Math.floor((Date.now() - passStarted) / 1000);
     let cursor = 0;
     const ordered: { slot: number; result: SettleResult }[] = [];
-    await Promise.all(
-      channels.map(async (channel) => {
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: workers }, async () => {
         for (;;) {
+          // Shutdown: finish what is in flight, take nothing new.
+          if (this.stopping) return;
           const slot = cursor;
           if (slot >= chargeable.length) return;
           // Batching groups up to KEEPER_BATCH_SIZE mandates into one
@@ -563,17 +736,42 @@ export class Keeper {
           const size = this.batchEnabled() ? this.batchSize() : 1;
           const group = chargeable.slice(slot, slot + size);
           cursor += group.length;
-          const results = await this.settleGroup(group, fee ?? BigInt(BASE_FEE), channel);
+          // A dry run submits nothing, so it has nothing to claim.
+          const claimed = dryRun ? group : await this.claimGroup(group, clock());
+          if (claimed.length === 0) continue;
+          const channel = await pool.acquire();
+          this.adjustInFlight(1);
+          let results: SettleResult[];
+          try {
+            results = await this.settleGroup(claimed, fee ?? BigInt(BASE_FEE), channel);
+          } finally {
+            // Whatever happened, the channel and the in-flight slot come back.
+            pool.release(channel);
+            this.adjustInFlight(-1);
+          }
           for (const [offset, result] of results.entries()) {
+            const mandate = claimed[offset]!;
             // A simulation is neither a settlement nor a failure: a dry run
             // leaves the backoff and the attempt log exactly as they were.
             const attempt = attemptOf(result);
-            if (attempt) await this.record(group[offset]!, attempt, now);
-            ordered.push({ slot: slot + offset, result });
+            if (attempt) {
+              const retryAt = await this.record(mandate, attempt, now);
+              await holdClaim(this.db, {
+                mandateId: mandate.id,
+                dueAt: mandate.next_charge,
+                owner: this.instanceId,
+                until: retryAt ?? clock() + this.claimTtl(),
+              });
+            }
+            ordered.push({ slot: position.get(mandate.id)!, result });
           }
         }
       }),
     );
+    // Every worker has finished — nothing is left in flight — before an
+    // unexpected error from one of them fails the pass.
+    const crashed = outcomes.find((outcome) => outcome.status === "rejected");
+    if (crashed) throw crashed.reason;
     ordered.sort((a, b) => a.slot - b.slot);
     const results = ordered.map((entry) => entry.result);
     // A dry run only reports: pass history and metrics describe work that
@@ -590,6 +788,7 @@ export class Keeper {
         [now - retentionDays * 24 * 60 * 60],
       );
     }
+    await pruneClaims(this.db, now);
     metrics.increment("keeper_passes");
     for (const result of results) {
       if (result.status === "settled") metrics.increment("charges_settled");
@@ -894,9 +1093,10 @@ export class Keeper {
    * Apply one attempt: advance or reset the mandate's backoff, append the
    * attempt to `charge_attempts` with the resulting streak, and tell the
    * merchant when the streak reaches {@link FAILING_STREAK} or ends after it.
-   * One indexed insert; nothing here waits on the network.
+   * One indexed insert; nothing here waits on the network. Answers when the
+   * mandate is next tried, or null once it has settled.
    */
-  private async record(mandate: DueMandate, attempt: ChargeAttempt, now: number): Promise<void> {
+  private async record(mandate: DueMandate, attempt: ChargeAttempt, now: number): Promise<number | null> {
     const streak = this.backoff.get(mandate.id)?.failures ?? 0;
     const failures = attempt.result === "settled" ? 0 : streak + 1;
     const retryAt =
@@ -942,6 +1142,7 @@ export class Keeper {
     } else if (failures === 0 && streak >= FAILING_STREAK) {
       this.notify({ ...subject, kind: "charge.recovered", failures: streak, txHash: attempt.txHash });
     }
+    return retryAt;
   }
 
   /** Hand a streak event to the listener; its failure is logged, never thrown into the pass. */
@@ -972,9 +1173,24 @@ export class Keeper {
     const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
     let fee = inclusionFee < maxFee ? inclusionFee : maxFee;
     let congestionRetries = 0;
+    let badSeqRetries = 0;
+    // `submit` reads the channel's account afresh on every call, so a retry
+    // after `txBadSeq` builds on the sequence the network reports now.
+    const retryBadSeq = (): boolean => {
+      if (badSeqRetries >= BAD_SEQ_RETRIES) return false;
+      badSeqRetries += 1;
+      logger.warn(
+        { mandateId, channel: lane.keys[lane.active]!.publicKey(), retry: badSeqRetries },
+        "channel sequence number was stale; refreshing it from the network and resubmitting",
+      );
+      return true;
+    };
     for (;;) {
       try {
         const result = await this.submit(mandateId, fee, lane);
+        if (result.status === "failed" && isBadSequence(result.errorCode, result.error) && retryBadSeq()) {
+          continue;
+        }
         if (result.status === "failed" && isCongestionFailure(result.error)) {
           const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
           if (congestionRetries === 0 && retryFee > fee) {
@@ -989,6 +1205,9 @@ export class Keeper {
           ? { ...result, error: this.scrubError(result.error ?? "Settlement failed") }
           : result;
       } catch (err) {
+        if (isBadSequence(undefined, err instanceof Error ? err.message : String(err)) && retryBadSeq()) {
+          continue;
+        }
         if (isCongestionFailure(err)) {
           const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
           if (congestionRetries === 0 && retryFee > fee) {
@@ -1066,9 +1285,13 @@ export class Keeper {
 
     const confirmed = await this.poll(sent.hash);
     if (confirmed.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      logger.info({ mandateId, txHash: sent.hash }, "mandate settled");
+      logger.info({ mandateId, txHash: sent.hash, channel: key.publicKey() }, "mandate settled");
       return { mandateId, status: "settled", txHash: sent.hash };
     }
+    logger.warn(
+      { mandateId, txHash: sent.hash, channel: key.publicKey(), status: confirmed.status },
+      "charge did not settle",
+    );
     return {
       mandateId,
       status: "failed",
@@ -1078,6 +1301,24 @@ export class Keeper {
     };
   }
 
+  /**
+   * Settle each mandate with its own `charge`, one after the other on the
+   * same channel. Never in parallel: every transaction from one channel
+   * draws on the same account sequence, so side-by-side submissions would
+   * race for one sequence number and all but one would fail `txBadSeq`.
+   */
+  private async settleEach(
+    mandates: DueMandate[],
+    inclusionFee: bigint,
+    channel: Channel,
+  ): Promise<SettleResult[]> {
+    const results: SettleResult[] = [];
+    for (const mandate of mandates) {
+      results.push(await this.settle(mandate.id, inclusionFee, channel));
+    }
+    return results;
+  }
+
   /** Settle a group, falling back to individual charges if batching is unavailable. */
   private async settleGroup(
     mandates: DueMandate[],
@@ -1085,15 +1326,25 @@ export class Keeper {
     channel: Channel,
   ): Promise<SettleResult[]> {
     if (mandates.length < 2 || !this.batchEnabled() || this.config.KEEPER_DRY_RUN) {
-      return Promise.all(mandates.map((mandate) => this.settle(mandate.id, inclusionFee, channel)));
+      return this.settleEach(mandates, inclusionFee, channel);
     }
     const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
     let fee = inclusionFee < maxFee ? inclusionFee : maxFee;
     let congestionRetries = 0;
+    let badSeqRetries = 0;
     for (;;) {
       try {
         const attempt = await this.submitBatch(mandates.map((mandate) => mandate.id), fee, channel);
         if (attempt.kind === "results") return attempt.results;
+        if (attempt.kind === "badSeq" && badSeqRetries < BAD_SEQ_RETRIES) {
+          // The next submitBatch re-reads the channel's sequence.
+          badSeqRetries += 1;
+          logger.warn(
+            { mandates: mandates.length, channel: channel.keys[channel.active]!.publicKey(), retry: badSeqRetries },
+            "channel sequence number was stale; refreshing it and resubmitting charge_many",
+          );
+          continue;
+        }
         if (attempt.kind === "congestion") {
           const retryFee = fee * 2n < maxFee ? fee * 2n : maxFee;
           if (congestionRetries === 0 && retryFee > fee) {
@@ -1113,7 +1364,7 @@ export class Keeper {
         }
       }
       logger.warn({ mandates: mandates.length }, "falling back to single charge transactions");
-      return Promise.all(mandates.map((mandate) => this.settle(mandate.id, inclusionFee, channel)));
+      return this.settleEach(mandates, inclusionFee, channel);
     }
   }
 
@@ -1154,6 +1405,7 @@ export class Keeper {
 
     const sent = await this.server.sendTransaction(prepared);
     if (sent.status === "TRY_AGAIN_LATER") return { kind: "congestion" };
+    if (sent.status === "ERROR" && resultCode(sent.errorResult) === "txBadSeq") return { kind: "badSeq" };
     if (sent.status === "ERROR") {
       const error = this.scrubError(
         typeof sent.errorResult === "string"
