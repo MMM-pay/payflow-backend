@@ -34,6 +34,7 @@ import type {
   ProtocolResponse,
   StatsResponse,
   SubscriberSummary,
+  UpcomingChargesResponse,
   VaultBalancePage,
   VaultEventPage,
 } from "../routes/types.ts";
@@ -309,6 +310,21 @@ export class PayflowClient {
 
   subscriberSummary(address: string): Promise<SubscriberSummary> {
     return this.get<SubscriberSummary>(`${API_PATH}/subscribers/${encodeURIComponent(address)}/summary`);
+  }
+
+  /**
+   * The charges this subscriber will be billed over the next `days`, merged
+   * across every active mandate and ordered by when each one falls due.
+   *
+   * A mandate already due is projected at `now` (the keeper settles it on its
+   * next pass), then every `period`; `days` defaults to 30 and is capped at
+   * 365. `truncated` marks output clipped by the per-mandate cap.
+   */
+  subscriberUpcoming(address: string, days?: number): Promise<UpcomingChargesResponse> {
+    return this.get<UpcomingChargesResponse>(
+      `${API_PATH}/subscribers/${encodeURIComponent(address)}/upcoming`,
+      days !== undefined ? { days } : undefined,
+    );
   }
 
   stats(): Promise<StatsResponse> {

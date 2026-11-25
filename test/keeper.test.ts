@@ -1402,6 +1402,165 @@ describe("keeper charge attempts", () => {
   });
 });
 
+/**
+ * Issue #324: the retry time after N consecutive failures follows the
+ * documented policy — one minute, doubling, capped at six hours — and the
+ * cap holds however long the streak lasts.
+ */
+describe("keeper backoff schedule", () => {
+  /** The waits after the 1st, 2nd, ... failure: 60 s doubling, then 6 h flat. */
+  const SCHEDULE = [60, 120, 240, 480, 960, 1_920, 3_840, 7_680, 15_360, 21_600, 21_600, 21_600];
+  const START = 1_000_000;
+
+  test("after each failure the next retry doubles from 60 s and caps at 6 h", async () => {
+    const db = openDatabase(":memory:");
+    // Due well before the first attempt; a failed charge never advances it.
+    insertDue(db, 1, START - 10_000);
+    const state = { failing: true };
+    const keeper = new Keeper(db, switchableRpc(state), keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+
+    let now = START;
+    for (const [index, wait] of SCHEDULE.entries()) {
+      const results = await keeper.tick(now);
+      assert.equal(results.length, 1, "the mandate is due at its retry time");
+      assert.equal(results[0]!.status, "failed");
+
+      const failures = index + 1;
+      const retryAt = now + wait;
+      assert.deepEqual(
+        keeper.backoffList(now),
+        [{ mandateId: 1, failures, retryAt, retryIn: wait }],
+        `failure ${failures} schedules the next attempt ${wait} s out`,
+      );
+      assert.equal(keeper.retryIn(1, now), wait);
+
+      // It is not retried early, and exactly at the computed time it is due.
+      assert.deepEqual(await keeper.findDue(retryAt - 1), [], "no retry before the schedule");
+      assert.deepEqual((await keeper.findDue(retryAt)).map((m) => m.id), [1]);
+
+      // The persisted attempt carries the same streak and retry time the
+      // in-memory backoff exposes, so a restart resumes the same schedule.
+      const row = attemptsOf(db).at(-1)!;
+      assert.equal(row.attempted_at, now);
+      assert.equal(row.result, "failed");
+      assert.equal(row.failures, failures);
+      assert.equal(row.retry_at, retryAt);
+
+      now = retryAt;
+    }
+    db.close();
+  });
+
+  test("a settlement clears the streak, so the next failure waits a minute again", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, START - 10_000);
+    const state = { failing: true };
+    const keeper = new Keeper(db, switchableRpc(state), keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+
+    // Four failures in a row: 60, 120, 240 and 480 s waits, next one 960 s.
+    let now = START;
+    for (const wait of SCHEDULE.slice(0, 4)) {
+      await keeper.tick(now);
+      now += wait;
+    }
+    assert.equal(keeper.backoffList(now)[0]!.failures, 4);
+
+    state.failing = false;
+    const settled = await keeper.tick(now);
+    assert.equal(settled[0]!.status, "settled");
+    assert.deepEqual(keeper.backoffList(now), [], "a success ends the backoff");
+    const last = attemptsOf(db).at(-1)!;
+    assert.equal(last.result, "settled");
+    assert.equal(last.failures, 0);
+    assert.equal(last.retry_at, null);
+
+    // A later failure is a fresh streak, not a continuation of the old one.
+    state.failing = true;
+    const next = now + 1;
+    await keeper.tick(next);
+    assert.deepEqual(keeper.backoffList(next), [
+      { mandateId: 1, failures: 1, retryAt: next + 60, retryIn: 60 },
+    ]);
+    db.close();
+  });
+
+  test("mandates back off independently, each from its own last failure", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, START - 10_000);
+    const state = { failing: true };
+    const keeper = new Keeper(db, switchableRpc(state), keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+
+    // Mandate 1 fails once at START and waits until START + 60.
+    await keeper.tick(START);
+    // Mandate 2 appears before that retry, so it fails for the first time at
+    // the same instant mandate 1 fails for the second time.
+    insertDue(db, 2, START - 10_000);
+    await keeper.tick(START + 60);
+    assert.deepEqual(keeper.backoffList(START + 60), [
+      { mandateId: 2, failures: 1, retryAt: START + 120, retryIn: 60 },
+      { mandateId: 1, failures: 2, retryAt: START + 180, retryIn: 120 },
+    ]);
+
+    // Only mandate 2's retry has arrived; mandate 1 keeps waiting.
+    assert.deepEqual((await keeper.findDue(START + 120)).map((m) => m.id), [2]);
+    await keeper.tick(START + 120);
+    assert.deepEqual(keeper.backoffList(START + 120), [
+      { mandateId: 1, failures: 2, retryAt: START + 180, retryIn: 60 },
+      { mandateId: 2, failures: 2, retryAt: START + 240, retryIn: 120 },
+    ]);
+    db.close();
+  });
+
+  test("an unusable signing account follows the same schedule, not a tighter retry", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, START - 10_000);
+    // No funded account: getAccount fails before simulation, the auth failure
+    // path. It must still back off like any other failed charge.
+    const keeper = new Keeper(db, fakeRpc(new Set()), keeperConfig({ KEEPER_SECRET: keyA.secret() }));
+
+    await keeper.tick(START);
+    assert.deepEqual(keeper.backoffList(START), [
+      { mandateId: 1, failures: 1, retryAt: START + 60, retryIn: 60 },
+    ]);
+    assert.deepEqual(await keeper.findDue(START + 59), []);
+    await keeper.tick(START + 60);
+    assert.deepEqual(keeper.backoffList(START + 60), [
+      { mandateId: 1, failures: 2, retryAt: START + 180, retryIn: 120 },
+    ]);
+    db.close();
+  });
+
+  test("the streak and next retry survive a restart and continue where they left off", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, START - 10_000);
+    const state = { failing: true };
+    const config = keeperConfig({ KEEPER_SECRET: keyA.secret() });
+    const before = new Keeper(db, switchableRpc(state), config);
+
+    let now = START;
+    for (const wait of SCHEDULE.slice(0, 4)) {
+      await before.tick(now);
+      now += wait;
+    }
+    // Four failures scheduled the next attempt 480 s out, at `now`.
+    const retryAt = now;
+    assert.equal(before.backoffList(now)[0]!.retryAt, retryAt);
+
+    // The same database in a new process resumes the exact retry time.
+    const after = new Keeper(db, switchableRpc(state), config);
+    await after.ready;
+    assert.deepEqual(after.backoffList(now), before.backoffList(now));
+    assert.deepEqual(await after.findDue(retryAt - 1), []);
+
+    // The fifth failure doubles the wait again, from 480 s to 960 s.
+    await after.tick(retryAt);
+    assert.deepEqual(after.backoffList(retryAt), [
+      { mandateId: 1, failures: 5, retryAt: retryAt + 960, retryIn: 960 },
+    ]);
+    db.close();
+  });
+});
+
 /** Issue #145: the merchant hears about a failing mandate once per streak. */
 describe("keeper failing streaks", () => {
   const TOKEN = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";

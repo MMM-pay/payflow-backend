@@ -132,16 +132,42 @@ async function get(path: string): Promise<Answer> {
   };
 }
 
+/**
+ * A body that can be compared between two requests.
+ *
+ * `/due` reports the server's clock as `now` in seconds. The alias and the
+ * versioned path are fetched one after the other, so the two can straddle a
+ * second boundary and legitimately differ by one; the field is checked for
+ * sanity separately rather than for equality.
+ */
+function comparable(route: string, answer: Answer): Answer {
+  if (route !== "/due") return answer;
+  const body = answer.body as Record<string, unknown> | null;
+  if (body === null) return answer;
+  const rest = { ...body };
+  delete rest.now;
+  return { ...answer, body: rest };
+}
+
 describe("the versioned API", () => {
   for (const route of ROUTES) {
     test(`${route} answers the same under /api and /api/v1`, async () => {
       const legacy = await get(`/api${route}`);
       const versioned = await get(`/api/v1${route}`);
       assert.deepEqual(
-        versioned,
-        legacy,
+        comparable(route, versioned),
+        comparable(route, legacy),
         `${route} differs between the versioned API and its alias`,
       );
+      if (route === "/due") {
+        for (const answer of [legacy, versioned]) {
+          const now = (answer.body as { now: number }).now;
+          assert.ok(
+            Math.abs(now - Date.now() / 1000) < 10,
+            `now is the request time, not a stale value: ${now}`,
+          );
+        }
+      }
     });
   }
 
