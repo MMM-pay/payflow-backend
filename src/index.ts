@@ -405,10 +405,12 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "shutting down");
   // The keeper takes no new mandates from here on; the settlements already in
   // flight finish and are recorded while the drain below waits for the pass.
-  activeKeeper?.stop();
+  // Waiting on the keeper itself (not only its loop) also covers a pass an
+  // operator triggered from /admin (#255).
+  const keeperDrain: Loop[] = activeKeeper ? [{ stop: () => activeKeeper.stop() }] : [];
   // Let a pass that is mid-write or mid-transaction finish before the database
   // closes, but never hang forever on a stuck RPC call.
-  const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);
+  const outcome = await drain([...keeperDrain, ...loops], config.SHUTDOWN_TIMEOUT_MS);
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
   const closeAll = async () => {

@@ -7,6 +7,21 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **Graceful keeper shutdown finishes in-flight charges (#255).** `Keeper.stop()`
+  now returns a promise that resolves once every running pass — scheduled or
+  triggered from `/admin` — has finished, and the API process's shutdown waits
+  on it (bounded by `SHUTDOWN_TIMEOUT_MS`). The one-shot `npm run keeper`
+  command, which used to die mid-transaction on `SIGTERM`, now stops picking
+  up mandates, lets the charges in flight confirm and be recorded, and closes
+  the database afterwards; past the deadline it exits non-zero. Charges a
+  worker had claimed but not yet submitted when the signal landed are released
+  immediately instead of being held for `KEEPER_CLAIM_TTL_S`. The HTTP API is
+  unchanged.
+- **Tests: a failed transfer never advances a mandate's due date (#256).** A
+  charge that fails on chain, is rejected on submission, is refused by the
+  contract or by authorization, never confirms, or cannot reach the RPC leaves
+  the mandate row untouched and the same due charge is retried once its
+  backoff lapses — including the failing member of a `charge_many`.
 - **Configurable indexing batch size and poll interval (#241).**
   `INDEXER_BATCH_SIZE` sets how many ledgers one batch reads and applies
   before the cursor moves (default 8,000, the RPC's getEvents window; 1–8,000),

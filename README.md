@@ -504,7 +504,13 @@ flight. Unset, it is one per channel — the behaviour before the cap existed.
   in a loop.
 - **Shutdown.** On `SIGTERM`/`SIGINT` the keeper takes no new mandates; the
   transactions in flight finish and are recorded before the process exits
-  (bounded by `SHUTDOWN_TIMEOUT_MS`).
+  (bounded by `SHUTDOWN_TIMEOUT_MS`). This holds for the long-running process
+  (including a pass triggered from `/admin`) and for the one-shot
+  `npm run keeper` command. Charges claimed but not yet submitted when the
+  signal lands are released at once, so another keeper can settle them
+  without waiting out `KEEPER_CLAIM_TTL_S`; a charge still stuck at the
+  deadline is abandoned, the one-shot command exits non-zero, and its claim
+  lapses after the TTL.
 
 `payflow_keeper_in_flight` reports the transactions in flight right now, and
 each `mandate settled` log line names the channel (public key) that signed it.

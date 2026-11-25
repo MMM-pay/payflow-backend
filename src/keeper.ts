@@ -500,6 +500,8 @@ export class Keeper {
   private stopping = false;
   /** Settlement transactions in flight right now, across every worker. */
   private inFlightCount = 0;
+  /** Passes running right now; {@link stop} waits for them to finish (#255). */
+  private readonly activePasses = new Set<Promise<unknown>>();
   /** Resolves when the persisted backoff has been loaded into memory. */
   readonly ready: Promise<void>;
 
@@ -585,18 +587,29 @@ export class Keeper {
     return this.inFlightCount;
   }
 
+  /** True once {@link stop} has been called: no new mandate will be picked up. */
+  get isStopping(): boolean {
+    return this.stopping;
+  }
+
   /**
    * Begin a graceful shutdown: workers take no new mandates, while the
    * transactions already in flight finish (or time out) and are recorded.
    * The pass in progress resolves once they have; later passes do nothing.
+   *
+   * Resolves once every pass that was running has finished, so a caller
+   * (SIGTERM handler) can wait for in-flight charges before closing the
+   * database (#255). Never rejects: a pass's own error is its caller's.
    */
-  stop(): void {
-    if (this.stopping) return;
-    this.stopping = true;
-    logger.info(
-      { inFlight: this.inFlightCount },
-      "keeper stopping: in-flight settlements will finish, no new ones start",
-    );
+  stop(): Promise<void> {
+    if (!this.stopping) {
+      this.stopping = true;
+      logger.info(
+        { inFlight: this.inFlightCount, passes: this.activePasses.size },
+        "keeper stopping: in-flight settlements will finish, no new ones start",
+      );
+    }
+    return Promise.allSettled([...this.activePasses]).then(() => undefined);
   }
 
   /**
@@ -799,6 +812,26 @@ export class Keeper {
     return this.config.KEEPER_CLAIM_TTL_S ?? DEFAULT_CLAIM_TTL_S;
   }
 
+  /**
+   * Give back claims this instance took but never submitted, by expiring
+   * them now; another keeper (or this one after a restart) may claim the
+   * charge on its next pass.
+   */
+  private async releaseClaims(group: DueMandate[], now: number): Promise<void> {
+    for (const mandate of group) {
+      await holdClaim(this.db, {
+        mandateId: mandate.id,
+        dueAt: mandate.next_charge,
+        owner: this.instanceId,
+        until: now,
+      });
+    }
+    logger.info(
+      { mandateIds: group.map((mandate) => mandate.id) },
+      "keeper stopping: released claims on charges that were never submitted",
+    );
+  }
+
   /** Track the in-flight count and publish it as the `keeper_in_flight` gauge. */
   private adjustInFlight(delta: number): void {
     this.inFlightCount += delta;
@@ -833,7 +866,13 @@ export class Keeper {
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
-    return withSpan("keeper.tick", () => this.tickInner(now));
+    const pass = withSpan("keeper.tick", () => this.tickInner(now));
+    this.activePasses.add(pass);
+    try {
+      return await pass;
+    } finally {
+      this.activePasses.delete(pass);
+    }
   }
 
   private async tickInner(now: number): Promise<SettleResult[]> {
@@ -911,6 +950,13 @@ export class Keeper {
           // A dry run submits nothing, so it has nothing to claim.
           const claimed = dryRun ? group : await this.claimGroup(group, clock());
           if (claimed.length === 0) continue;
+          // Stop landed while the claims were being taken: nothing has been
+          // submitted for them, so hand them back at once rather than make
+          // another keeper wait out the claim TTL (#255).
+          if (this.stopping) {
+            if (!dryRun) await this.releaseClaims(claimed, clock());
+            return;
+          }
           const channel = await pool.acquire();
           this.adjustInFlight(1);
           let results: SettleResult[];
@@ -1770,5 +1816,74 @@ export class Keeper {
       latest = await this.server.getTransaction(hash);
     }
     return latest;
+  }
+}
+
+/** What {@link settleOnce} listens to for shutdown signals; `process` in production. */
+export interface SignalSource {
+  once(signal: NodeJS.Signals, listener: () => void): unknown;
+  off(signal: NodeJS.Signals, listener: () => void): unknown;
+}
+
+export interface SettleOnceResult {
+  /** The pass's results, or undefined when it failed or was abandoned. */
+  results?: SettleResult[];
+  /** The pass's error, when it threw. */
+  error?: unknown;
+  /** The signal that stopped the pass early, if one arrived. */
+  signal?: NodeJS.Signals | undefined;
+  /** True when in-flight charges were still running at the shutdown deadline. */
+  timedOut: boolean;
+}
+
+/**
+ * Run one settlement pass the way the standalone keeper command does (#255).
+ *
+ * A SIGTERM or SIGINT while the pass runs stops it gracefully: no new mandate
+ * is picked up, and the transactions already in flight finish and are
+ * recorded before this resolves. If they are still running `timeoutMs` after
+ * the signal, it resolves with `timedOut` so the caller can exit instead of
+ * hanging on a stuck RPC call; their claims lapse after `KEEPER_CLAIM_TTL_S`.
+ * Never rejects; the pass's own error comes back as `error`.
+ */
+export async function settleOnce(
+  keeper: Keeper,
+  options: { timeoutMs: number; signals?: SignalSource; now?: number },
+): Promise<SettleOnceResult> {
+  const signals = options.signals ?? process;
+  let signal: NodeJS.Signals | undefined;
+  let deadline: NodeJS.Timeout | undefined;
+  let resolveTimeout: (value: "timeout") => void = () => undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    resolveTimeout = resolve;
+  });
+  const handlers = (["SIGTERM", "SIGINT"] as const).map((name) => {
+    const handler = (): void => {
+      if (signal) return;
+      signal = name;
+      logger.info({ signal: name, inFlight: keeper.inFlight }, "shutdown signal received during settlement pass");
+      void keeper.stop();
+      deadline = setTimeout(() => resolveTimeout("timeout"), options.timeoutMs);
+    };
+    signals.once(name, handler);
+    return [name, handler] as const;
+  });
+  const pass = keeper.tick(options.now).then(
+    (results) => ({ results }),
+    (error: unknown) => ({ error }),
+  );
+  try {
+    const outcome = await Promise.race([pass, timedOut]);
+    if (outcome === "timeout") {
+      logger.warn(
+        { timeoutMs: options.timeoutMs, inFlight: keeper.inFlight },
+        "in-flight settlements still running at the shutdown deadline; exiting anyway",
+      );
+      return { signal, timedOut: true };
+    }
+    return { ...outcome, signal, timedOut: false };
+  } finally {
+    clearTimeout(deadline);
+    for (const [name, handler] of handlers) signals.off(name, handler);
   }
 }
