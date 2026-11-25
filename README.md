@@ -921,7 +921,8 @@ try {
 Every endpoint is covered: `health`, `plans`, `plan`, `planStats`, `mandates`,
 `mandate`, `charges`, `chargeAttempts`, `due`, `merchantSummary`,
 `merchantForecast`, `merchantSubscribers`, `merchantChurn`, `merchantRevenue`,
-`subscriberSummary`, `stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`.
+`subscriberSummary`, `subscriberUpcoming`, `stats`, `protocol`, `vault`,
+`vaultEvents`, and `keeper`.
 The client calls the versioned `/api/v1` paths; `health` stays at the service
 root.
 
