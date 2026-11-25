@@ -215,7 +215,7 @@ function claims(): string[] {
   ];
   const tokens = payloads.map((payload) => forge(payload));
   // Payloads that are not JSON, or not UTF-8, under a valid signature.
-  for (const raw of ["", "{", "{\"iss\":", "nul", "\u0000", "﻿" + JSON.stringify(validClaims)]) {
+  for (const raw of ["", "{", "{\"iss\":", "nul", "\u0000", "\uFEFF" + JSON.stringify(validClaims)]) {
     tokens.push(signRaw(b64u(HEADER), b64u(raw)));
   }
   tokens.push(signRaw(b64u(HEADER), Buffer.from([0xff, 0xfe, 0xfd]).toString("base64url")));
