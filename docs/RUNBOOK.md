@@ -51,6 +51,7 @@ indexer is behind right now, the metrics say how long it has been.
 | `payflow_charges_settled_total` | No charges settled although mandates are due |
 | `payflow_charges_failed_total` | Failures climbing: the keeper cannot settle |
 | `payflow_keeper_passes_total` | A pass count that stops growing: the keeper is stuck |
+| `payflow_keeper_backoffs_total` | `reason="keeper"` climbing: the keeper's signer or authorization is refused, fix the key; `reason="infrastructure"` climbing: RPC or network trouble |
 | `payflow_keeper_in_flight` | Stuck at `KEEPER_CONCURRENCY` for long: transactions are not confirming (RPC or network trouble) |
 
 The keeper logs a mandate it skipped because the vault could not cover it:

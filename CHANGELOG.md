@@ -327,6 +327,23 @@ All notable changes to payflow-backend. The format follows
 
 ### Changed
 
+- **Per-mandate backoff by cause, configurable (#248).** A failing mandate
+  still waits `min(base × multiplier^(n−1), max)` after its *n*-th failure in a
+  row, now with `KEEPER_BACKOFF_BASE_S` (60), `KEEPER_BACKOFF_MULTIPLIER` (2),
+  `KEEPER_BACKOFF_MAX_S` (21600) and `KEEPER_BACKOFF_JITTER` (0.1, a random
+  share taken off each wait so mandates that failed together spread out), all
+  validated at startup and on `SIGHUP`. Only the mandate's own failures (an
+  underfunded vault or allowance, a contract refusal) grow the wait. A
+  permanent refusal (`MandateNotFound`, `MandateNotActive`,
+  `MaxChargesReached`, `PlanNotFound`) waits the cap at once. RPC, network,
+  sequence-number and fee failures, and a refused keeper signer, retry after
+  the base delay without growing it, so an outage or a misconfigured key no
+  longer pushes every mandate hours into the future. The due query now skips
+  backed-off mandates itself, reading each mandate's newest `charge_attempts`
+  row, so keepers sharing a database honour and continue each other's
+  backoff. Each backoff is logged and counted in the new
+  `payflow_keeper_backoffs_total{reason}`. No schema change: the existing
+  `charge_attempts` columns hold the state.
 - **The raw event feed reads one page per request (#364).** `GET /api/events`
   without a `name` filter now asks the database for one page plus one row
   (51) instead of a 200-row batch, and a `contract` filter is served by a new

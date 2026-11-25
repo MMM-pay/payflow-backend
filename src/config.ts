@@ -129,6 +129,29 @@ const schema = z.object({
    * poll), which takes well under a minute.
    */
   KEEPER_CLAIM_TTL_S: z.coerce.number().int().min(60, "must be at least 60 seconds").default(300),
+  /**
+   * Per-mandate backoff after a failed charge (#248): the wait after the
+   * n-th consecutive failure is
+   * `min(KEEPER_BACKOFF_BASE_S * KEEPER_BACKOFF_MULTIPLIER^(n-1), KEEPER_BACKOFF_MAX_S)`,
+   * less a random share of up to `KEEPER_BACKOFF_JITTER` of it, so mandates
+   * that failed together do not all come back at the same instant. Only
+   * failures that are the mandate's own (an underfunded vault, a contract
+   * refusal) grow the wait; RPC, network and keeper-signer failures retry
+   * after the base delay without growing it.
+   */
+  KEEPER_BACKOFF_BASE_S: z.coerce.number().int().min(1, "must be at least 1 second").default(60),
+  KEEPER_BACKOFF_MULTIPLIER: z.coerce.number().min(1, "must be at least 1").default(2),
+  KEEPER_BACKOFF_MAX_S: z.coerce
+    .number()
+    .int()
+    .min(1, "must be at least 1 second")
+    .max(604_800, "must be at most 604800 seconds (7 days)")
+    .default(21_600),
+  KEEPER_BACKOFF_JITTER: z.coerce
+    .number()
+    .min(0, "must be between 0 and 0.5")
+    .max(0.5, "must be between 0 and 0.5")
+    .default(0.1),
   /** Use charge_many when the deployed contract supports it. */
   KEEPER_BATCH: z.string().default("true").transform((v) => v === "true"),
   /** Mandates per batch transaction, bounded by the contract's supported list size. */
@@ -390,6 +413,33 @@ export function keeperChannelCount(
   return channels;
 }
 
+/**
+ * What is wrong with the keeper's backoff settings taken together, or null
+ * when they fit (#248). Each value is range-checked by the schema; this
+ * checks them against each other: the cap may not sit below the first wait,
+ * and a wait may not outlive the attempt log that remembers it — a mandate's
+ * newest `charge_attempts` row is its backoff state, so pruning it early
+ * would let the mandate retry before its time.
+ */
+export function keeperBackoffProblem(
+  config: Pick<Config, "KEEPER_BACKOFF_BASE_S" | "KEEPER_BACKOFF_MAX_S" | "CHARGE_ATTEMPT_RETENTION_DAYS">,
+): string | null {
+  if (config.KEEPER_BACKOFF_MAX_S < config.KEEPER_BACKOFF_BASE_S) {
+    return (
+      `KEEPER_BACKOFF_MAX_S=${config.KEEPER_BACKOFF_MAX_S} is below ` +
+      `KEEPER_BACKOFF_BASE_S=${config.KEEPER_BACKOFF_BASE_S}; the cap must be at least the first wait`
+    );
+  }
+  const retentionDays = config.CHARGE_ATTEMPT_RETENTION_DAYS;
+  if (retentionDays > 0 && config.KEEPER_BACKOFF_MAX_S > retentionDays * 86_400) {
+    return (
+      `KEEPER_BACKOFF_MAX_S=${config.KEEPER_BACKOFF_MAX_S} outlasts ` +
+      `CHARGE_ATTEMPT_RETENTION_DAYS=${retentionDays}; a backoff must end before its attempt is pruned`
+    );
+  }
+  return null;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const parsed = schema.safeParse(env);
   if (!parsed.success) {
@@ -412,6 +462,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       );
     }
   }
+  const backoffProblem = keeperBackoffProblem(parsed.data);
+  if (backoffProblem) throw new Error(backoffProblem);
   if (
     parsed.data.SEP10_SIGNING_KEY &&
     (!parsed.data.SEP10_JWT_SECRET || !parsed.data.SEP10_HOME_DOMAIN)

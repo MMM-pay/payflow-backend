@@ -285,10 +285,16 @@ array) and `updated_at`. An empty list turns notifications off.
 
 One row per keeper charge attempt: `attempted_at` (unix seconds), `result`
 (`settled`, `failed` or `skipped` when the vault could not cover it),
-`error_code`, `tx_hash`, `shortfall` for a skip, the mandate's consecutive
+`error_code`, `tx_hash`, `shortfall` for a skip, the mandate's failure streak
 `failures` after the attempt and its next `retry_at`. A mandate's newest row
-is its whole backoff state, so a restarted keeper resumes where it left off.
-Rows older than `CHARGE_ATTEMPT_RETENTION_DAYS` (90) are pruned.
+is its whole backoff state (#248): the keeper's due query skips a mandate
+whose newest `retry_at` is still ahead (one seek on the `(mandate_id, id)`
+index per candidate), so a restarted keeper, or another keeper on the same
+database, resumes where it left off. Only the mandate's own failures grow
+`failures`; network and keeper-signer failures keep it and retry after the
+base delay (see the README's *Per-mandate backoff*). Rows older than
+`CHARGE_ATTEMPT_RETENTION_DAYS` (90) are pruned, which is why
+`KEEPER_BACKOFF_MAX_S` may not outlast it.
 
 ### `keeper_claims`
 

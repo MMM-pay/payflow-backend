@@ -186,6 +186,67 @@ describe("keeper channel balance threshold", () => {
   });
 });
 
+describe("keeper backoff settings (#248)", () => {
+  test("default to 60 s doubling up to 6 h, with 10% jitter", () => {
+    const config = loadConfig({ ...BASE });
+    assert.deepEqual(
+      [config.KEEPER_BACKOFF_BASE_S, config.KEEPER_BACKOFF_MULTIPLIER, config.KEEPER_BACKOFF_MAX_S, config.KEEPER_BACKOFF_JITTER],
+      [60, 2, 21_600, 0.1],
+    );
+  });
+
+  test("accept a valid schedule, a fractional multiplier and jitter turned off", () => {
+    const config = loadConfig({
+      ...BASE,
+      KEEPER_BACKOFF_BASE_S: "30",
+      KEEPER_BACKOFF_MULTIPLIER: "1.5",
+      KEEPER_BACKOFF_MAX_S: "30",
+      KEEPER_BACKOFF_JITTER: "0",
+    });
+    assert.deepEqual(
+      [config.KEEPER_BACKOFF_BASE_S, config.KEEPER_BACKOFF_MULTIPLIER, config.KEEPER_BACKOFF_MAX_S, config.KEEPER_BACKOFF_JITTER],
+      [30, 1.5, 30, 0],
+    );
+  });
+
+  test("an invalid value fails startup with its name", () => {
+    const invalid: [Record<string, string>, RegExp][] = [
+      [{ KEEPER_BACKOFF_BASE_S: "0" }, /KEEPER_BACKOFF_BASE_S: must be at least 1 second/],
+      [{ KEEPER_BACKOFF_BASE_S: "-60" }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_BASE_S: "1.5" }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_BASE_S: "soon" }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_MULTIPLIER: "0.5" }, /KEEPER_BACKOFF_MULTIPLIER: must be at least 1/],
+      [{ KEEPER_BACKOFF_MULTIPLIER: "0" }, /KEEPER_BACKOFF_MULTIPLIER/],
+      [{ KEEPER_BACKOFF_MAX_S: "0" }, /KEEPER_BACKOFF_MAX_S/],
+      [{ KEEPER_BACKOFF_MAX_S: "604801" }, /KEEPER_BACKOFF_MAX_S: must be at most 604800/],
+      [{ KEEPER_BACKOFF_JITTER: "-0.1" }, /KEEPER_BACKOFF_JITTER/],
+      [{ KEEPER_BACKOFF_JITTER: "0.6" }, /KEEPER_BACKOFF_JITTER: must be between 0 and 0.5/],
+    ];
+    for (const [env, message] of invalid) {
+      assert.throws(() => loadConfig({ ...BASE, ...env }), message, JSON.stringify(env));
+    }
+  });
+
+  test("a cap below the base delay fails startup", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_BACKOFF_BASE_S: "600", KEEPER_BACKOFF_MAX_S: "300" }),
+      /KEEPER_BACKOFF_MAX_S=300 is below KEEPER_BACKOFF_BASE_S=600/,
+    );
+    // Equal is a flat schedule, which is allowed.
+    assert.equal(loadConfig({ ...BASE, KEEPER_BACKOFF_BASE_S: "300", KEEPER_BACKOFF_MAX_S: "300" }).KEEPER_BACKOFF_MAX_S, 300);
+  });
+
+  test("a cap that outlasts the attempt log fails startup, unless the log is kept forever", () => {
+    const env = { ...BASE, KEEPER_BACKOFF_MAX_S: String(2 * 86_400) };
+    assert.throws(
+      () => loadConfig({ ...env, CHARGE_ATTEMPT_RETENTION_DAYS: "1" }),
+      /KEEPER_BACKOFF_MAX_S=172800 outlasts CHARGE_ATTEMPT_RETENTION_DAYS=1/,
+    );
+    assert.equal(loadConfig({ ...env, CHARGE_ATTEMPT_RETENTION_DAYS: "2" }).KEEPER_BACKOFF_MAX_S, 172_800);
+    assert.equal(loadConfig({ ...env, CHARGE_ATTEMPT_RETENTION_DAYS: "0" }).KEEPER_BACKOFF_MAX_S, 172_800);
+  });
+});
+
 describe("keeper concurrency cap (KEEPER_CONCURRENCY)", () => {
   const primary = Keypair.random().secret();
   const channelB = Keypair.random().secret();

@@ -2082,11 +2082,13 @@ function componentSchemas(): Record<string, SchemaObject> {
         },
         failures: {
           type: "integer",
-          description: "Consecutive failed attempts after this one; 0 once a charge settles.",
+          description:
+            "The mandate's failure streak after this attempt: consecutive failures that are the mandate's own (a vault shortfall, a contract refusal). Network, sequence-number and keeper-signer failures leave it unchanged. 0 once a charge settles.",
         },
         retryAt: {
           type: ["integer", "null"],
-          description: "When the keeper tries again, in unix seconds; null after a settlement.",
+          description:
+            "When the keeper tries again, in unix seconds; null after a settlement. Grows with `failures` up to the configured cap; one base delay away after a failure that left `failures` unchanged.",
         },
       },
       required: ["id", "mandateId", "attemptedAt", "result", "errorCode", "txHash", "failures", "retryAt"],
