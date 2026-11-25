@@ -602,7 +602,7 @@ async function makeAuthApp(storage: Storage): Promise<{ server: Server; base: st
     getLedgerEntries: async (..._keys: xdr.LedgerKey[]): Promise<rpc.Api.GetLedgerEntriesResponse> =>
       ({ entries: [], latestLedger: 1 } as never),
   };
-  const auth = sep10For(config, network, fakeRpc)!;
+  const auth = sep10For(config, network, fakeRpc, storage)!;
   const dispatcher = new WebhookDispatcher({
     db: storage,
     fetchImpl: async () => new Response("ok", { status: 200 }),

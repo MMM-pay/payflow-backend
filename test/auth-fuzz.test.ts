@@ -9,6 +9,7 @@ import { WebhookDispatcher } from "../src/lib/webhooks.ts";
 import { logger } from "../src/lib/logger.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import { Sep10Auth } from "../src/routes/auth.ts";
+import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 
 /**
  * #284: fuzz the bearer-token check with malformed, expired, tampered and
@@ -66,6 +67,8 @@ const auth = new Sep10Auth({
   networkPassphrase: Networks.TESTNET,
   issuer: ISSUER,
   tokenTtlS: TTL,
+  refreshTtlS: 86_400,
+  db: SqliteStorage.open(":memory:"),
   loadAccount: async () => assert.fail("verifying a token never loads an account"),
 });
 
