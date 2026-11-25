@@ -211,6 +211,28 @@ export function isAmbiguousHttpRequest(req: Request): boolean {
   return false;
 }
 
+/**
+ * Paths a platform probes over its private network in plain HTTP (Fly and
+ * Render health checks, a Prometheus scrape). They carry no credentials.
+ */
+const PLAINTEXT_EXEMPT = new Set(["/health", "/ready", "/metrics"]);
+
+/**
+ * Refuse a request that reached the app over plaintext HTTP (#277).
+ *
+ * `req.secure` honours `X-Forwarded-Proto` from the single trusted proxy hop
+ * (`trust proxy` is 1). The request is rejected rather than redirected: a
+ * redirect would teach clients that `http://` works, and whatever they sent —
+ * a bearer token, a webhook secret — has already crossed the wire.
+ */
+export function requireHttps(req: Request, res: Response, next: NextFunction): void {
+  if (req.secure || PLAINTEXT_EXEMPT.has(req.path)) {
+    next();
+    return;
+  }
+  sendApiError(res, req, 403, "forbidden", "HTTPS is required");
+}
+
 export function createApp(
   runtimes: NetworkRuntime[],
   config: Config,
@@ -293,7 +315,17 @@ export function createApp(
   const app = express();
 
   app.set("trust proxy", 1);
-  app.use(helmet());
+  // HSTS tells browsers to use HTTPS for every later request (#277). The
+  // header is ignored over plaintext, so sending it unconditionally is safe.
+  const hstsMaxAge = config.HSTS_MAX_AGE_S ?? 31_536_000;
+  app.use(
+    helmet({
+      strictTransportSecurity: hstsMaxAge > 0 ? { maxAge: hstsMaxAge, includeSubDomains: true } : false,
+    }),
+  );
+  if (config.REQUIRE_HTTPS === true) {
+    app.use(requireHttps);
+  }
   // Compress JSON/text responses to reduce payloads. SSE and CSV responses
   // are streamed (and CSV respects backpressure), so buffering them for
   // compression would add latency and memory; they are excluded. Small

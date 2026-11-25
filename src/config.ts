@@ -253,6 +253,20 @@ const schema = z.object({
   DATABASE_URL: postgresUrl,
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
+  /** Read only to pick the `REQUIRE_HTTPS` default. */
+  NODE_ENV: z.string().default("development"),
+  /**
+   * Reject plaintext HTTP requests (#277). Unset means on when
+   * `NODE_ENV=production` (the Docker image sets it) and off otherwise, so
+   * local development keeps working over `http://localhost`. The scheme is
+   * read from `X-Forwarded-Proto` set by the first proxy hop (Fly, Render).
+   */
+  REQUIRE_HTTPS: z
+    .enum(["true", "false", ""])
+    .optional()
+    .transform((v) => (v === undefined || v === "" ? undefined : v === "true")),
+  /** `Strict-Transport-Security` max-age in seconds; 0 disables the header. */
+  HSTS_MAX_AGE_S: z.coerce.number().int().nonnegative().default(31_536_000),
   LOG_LEVEL: z.string().default("info"),
   // An empty value means "not set": the shipped .env.example leaves the
   // variable blank, and a container that reads it must not refuse to start
@@ -404,7 +418,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   ) {
     throw new Error("SEP10_SIGNING_KEY requires SEP10_JWT_SECRET and SEP10_HOME_DOMAIN to be set");
   }
-  return parsed.data;
+  return {
+    ...parsed.data,
+    REQUIRE_HTTPS: parsed.data.REQUIRE_HTTPS ?? parsed.data.NODE_ENV === "production",
+  };
 }
 
 /** Route segments have to survive a URL path: lowercase letters, digits, dashes. */

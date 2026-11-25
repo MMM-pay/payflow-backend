@@ -1140,6 +1140,8 @@ examined without API downtime.
 | `API_RATE_LIMIT_MAX` | `120` | Maximum requests per IP in each API rate-limit window |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus metrics at `/metrics` |
 | `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
+| `REQUIRE_HTTPS` | on when `NODE_ENV=production` | Reject plaintext requests with `403 forbidden`, judged by the proxy's `X-Forwarded-Proto`. `/health`, `/ready` and `/metrics` are exempt for platform probes |
+| `HSTS_MAX_AGE_S` | `31536000` | `Strict-Transport-Security` max-age (with `includeSubDomains`); `0` drops the header |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
 | `ADMIN_TOKEN` | — | Bearer token for `/admin`. Unset keeps those routes disabled |

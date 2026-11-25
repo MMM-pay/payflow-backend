@@ -23,6 +23,9 @@ primary_region = "sjc"
   # Settlement stays off unless a funded KEEPER_SECRET is set as a secret and
   # KEEPER_ENABLED is flipped to "true".
   KEEPER_ENABLED = "false"
+  # Reject plaintext requests that bypass force_https (e.g. over the private
+  # network). /health, /ready and /metrics stay reachable for probes.
+  REQUIRE_HTTPS = "true"
 
 [http_service]
   internal_port = 8080
