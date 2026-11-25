@@ -5,6 +5,8 @@
   <strong>Event indexer, settlement keeper, and read API for the Payflow protocol.</strong>
 </p>
 
+
+
 <p align="center">
   <a href="https://github.com/MMM-pay/payflow-backend/actions/workflows/ci.yml">
     <img alt="CI" src="https://github.com/MMM-pay/payflow-backend/actions/workflows/ci.yml/badge.svg"/>
@@ -22,6 +24,7 @@
 > **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) ·
 > **API conventions:** [docs/API_CONVENTIONS.md](docs/API_CONVENTIONS.md) ·
 > **API changelog:** [API_CHANGELOG.md](API_CHANGELOG.md)
+
 
 ---
 
