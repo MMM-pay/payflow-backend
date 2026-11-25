@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test, describe } from "node:test";
 import { openDatabase, backupDatabase, migrate, writeCursor } from "../src/lib/db.ts";
@@ -120,6 +123,41 @@ describe("forward-only schema migrations", () => {
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM plans").get() as { n: number }).n, 1);
     assert.doesNotThrow(() => migrate(db));
     db.close();
+  });
+
+  test("an existing database gains keeper_claims on open, keeps its keeper rows, and reopens cleanly (#249)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "payflow-claims-migration-"));
+    const path = join(dir, "legacy.db");
+    try {
+      // A database from before #249: a charge attempt, no claims table.
+      const legacy = new DatabaseSync(path);
+      legacy.exec(`
+        CREATE TABLE charge_attempts (
+          id INTEGER PRIMARY KEY, mandate_id INTEGER NOT NULL, attempted_at INTEGER NOT NULL,
+          result TEXT NOT NULL, error_code TEXT, tx_hash TEXT, shortfall TEXT,
+          failures INTEGER NOT NULL, retry_at INTEGER
+        );
+        INSERT INTO charge_attempts VALUES (1, 8, 100, 'failed', 'txBadSeq', NULL, NULL, 1, 160);
+      `);
+      legacy.close();
+
+      for (let open = 0; open < 2; open += 1) {
+        const db = openDatabase(path);
+        const columns = db
+          .prepare("SELECT name FROM pragma_table_info('keeper_claims') ORDER BY cid")
+          .all()
+          .map((row) => (row as { name: string }).name);
+        assert.deepEqual(columns, ["mandate_id", "due_at", "owner", "expires_at"]);
+        assert.deepEqual(
+          { ...(db.prepare("SELECT mandate_id, error_code, retry_at FROM charge_attempts").get() as object) },
+          { mandate_id: 8, error_code: "txBadSeq", retry_at: 160 },
+          "the attempt log, and so the restored backoff, survives the upgrade",
+        );
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("surfaces database errors instead of treating a failed migration as success", () => {
@@ -366,6 +404,84 @@ describe("report query indexes", () => {
     );
     // The index already yields (next_charge, id) order: no sort step.
     assert.doesNotMatch(page, /TEMP B-TREE/);
+    db.close();
+  });
+});
+
+describe("hot-path indexes (#264)", () => {
+  test("migrate creates the new covering indexes", () => {
+    const db = openDatabase(":memory:");
+    const names = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as {
+        name: string;
+      }[]
+    ).map((r) => r.name);
+
+    assert.ok(names.includes("mandates_merchant_status_id"), "mandates_merchant_status_id");
+    assert.ok(names.includes("mandates_status_merchant"), "mandates_status_merchant");
+    assert.ok(names.includes("charges_mandate_ledger"), "charges_mandate_ledger");
+    assert.ok(names.includes("charges_subscriber_ledger"), "charges_subscriber_ledger");
+    db.close();
+  });
+
+  test("listMandates merchant+status paging uses a (merchant, status) index", () => {
+    const db = openDatabase(":memory:");
+    // The keyset page listMandates runs with both merchant and status filters.
+    const plan = queryPlan(
+      db,
+      `SELECT * FROM mandates WHERE merchant = ? AND status = ? AND id < ? ORDER BY id DESC LIMIT ?`,
+      ["M", "Active", 100, 51],
+    );
+    // The planner may choose either mandates_merchant_status_id (merchant, status, id)
+    // or mandates_status_merchant (status, merchant); both cover the two equality
+    // predicates and use the rowid for the cursor — the key assertion is that
+    // neither the mandates_merchant-only index (which ignores status) nor a
+    // full table scan is used.
+    assert.doesNotMatch(plan, /SCAN mandates\b/);
+    assert.match(plan, /USING INDEX mandates_(merchant_status_id|status_merchant)/);
+    db.close();
+  });
+
+  test("COUNT(DISTINCT merchant) for active mandates uses a covering index", () => {
+    const db = openDatabase(":memory:");
+    // getProtocolStats counts distinct active merchants.
+    const plan = queryPlan(
+      db,
+      `SELECT COUNT(DISTINCT merchant) AS n FROM mandates WHERE status = 'Active'`,
+    );
+    // The (status, merchant) covering index lets the planner read merchant
+    // straight from the index without touching the table.
+    assert.match(plan, /COVERING INDEX mandates_status_merchant/);
+    assert.doesNotMatch(plan, /SCAN mandates\b/);
+    db.close();
+  });
+
+  test("listMandateCharges ORDER BY ledger DESC uses the (mandate_id, ledger, tx_hash) index", () => {
+    const db = openDatabase(":memory:");
+    // The endpoint reads one mandate's charges newest-first by ledger.
+    const plan = queryPlan(
+      db,
+      `SELECT * FROM charges WHERE mandate_id = ? ORDER BY ledger DESC LIMIT ?`,
+      [1, 50],
+    );
+    assert.match(plan, /SEARCH charges USING INDEX charges_mandate_ledger \(mandate_id=\?\)/);
+    // Index already delivers rows in ledger DESC order: no sort step.
+    assert.doesNotMatch(plan, /TEMP B-TREE/);
+    db.close();
+  });
+
+  test("getSubscriberExport charges ORDER BY ledger ASC uses the (subscriber, ledger, tx_hash) index", () => {
+    const db = openDatabase(":memory:");
+    // The export reads all of a subscriber's charges oldest-first by ledger.
+    const plan = queryPlan(
+      db,
+      `SELECT tx_hash, mandate_id, subscriber, merchant, amount, fee, ledger, created_at
+         FROM charges WHERE subscriber = ? ORDER BY ledger ASC, tx_hash ASC`,
+      ["S"],
+    );
+    assert.match(plan, /SEARCH charges USING INDEX charges_subscriber_ledger \(subscriber=\?\)/);
+    // Index already delivers rows in ledger ASC, tx_hash ASC order.
+    assert.doesNotMatch(plan, /TEMP B-TREE/);
     db.close();
   });
 });

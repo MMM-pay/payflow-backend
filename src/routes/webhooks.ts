@@ -119,17 +119,16 @@ function authorized(
   signature: string,
   timestamp: number,
 ): boolean {
+  // `details` belongs to `invalid_request` only (see the README's "Error
+  // responses" table and the OpenAPI Error schema), so a 401 carries copy
+  // but no field list.
   if (!fresh(timestamp)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.", [
-      { path: "timestamp", message: "must be within ten minutes of the server's clock" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.");
     return false;
   }
   const bytes = signatureBytesOf(signature);
   if (bytes === null || !verifies(merchant, message, bytes)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.", [
-      { path: "signature", message: "signature does not prove control of the merchant address" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.");
     return false;
   }
   return true;
@@ -137,9 +136,7 @@ function authorized(
 
 /** Answer a SEP-10 session whose account is not the merchant the request names. */
 function sendWrongAccount(req: Request, res: Response): void {
-  sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.", [
-    { path: "merchant", message: "must be the account the bearer token was issued to" },
-  ]);
+  sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.");
 }
 
 /**

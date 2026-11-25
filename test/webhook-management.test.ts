@@ -196,6 +196,51 @@ describe("webhook management", () => {
   });
 
   describe("sending a test event", () => {
+    test("replaying a charged event does not enqueue a second delivery", async () => {
+      const hook = await dispatcher.register(merchant, "https://m.example/replayed-charge", "replay-secret");
+      calls.length = 0;
+
+      charge(7n, "tx-replayed");
+      await flush();
+      charge(7n, "tx-replayed");
+      await flush();
+
+      assert.equal(
+        calls.filter((call) => call.url === "https://m.example/replayed-charge").length,
+        1,
+      );
+      assert.equal(
+        db.prepare("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id = ? AND event_id = ?")
+          .get(hook.id, "charge:tx-replayed:7")
+          ?.n,
+        1,
+      );
+    });
+
+    test("separate charges in one transaction keep distinct replay receipts", async () => {
+      const hook = await dispatcher.register(merchant, "https://m.example/batched-charges", "batch-secret");
+      calls.length = 0;
+
+      charge(8n, "tx-batch");
+      charge(9n, "tx-batch");
+      await flush();
+      charge(8n, "tx-batch");
+      charge(9n, "tx-batch");
+      await flush();
+
+      assert.equal(
+        calls.filter((call) => call.url === "https://m.example/batched-charges").length,
+        2,
+      );
+      const deliveries = db
+        .prepare("SELECT event_id FROM webhook_deliveries WHERE webhook_id = ? ORDER BY event_id")
+        .all(hook.id) as { event_id: string }[];
+      assert.deepEqual(
+        deliveries.map((row) => row.event_id),
+        ["charge:tx-batch:8", "charge:tx-batch:9"],
+      );
+    });
+
     test("delivers a ping signed exactly like a charge and reports status and latency", async () => {
       const hook = await dispatcher.register(merchant, "https://m.example/ping", "ping-secret");
       calls.length = 0;
@@ -288,7 +333,7 @@ describe("webhook management", () => {
       assert.equal(rest.length, 0);
       assert.deepEqual(
         { ...succeeded, id: 0, attemptedAt: 0 },
-        { id: 0, deliveryId: pending.id, eventId: "charge:tx-flaky", attempt: 2, status: "delivered", statusCode: 200, error: null, nextRetryAt: null, attemptedAt: 0 },
+        { id: 0, deliveryId: pending.id,         eventId: "charge:tx-flaky:3", attempt: 2, status: "delivered", statusCode: 200, error: null, nextRetryAt: null, attemptedAt: 0 },
       );
       assert.equal(failed!.deliveryId, pending.id);
       assert.equal(failed!.attempt, 1);
