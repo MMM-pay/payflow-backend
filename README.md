@@ -46,6 +46,8 @@ Merchant summaries and token metadata are cached to reduce repeated projection a
 
 ### The keeper is not a trust dependency
 
+
+
 `charge` is permissionless on-chain. This keeper holds no user funds and has no
 privileged role â€” it only pays the transaction fee to trigger settlement. If it
 stops running, merchants and subscribers can settle their own mandates directly.
