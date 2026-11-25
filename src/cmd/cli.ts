@@ -39,6 +39,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { networkConfigs, loadConfig, type Config, type NetworkConfig } from "../config.ts";
 import { openDatabase, readCursor, writeCursor, backupDatabase } from "../lib/db.ts";
+import { getMigrationStatus } from "../lib/migrations.ts";
 import { asStorage, openStorage, type Storage } from "../lib/store/index.ts";
 import { HttpArchive, makeRpc, type RpcLike } from "../lib/stellar.ts";
 import {
@@ -299,6 +300,17 @@ const COMMAND_LIST: CommandSpec[] = [
       "Writes a transactionally consistent snapshot of the database to",
       "`<path>` using SQLite's VACUUM INTO. The running service keeps serving",
       "requests while the backup is taken.",
+    ],
+  },
+  {
+    name: "migrations",
+    summary: "Show applied and pending database migrations",
+    usage: "migrations",
+    positionals: [],
+    options: [],
+    notes: [
+      "Reads `schema_migrations` from the configured SQLite or PostgreSQL",
+      "store and reports which versioned migrations are applied vs pending.",
     ],
   },
 ];
@@ -1448,6 +1460,33 @@ async function backupCommand(context: CommandContext): Promise<number> {
   }
 }
 
+/** Show applied and pending database migrations for the configured store. */
+async function migrationsCommand(context: CommandContext): Promise<number> {
+  const { deps, args, write } = context;
+  const openDb = deps.openDb ?? openDatabase;
+  const db = openDb(databasePath(context.network, args.options));
+  try {
+    const storage = asStorage(db);
+    const status = await getMigrationStatus(storage);
+    if (flag(args.options, "json")) {
+      write(JSON.stringify(status, null, 2));
+    } else {
+      write(`dialect: ${status.dialect}`);
+      write(`applied (${status.applied.length}):`);
+      for (const m of status.applied) {
+        write(`  v${m.version}  ${m.name}  [applied]`);
+      }
+      write(`pending (${status.pending.length}):`);
+      for (const m of status.pending) {
+        write(`  v${m.version}  ${m.name}  [pending]`);
+      }
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 /** Run one command. */
 async function runCommand(context: CommandContext): Promise<number> {
   switch (context.spec.name) {
@@ -1465,6 +1504,8 @@ async function runCommand(context: CommandContext): Promise<number> {
       return reindexCommand(context);
     case "backup":
       return backupCommand(context);
+    case "migrations":
+      return migrationsCommand(context);
     default:
       throw new CliError(`unknown command '${context.spec.name}'`);
   }
