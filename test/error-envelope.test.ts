@@ -421,10 +421,33 @@ describe("route error responses", () => {
   }
 
   test("the alias and versioned prefixes answer with the same envelope", async () => {
+    const bodies: ErrorEnvelope[] = [];
     for (const path of ["/api/mandates/999999", "/api/v1/mandates/999999"]) {
       const res = await fetch(base + path);
-      await assertErrorEnvelope(res, { status: 404, code: "mandate_not_found" }, path);
+      bodies.push(await assertErrorEnvelope(res, { status: 404, code: "mandate_not_found" }, path));
     }
+    // Identical copy, not just identical codes: the alias is the same router.
+    assert.equal(bodies[0]?.error.message, bodies[1]?.error.message);
+  });
+
+  test("a caller-supplied X-Request-Id is echoed in the envelope", async () => {
+    const res = await fetch(`${base}/api/v1/mandates/999999`, {
+      headers: { "X-Request-Id": "envelope-test" },
+    });
+    assert.equal(res.headers.get("x-request-id"), "envelope-test");
+    const body = await assertErrorEnvelope(
+      res,
+      { status: 404, code: "mandate_not_found" },
+      "supplied request id",
+    );
+    assert.equal(body.error.requestId, "envelope-test");
+  });
+
+  test("an unauthenticated admin request names the missing token, not the resource", async () => {
+    const res = await fetch(`${base}/admin/audit-logs`);
+    const body = await assertErrorEnvelope(res, { status: 401, code: "unauthorized" }, "GET /admin/audit-logs");
+    // The default copy for the code, never anything about the projection.
+    assert.doesNotMatch(body.error.message, /audit log/i);
   });
 });
 

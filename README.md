@@ -176,7 +176,6 @@ written through the same code, so it cannot drift from what the service does.
 | `due` | The mandates that are due for charging, each with the `funded` flag the last indexed vault balance gives |
 | `charge <id>` | Trigger a charge for one mandate, through the keeper |
 | `reindex` | Rebuild the projection from a ledger |
-| `check` | Validate environment, database reachability and RPC connectivity |
 
 Every command has its own help:
 
