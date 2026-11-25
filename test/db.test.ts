@@ -509,3 +509,19 @@ describe("hot-path indexes (#264)", () => {
     db.close();
   });
 });
+
+describe("openDatabase pragmas", () => {
+  test("enables WAL mode on file-backed databases and sets busy_timeout", () => {
+    const dir = mkdtempSync(join(tmpdir(), "payflow-db-pragma-"));
+    try {
+      const db = openDatabase(join(dir, "test.db"));
+      const journalMode = db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
+      const busyTimeout = db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+      assert.equal(journalMode.journal_mode, "wal");
+      assert.equal(busyTimeout.timeout, 5000);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
