@@ -469,7 +469,7 @@ export class WebhookDispatcher {
     );
     if (!webhook) return null;
     const payload = JSON.stringify({ event: "ping", webhook_id: id, merchant });
-    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, randomUUID(), payload);
+    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, payload);
     if (!delivery) throw new Error("webhook ping unexpectedly matched an existing event");
     return { deliveryId: delivery.id, ...(await this.attempt(delivery, webhook)) };
   }
@@ -664,7 +664,7 @@ export class WebhookDispatcher {
   /** One pending delivery and a first attempt per webhook, under one idempotency key. */
   private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
     for (const webhook of webhooks) {
-      const delivery = await this.enqueue(webhook.id, eventId, randomUUID(), payload);
+      const delivery = await this.enqueue(webhook.id, eventId, payload);
       if (delivery) await this.attempt(delivery, webhook);
     }
   }
@@ -675,6 +675,7 @@ export class WebhookDispatcher {
     eventId: string,
     payload: string,
   ): Promise<DeliveryRow | null> {
+    const idempotencyKey = idempotencyKeyFor(webhookId, eventId);
     const now = Math.floor(Date.now() / 1000);
     return this.db.transaction(async (storage) => {
       const receipt = await storage.get<{ event_key: string }>(

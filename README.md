@@ -1222,7 +1222,7 @@ examined without API downtime.
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
 | `API_RATE_LIMIT_MAX` | `120` | Maximum requests per IP in each API rate-limit window |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus metrics at `/metrics` |
-| `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
+| `CORS_ORIGIN` | *(empty)* | Comma-separated exact browser origins allowed to call the API (`https://app.example`). Empty refuses cross-origin reads; `*` allows every origin. SEP-10 always answers `*` |
 | `REQUIRE_HTTPS` | on when `NODE_ENV=production` | Reject plaintext requests with `403 forbidden`, judged by the proxy's `X-Forwarded-Proto`. `/health`, `/ready` and `/metrics` are exempt for platform probes |
 | `HSTS_MAX_AGE_S` | `31536000` | `Strict-Transport-Security` max-age (with `includeSubDomains`); `0` drops the header |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |

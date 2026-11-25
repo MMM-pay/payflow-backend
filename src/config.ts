@@ -359,7 +359,25 @@ const schema = z.object({
    */
   DATABASE_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   DATABASE_PATH: z.string().default("./payflow.db"),
-  CORS_ORIGIN: z.string().default("*"),
+  /**
+   * Comma-separated exact origins a browser may call the API from. Empty
+   * (the default) allows none; `*` allows every origin. Validated at startup
+   * so a typo fails the boot instead of silently matching no request.
+   */
+  CORS_ORIGIN: z
+    .string()
+    .default("")
+    .transform((value, ctx) => {
+      try {
+        return corsOrigins(value);
+      } catch (err) {
+        ctx.addIssue({
+          code: "custom",
+          message: err instanceof Error ? err.message : "invalid origin list",
+        });
+        return z.NEVER;
+      }
+    }),
   /** Read only to pick the `REQUIRE_HTTPS` default. */
   NODE_ENV: z.string().default("development"),
   /**

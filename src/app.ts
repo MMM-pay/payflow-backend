@@ -345,12 +345,29 @@ export function createApp(
   const app = express();
 
   app.set("trust proxy", 1);
+  // Security headers on every response, including errors: a strict CSP,
+  // `nosniff` (a JSON body must never be sniffed as HTML), frame denial (the
+  // header and the CSP's `frame-ancestors`), no referrer, HSTS and the
+  // cross-origin isolation headers. `helmet()` alone would leave the policy
+  // implicit; spelling it out keeps the JSON API and the docs page on the
+  // same, auditable baseline.
+  //
   // HSTS tells browsers to use HTTPS for every later request (#277). The
-  // header is ignored over plaintext, so sending it unconditionally is safe.
+  // header is ignored over plaintext, so sending it unconditionally is safe;
+  // `HSTS_MAX_AGE_S=0` turns it off for a deployment served without TLS.
+  app.disable("x-powered-by");
   const hstsMaxAge = config.HSTS_MAX_AGE_S ?? 31_536_000;
   app.use(
     helmet({
+      contentSecurityPolicy: { useDefaults: false, directives: CSP_DIRECTIVES },
+      crossOriginOpenerPolicy: { policy: "same-origin" },
+      crossOriginResourcePolicy: { policy: "same-origin" },
+      referrerPolicy: { policy: "no-referrer" },
       strictTransportSecurity: hstsMaxAge > 0 ? { maxAge: hstsMaxAge, includeSubDomains: true } : false,
+      xContentTypeOptions: true,
+      xDnsPrefetchControl: { allow: false },
+      xFrameOptions: { action: "deny" },
+      xPermittedCrossDomainPolicies: { permittedPolicies: "none" },
     }),
   );
   if (config.REQUIRE_HTTPS === true) {

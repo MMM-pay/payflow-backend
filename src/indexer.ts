@@ -71,6 +71,18 @@ const RETAIN_CHUNK = 200;
 /** Ledgers between two `indexer progress` log lines when none is configured. */
 const DEFAULT_PROGRESS_LEDGERS = 10_000;
 
+/**
+ * The stable identity of a raw delivery: the RPC event id when it has one,
+ * otherwise the same ledger/tx/topic/value digest the `events` table keys on.
+ * A replayed window carries the same id, which is what makes it detectable.
+ */
+function eventIdOf(raw: rpc.Api.EventResponse): string {
+  return (
+    raw.id ??
+    `${raw.ledger}:${raw.txHash}:${raw.topic.map((topic) => topic.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`
+  );
+}
+
 /** The RPC calls the indexer makes. Narrow so tests can supply a fake. */
 export type IndexerRpc = Pick<rpc.Server, "getLatestLedger" | "getHealth" | "getEvents">;
 
@@ -601,12 +613,17 @@ export class Indexer {
         let windowMismatched = 0;
         const notifications: DecodedEvent[] = [];
         for (const ledgerEvents of groupByLedger(result.value)) {
-          await this.retainAll(ledgerEvents, storage);
+          const firstDeliveries = await this.retainAll(ledgerEvents, storage);
           for (const raw of ledgerEvents) {
             const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
             if (ct !== null) lastSeenCloseTime = ct;
             const decoded = decodeEvent(raw);
             if (!decoded) continue;
+            // The event was already retained — and projected, in the transaction
+            // that stored it — so this is a redelivery from an overlapping
+            // window or a rewound cursor. Applying it again would inflate the
+            // applied metric and could notify a webhook twice, so it is dropped.
+            if (!firstDeliveries.has(eventIdOf(raw))) continue;
             if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
             else windowMismatched += 1;
           }
@@ -648,18 +665,30 @@ export class Indexer {
    * (#247). The row is unchanged — same event id, same XDR payload — and
    * `INSERT OR IGNORE` keeps a replay idempotent, whichever chunk a repeated
    * event lands in.
+   *
+   * Returns the ids this delivery actually added. An id already present in the
+   * `events` table means the event was projected in the transaction that
+   * retained it, so the caller can drop the duplicate instead of applying and
+   * counting it again (#243).
    */
   private async retainAll(
     events: readonly rpc.Api.EventResponse[],
     storage: Storage = this.db,
-  ): Promise<void> {
+  ): Promise<Set<string>> {
+    const firstDeliveries = new Set<string>();
     for (let i = 0; i < events.length; i += RETAIN_CHUNK) {
       const chunk = events.slice(i, i + RETAIN_CHUNK);
+      const ids = chunk.map(eventIdOf);
+      const existing = await storage.all<{ event_id: string }>(
+        `SELECT event_id FROM events WHERE event_id IN (${ids.map(() => "?").join(", ")})`,
+        ids,
+      );
+      const retained = new Set(existing.map((row) => row.event_id));
       const values = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
       const parameters = chunk.flatMap((raw) => {
         const topics = raw.topic.map((topic) => topic.toXDR("base64"));
         return [
-          raw.id ?? `${raw.ledger}:${raw.txHash}:${topics.join(":")}:${raw.value.toXDR("base64")}`,
+          eventIdOf(raw),
           raw.contractId?.toString() ?? "",
           raw.ledger,
           raw.txHash,
@@ -675,7 +704,11 @@ export class Indexer {
          VALUES ${values}`,
         parameters,
       );
+      for (const id of ids) {
+        if (!retained.has(id)) firstDeliveries.add(id);
+      }
     }
+    return firstDeliveries;
   }
 
   /** Rebuild event-derived projections locally, without querying RPC. */
