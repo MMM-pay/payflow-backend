@@ -845,6 +845,44 @@ Every delivery is a `POST` to the registered URL carrying:
 - The charge event as a JSON body (`event`, `mandate_id`, `subscriber`,
   `merchant`, `amount`, `fee`, `ledger`).
 
+Verify the signature against the exact raw request bytes before parsing the
+JSON. During secret rotation the header contains one signature per active
+secret; accepting any valid value lets a receiver switch secrets without
+missing deliveries:
+
+```js
+import express from "express";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const app = express();
+const webhookSecret = process.env.PAYFLOW_WEBHOOK_SECRET;
+if (!webhookSecret) throw new Error("PAYFLOW_WEBHOOK_SECRET is required");
+
+function verifyWebhook(rawBody, header, secret) {
+  if (!Buffer.isBuffer(rawBody) || typeof header !== "string") return false;
+  const expected = createHmac("sha256", secret).update(rawBody).digest();
+  return header.split(",").some((part) => {
+    const match = /^\s*sha256=([0-9a-f]{64})\s*$/i.exec(part);
+    if (!match) return false;
+    const supplied = Buffer.from(match[1], "hex");
+    return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  });
+}
+
+app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  if (!verifyWebhook(req.body, req.get("Payflow-Signature"), webhookSecret)) {
+    return res.sendStatus(401);
+  }
+  const event = JSON.parse(req.body.toString("utf8"));
+  // Process the verified event; use Idempotency-Key to collapse retries.
+  res.sendStatus(204);
+});
+```
+
+Keep the secret out of logs and source control. Reject the request when
+verification fails; do not parse or process it first. The same delivery keeps
+its `Idempotency-Key` across retries, so handlers should deduplicate that key.
+
 Failing deliveries retry with exponential backoff (1 minute, doubling, up to
 six hours) for at most five attempts. A webhook that gives up is marked
 failed and stops receiving deliveries until re-registered. Undelivered
@@ -1078,6 +1116,7 @@ examined without API downtime.
 | `KEEPER_CHANNEL_SECRETS` | *(empty)* | Extra `S...` channel keys, comma-separated: each settles in parallel with its own sequence and fees; see [Settling in parallel with channel accounts](#settling-in-parallel-with-channel-accounts) |
 | `KEEPER_CONCURRENCY` | *(one per channel)* | Most settlement transactions in flight at once (at least 1). May not exceed the number of channels (`KEEPER_SECRET` plus distinct `KEEPER_CHANNEL_SECRETS`); a larger value fails startup. See [the concurrency cap](#the-concurrency-cap-and-double-settlement) |
 | `KEEPER_CLAIM_TTL_S` | `300` | Seconds a keeper's claim on a due charge lasts (at least 60); a claim left by a crashed keeper lapses after this |
+| `KEEPER_CHANNEL_MIN_XLM` | `2` | Minimum total XLM balance to keep a channel account in rotation; at most 7 decimal places. Raise it for additional account reserves or fee headroom |
 | `KEEPER_INTERVAL_MS` | `60000` | Settlement poll interval |
 | `KEEPER_ORDER` | `oldest` | Order for due mandates: `oldest` (due date ascending) or `largest` (amount descending) |
 | `KEEPER_MERCHANTS` | *(empty)* | Only settle mandates payable to these merchants, comma-separated `G...` addresses. Empty settles every merchant |

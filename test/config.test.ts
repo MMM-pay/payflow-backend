@@ -167,6 +167,25 @@ describe("keeper channel secrets", () => {
   });
 });
 
+describe("keeper channel balance threshold", () => {
+  test("defaults to two XLM and accepts up to seven decimal places", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_CHANNEL_MIN_XLM, "2");
+    assert.equal(
+      loadConfig({ ...BASE, KEEPER_CHANNEL_MIN_XLM: "0.0000001" }).KEEPER_CHANNEL_MIN_XLM,
+      "0.0000001",
+    );
+  });
+
+  test("rejects malformed or over-precise XLM balances", () => {
+    for (const value of ["-1", "1e2", "0.00000001", "1."]) {
+      assert.throws(
+        () => loadConfig({ ...BASE, KEEPER_CHANNEL_MIN_XLM: value }),
+        /KEEPER_CHANNEL_MIN_XLM/,
+      );
+    }
+  });
+});
+
 describe("keeper concurrency cap (KEEPER_CONCURRENCY)", () => {
   const primary = Keypair.random().secret();
   const channelB = Keypair.random().secret();

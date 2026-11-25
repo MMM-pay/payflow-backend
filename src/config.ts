@@ -101,6 +101,14 @@ const schema = z.object({
           .refine(StrKey.isValidEd25519SecretSeed, "must be a valid Stellar secret seed"),
       ),
     ),
+  /** Skip a keeper channel below this total XLM reserve and fee cushion. */
+  KEEPER_CHANNEL_MIN_XLM: z
+    .string()
+    .regex(
+      /^(?:0|[1-9]\d*)(?:\.\d{1,7})?$/,
+      "must be a non-negative XLM amount with at most 7 decimal places",
+    )
+    .default("2"),
   /**
    * Most settlement transactions one pass keeps in flight at once (#249).
    * Each in-flight transaction leases its own channel account, so the cap can

@@ -283,6 +283,55 @@ describe("keeper concurrency cap (#249)", () => {
   });
 });
 
+describe("keeper channel XLM health (#252)", () => {
+  test("routes due charges away from a channel below the configured balance threshold", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1);
+    const channelKeys = keys(2);
+    const t = trace();
+    const server = fakeNode(t);
+    let balanceReads = 0;
+    server.getLedgerEntries = async () => ({
+      entries: [{
+        val: {
+          type: "account",
+          account: { balance: balanceReads++ === 0 ? 5_000_000n : 20_000_000n },
+        },
+      }],
+      latestLedger: 1,
+    }) as never;
+    const keeper = new Keeper(db, server, channelConfig(channelKeys));
+
+    const results = await keeper.tick(NOW);
+
+    assert.equal(results[0]!.status, "settled");
+    assert.deepEqual(t.sends.map((send) => send.source), [channelKeys[1]!.publicKey()]);
+    db.close();
+  });
+
+  test("does not submit from channels confirmed below the minimum when none are healthy", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1);
+    const t = trace();
+    const server = fakeNode(t);
+    server.getLedgerEntries = async () => ({
+      entries: [{
+        val: { type: "account", account: { balance: 5_000_000n } },
+      }],
+      latestLedger: 1,
+    }) as never;
+    const keeper = new Keeper(db, server, channelConfig(keys(1)));
+
+    assert.deepEqual(await keeper.tick(NOW), []);
+    assert.deepEqual(t.sends, []);
+    assert.equal(
+      db.prepare("SELECT COUNT(*) AS n FROM charge_attempts").get()?.n,
+      0,
+    );
+    db.close();
+  });
+});
+
 describe("keeper channel exclusivity (#249)", () => {
   test("no channel ever has two transactions in flight, and channels are reused after completion", async () => {
     const db = openDatabase(":memory:");
@@ -596,7 +645,7 @@ describe("keeper failure isolation (#249)", () => {
 
     assert.equal(results[0]!.status, "settled");
     assert.equal(t.sends.length, 2, "one refused submission, one accepted");
-    assert.equal(t.getAccounts.length, 2, "the account was re-read before the resubmission");
+    assert.equal(t.getAccounts.length, 2, "the account is re-read before the resubmission");
     assert.deepEqual(t.collisions, []);
     db.close();
   });

@@ -637,7 +637,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["webhooks"],
         summary: "Register a webhook for charge events",
         description:
-          "Registers a URL to receive signed POSTs when one of the merchant's mandates charges. The caller proves control of the merchant's Stellar address with an ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`; the returned secret is used to verify the `Payflow-Signature` header on deliveries.",
+          "Registers a URL to receive signed POSTs when one of the merchant's mandates charges. The caller proves control of the merchant's Stellar address with an ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`; the returned secret is used to verify the `Payflow-Signature` header on deliveries. Compute HMAC-SHA256 over the exact raw request body bytes and compare it with each `sha256=<hex>` value in the comma-separated header using a constant-time comparison. During secret rotation, accept a matching signature under either active secret.",
         operationId: `registerWebhook${operationSuffix(root)}`,
         requestBody: {
           required: true,

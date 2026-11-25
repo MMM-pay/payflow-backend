@@ -5,6 +5,7 @@ import {
   BASE_FEE,
   Contract,
   Keypair,
+  StrKey,
   TransactionBuilder,
   nativeToScVal,
   rpc,
@@ -65,6 +66,7 @@ const DEFAULT_CLAIM_TTL_S = 300;
  * off) instead of looping.
  */
 const BAD_SEQ_RETRIES = 2;
+const XLM_STROOPS = 10_000_000n;
 
 /**
  * Whether a failed submission was refused for a stale sequence number: the
@@ -107,6 +109,11 @@ function hostErrorCode(message: string): string | undefined {
 function isKeyFailure(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /not found|no such account|missing source|not funded/i.test(message);
+}
+
+function xlmToStroops(amount: string): bigint {
+  const [whole, fraction = ""] = amount.split(".");
+  return BigInt(whole!) * XLM_STROOPS + BigInt(fraction.padEnd(7, "0"));
 }
 
 function isCongestionFailure(err: unknown): boolean {
@@ -223,6 +230,8 @@ export interface Channel {
   active: number;
 }
 
+type ChannelBalance = { kind: "available"; stroops: bigint } | { kind: "missing" };
+
 /**
  * Settles mandates that have fallen due.
  *
@@ -266,10 +275,9 @@ export interface Channel {
  * Due mandates are pulled from one shared queue by one worker per channel
  * (see `tick`): distribution is dynamic, one slow channel cannot stall the
  * others, and with a single channel the pass is exactly the old sequential
- * loop. Before distributing, each channel's account is checked with one
- * `getAccount` (only when several channels are configured); an unusable
- * channel is dropped for the pass, logged by public key, so its mandates
- * settle through the live channels instead of backing off against a dead key.
+ * loop. Before distributing, each channel's account and native XLM balance
+ * are checked; a channel below `KEEPER_CHANNEL_MIN_XLM` rotates to its standby
+ * or is dropped for the pass so mandates use healthier channels instead.
  *
  * ### Bounded worker pool (#249)
  *
@@ -339,6 +347,7 @@ export class Keeper {
   private readonly backoff = new Map<number, { failures: number; retryAt: number }>();
   /** Told when a mandate starts or ends a failing streak; see the class notes. */
   private readonly onStreak: ((event: ChargeStreakEvent) => Promise<void>) | undefined;
+  private warnedMissingBalanceReader = false;
   /**
    * Signing lanes, primary first: `channels[0]` is `KEEPER_SECRET` (with
    * `KEEPER_SECRET_NEXT` as its standby in the same lane), every entry from
@@ -925,51 +934,112 @@ export class Keeper {
 
   /**
    * The channels this pass may distribute due mandates over: every configured
-   * channel whose signing account can pay, checked once per pass with a single
-   * `getAccount` each (and only when several channels are configured). A
-   * channel that cannot pay is dropped for the pass — logged by public key,
+   * channel whose signing account exists and has enough XLM to meet its
+   * configured minimum balance, checked once per pass. A channel that cannot
+   * pay is dropped for the pass — logged by public key,
    * never a secret — so its mandates settle through the live channels instead
    * of backing off against a dead key. A *transient* RPC error keeps the
    * channel: `settle` will fail the mandate and the usual backoff retries it
-   * on the next pass, never crashing the loop. If every channel looks unusable
-   * (an RPC outage misread as dead accounts), all of them are kept and
-   * per-mandate failure decides, exactly like the single-key path.
+   * on the next pass, never crashing the loop. If every channel is below the
+   * configured balance threshold, none is submitted; missing accounts retain
+   * the existing per-mandate failure and backoff behavior.
    */
   private async distributableChannels(): Promise<Channel[]> {
-    if (this.channels.length === 1) return this.channels;
     const checked = await Promise.all(
       this.channels.map(async (channel) => {
-        if (await this.canSign(channel)) return channel;
-        const unusable = channel.keys[channel.active]!.publicKey();
-        logger.warn(
-          { channel: unusable },
-          "keeper channel key cannot pay; skipping this channel for the pass",
-        );
-        return null;
+        const health = await this.canSign(channel);
+        if (health !== "usable") {
+          const unusable = channel.keys[channel.active]!.publicKey();
+          logger.warn(
+            { channel: unusable, health },
+            "keeper channel key cannot pay; skipping this channel for the pass",
+          );
+        }
+        return { channel, health };
       }),
     );
-    const usable = checked.filter((channel): channel is Channel => channel !== null);
-    return usable.length > 0 ? usable : this.channels;
+    const usable = checked.filter(({ health }) => health === "usable");
+    if (usable.length > 0) return usable.map(({ channel }) => channel);
+    // Preserve the established per-mandate failure/backoff path for missing
+    // accounts, but never fall back to channels confirmed below the threshold.
+    return checked
+      .filter(({ health }) => health !== "low_balance")
+      .map(({ channel }) => channel);
   }
 
   /**
-   * Whether the channel's active key can pay for a transaction, rotating to
-   * its standby first when the active key cannot — the same rotation
-   * `settle` performs mid-pass, done up front here so an unused channel never
-   * strands its standby. A non-key failure (RPC hiccup) answers `true`: the
-   * channel stays and the mandate's own error handling takes over.
+   * Check the active key's account and balance, rotating to its standby first
+   * when either is unusable. A transient RPC failure keeps the channel in
+   * rotation so normal transaction handling can apply its usual backoff.
    */
-  private async canSign(channel: Channel): Promise<boolean> {
+  private async canSign(channel: Channel): Promise<"usable" | "low_balance" | "unusable"> {
     for (;;) {
       const key = channel.keys[channel.active]!;
       try {
-        await this.server.getAccount(key.publicKey());
-        return true;
+        const balance = await this.channelBalance(key);
+        const minimum = xlmToStroops(this.config.KEEPER_CHANNEL_MIN_XLM ?? "1");
+        if (balance?.kind === "missing") {
+          if (this.rotateToStandby(channel)) continue;
+          return "unusable";
+        }
+        if (balance?.kind === "available" && balance.stroops < minimum) {
+          logger.warn(
+            {
+              channel: key.publicKey(),
+              balanceStroops: balance.stroops.toString(),
+              minimumXlm: this.config.KEEPER_CHANNEL_MIN_XLM ?? "1",
+            },
+            "keeper channel XLM balance is below the minimum",
+          );
+          if (this.rotateToStandby(channel)) continue;
+          return "low_balance";
+        }
+        if (balance === null && this.channels.length > 1) {
+          await this.server.getAccount(key.publicKey());
+        }
+        return "usable";
       } catch (err) {
-        if (!isKeyFailure(err)) return true;
+        if (!isKeyFailure(err)) return "usable";
         if (this.rotateToStandby(channel)) continue;
-        return false;
+        return "unusable";
       }
+    }
+  }
+
+  /** Native XLM balance in stroops, or null when the RPC cannot read it. */
+  private async channelBalance(key: Keypair): Promise<ChannelBalance | null> {
+    if (!this.server.getLedgerEntries) {
+      if (!this.warnedMissingBalanceReader) {
+        this.warnedMissingBalanceReader = true;
+        logger.warn(
+          "keeper RPC does not support account balance reads; channel balance checks are disabled",
+        );
+      }
+      return null;
+    }
+    try {
+      const ledgerKey = xdr.LedgerKey.account(
+        new xdr.LedgerKeyAccount({
+          accountId: xdr.PublicKey.publicKeyTypeEd25519(
+            StrKey.decodeEd25519PublicKey(key.publicKey()),
+          ),
+        }),
+      );
+      const response = await this.server.getLedgerEntries(ledgerKey);
+      const account = response.entries[0]?.val;
+      if (!account) return { kind: "missing" };
+      return account.type === "account"
+        ? { kind: "available", stroops: account.account.balance }
+        : null;
+    } catch (err) {
+      logger.warn(
+        {
+          channel: key.publicKey(),
+          error: this.scrubError(err instanceof Error ? err.message : String(err)),
+        },
+        "keeper channel XLM balance unavailable; keeping channel for this pass",
+      );
+      return null;
     }
   }
 

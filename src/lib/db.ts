@@ -223,6 +223,19 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS webhook_deliveries_webhook ON webhook_deliveries(webhook_id);
 CREATE INDEX IF NOT EXISTS webhook_deliveries_due ON webhook_deliveries(status, retry_at);
 
+CREATE TABLE IF NOT EXISTS webhook_event_receipts (
+  webhook_id INTEGER NOT NULL,
+  event_key  TEXT    NOT NULL,
+  PRIMARY KEY (webhook_id, event_key)
+);
+INSERT OR IGNORE INTO webhook_event_receipts (webhook_id, event_key)
+  SELECT webhook_id,
+         CASE WHEN json_extract(payload, '$.event') = 'charged'
+              THEN event_id || ':' || json_extract(payload, '$.mandate_id')
+              ELSE event_id END
+    FROM webhook_deliveries
+   WHERE NOT EXISTS (SELECT 1 FROM webhook_event_receipts);
+
 -- Delivery history: one row per HTTP attempt, so a delivery that failed and
 -- then succeeded shows both. Pruned to the newest 100 rows per webhook on
 -- every insert; the index serves both the prune and the newest-first read.
