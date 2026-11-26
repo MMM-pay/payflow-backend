@@ -38,7 +38,7 @@ export type KeeperRpc = Pick<
   | "sendTransaction"
   | "getTransaction"
 > &
-  Partial<Pick<rpc.Server, "simulateTransaction">>;
+  Partial<Pick<rpc.Server, "simulateTransaction" | "getLedgerEntries">>;
 
 /** Where failover currently stands; reported by /health. */
 export interface RpcStatus {

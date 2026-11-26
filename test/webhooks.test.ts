@@ -64,6 +64,7 @@ describe("webhooks", () => {
   const merchant = merchantKey.publicKey();
   const url = "https://payflow.example/webhooks";
   const secret = "test-webhook-secret";
+  const deliveryToken = "test-webhook-delivery-token";
 
   let db: ReturnType<typeof openDatabase>;
   let ix: Indexer;
@@ -100,6 +101,17 @@ describe("webhooks", () => {
         }
       }
       calls.push({ url: urlStr, headers, body: typeof init?.body === "string" ? init.body : "" });
+      if (urlStr.includes("/sensitive-error")) {
+        throw new Error(`request failed for ${urlStr} with ${secret} and ${deliveryToken}`);
+      }
+      if (urlStr.includes("/sensitive-response")) {
+        return {
+          status: 200,
+          ok: true,
+          text: async () => `${secret} ${deliveryToken}`,
+          json: async () => ({ ok: true }),
+        } as unknown as Response;
+      }
       if (urlStr.includes("/failing")) throw new Error("down");
       return {
         status: 200,
@@ -282,6 +294,70 @@ describe("webhooks", () => {
       .update(call.body)
       .digest("hex");
     assert.equal(call.headers["payflow-signature"], `sha256=${expected}`);
+  });
+
+  test("delivery history never records receiver bodies or transport errors", async () => {
+    const bodyHook = await dispatcher.register(
+      merchant,
+      "https://payflow.example/sensitive-response",
+      secret,
+    );
+    await dispatcher.ping(merchant, bodyHook.id);
+
+    const bodyRow = db.prepare(
+      "SELECT response_body, error FROM webhook_deliveries WHERE webhook_id = ?",
+    ).get(bodyHook.id) as { response_body: string | null; error: string | null };
+    assert.equal(bodyRow.response_body, null);
+    assert.equal(bodyRow.error, null);
+
+    const errorHook = await dispatcher.register(
+      merchant,
+      `https://payflow.example/sensitive-error?token=${deliveryToken}`,
+      secret,
+    );
+    const outcome = await dispatcher.ping(merchant, errorHook.id);
+    assert.ok(outcome);
+    assert.equal(outcome.error, "delivery request failed");
+
+    const errorRow = db.prepare(
+      "SELECT response_body, error FROM webhook_deliveries WHERE webhook_id = ?",
+    ).get(errorHook.id) as { response_body: string | null; error: string | null };
+    assert.equal(errorRow.response_body, null);
+    assert.equal(errorRow.error, "delivery request failed");
+
+    const timestamp = nowSec();
+    const proof = `payflow-webhook-deliveries:v1:${merchant}:${errorHook.id}:${timestamp}`;
+    const query = new URLSearchParams({
+      merchant,
+      timestamp: String(timestamp),
+      signature: signMessage(proof, seed),
+    });
+    const historyUrl = `${base}/api/webhooks/${errorHook.id}/deliveries?${query}`;
+    const unauthorized = await fetch(
+      `${base}/api/webhooks/${errorHook.id}/deliveries?merchant=${merchant}`,
+    );
+    assert.equal(unauthorized.status, 400);
+    const invalidProof = new URLSearchParams({
+      merchant,
+      timestamp: String(timestamp),
+      signature: signMessage(proof, StrKey.encodeEd25519SecretSeed(crypto.getRandomValues(new Uint8Array(32)))),
+    });
+    assert.equal(
+      (await fetch(`${base}/api/webhooks/${errorHook.id}/deliveries?${invalidProof}`)).status,
+      401,
+    );
+
+    const response = await fetch(historyUrl);
+    assert.equal(response.status, 200);
+    const historyText = await response.text();
+    assert.equal(historyText.includes(secret), false);
+    assert.equal(historyText.includes(deliveryToken), false);
+    const history = JSON.parse(historyText) as {
+      deliveries: Array<{ error: string | null }>;
+    };
+    assert.equal(history.deliveries[0]!.error, "delivery request failed");
+    await dispatcher.deactivate(merchant, bodyHook.id);
+    await dispatcher.deactivate(merchant, errorHook.id);
   });
 
   test("delivery retries with backoff and gives up after five attempts", async () => {

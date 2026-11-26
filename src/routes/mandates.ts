@@ -22,6 +22,7 @@ import {
   limitSchema,
   mandateStatusSchema,
   present,
+  queryOnly,
   validate,
 } from "./validate.ts";
 import type {
@@ -57,7 +58,7 @@ function parseIds(raw: unknown): { ids: number[]; tooMany: boolean } | null {
 export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Router {
   const r = Router();
 
-  r.get("/mandates", async (req, res) => {
+  r.get("/mandates", queryOnly("ids", "subscriber", "merchant", "status", "cursor", "limit"), async (req, res) => {
     const { ids } = req.query;
     let parsedIds: number[] | undefined;
     if (ids !== undefined) {
@@ -131,7 +132,7 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
     res.json(body);
   });
 
-  r.get("/mandates/:id", async (req, res) => {
+  r.get("/mandates/:id", queryOnly(), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
 
@@ -144,7 +145,7 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
     res.json({ ...row, ...(await tokenFields(tokens, tokenId)) });
   });
 
-  r.get("/mandates/:id/timeline", async (req, res) => {
+  r.get("/mandates/:id/timeline", queryOnly(), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     if (!(await getMandateById(db, id.value))) {
@@ -161,7 +162,7 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
     }));
     res.json({ events });
   });
-  r.get("/mandates/:id/charges", async (req, res) => {
+  r.get("/mandates/:id/charges", queryOnly("limit", "from", "to"), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
@@ -203,7 +204,7 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
    * ended, the error code and transaction hash, and the backoff that
    * followed. Answers "why wasn't I charged?" for 90 days back.
    */
-  r.get("/mandates/:id/attempts", async (req, res) => {
+  r.get("/mandates/:id/attempts", queryOnly("limit"), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
@@ -229,7 +230,7 @@ export function mandatesRouter(db: Storage, tokens: TokenMetadataService): Route
    * settles — but it is enough to tell a mandate that is merely due from one
    * that is waiting for a top-up.
    */
-  r.get("/due", async (req, res) => {
+  r.get("/due", queryOnly("limit"), async (req, res) => {
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
     if (!limit.ok) return;
 

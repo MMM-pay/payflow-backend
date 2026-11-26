@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
+import { StrKey } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
@@ -18,10 +19,10 @@ const TESTNET = "Test SDF Network ; September 2015";
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
 // A USDC-style contract id (56 chars) that the fake reader recognises.
-const USDC = "CCW67TSZV3SSS2HXMBQ5JFGHPJDUIVAPHCIMTQWGLP3OK53N2OQ6TQ7N";
+const USDC = "CDQ5EJTVXXX2CBMHWP3BGGUDHSK6D4I25IF5XXH3QGL2TNTBMJUOFKDB";
 // A well-formed contract id the fake reader refuses, standing in for an
 // unreachable token.
-const UNKNOWN = "C" + "D".repeat(55);
+const UNKNOWN = StrKey.encodeContract(Buffer.alloc(32, 1));
 
 const config = {
   STELLAR_NETWORK: "testnet",
@@ -115,9 +116,11 @@ describe("GET /api/tokens/:id", () => {
   });
 
   test("a malformed contract id is a 400", async () => {
+    const before = reads;
     const { status, body } = await get("/api/tokens/not-a-token");
     assert.equal(status, 400);
     assert.equal((body.error as unknown as { code: string }).code, "invalid_token_id");
+    assert.equal(reads, before, "invalid ids never reach the token reader");
   });
 
   test("an unreadable token is a 502 and is retried next request", async () => {

@@ -83,8 +83,11 @@ describe("scoped admin tokens", () => {
     };
     assert.throws(() => loadConfig({ ...base, ADMIN_TOKENS: "not json" }));
     assert.throws(() => loadConfig({ ...base, ADMIN_TOKENS: '[{"token":"short"}]' }));
+    assert.throws(() => loadConfig({ ...base, ADMIN_TOKENS: '[{"token":"a-long-enough-token-1","unexpected":true}]' }));
     const ok = loadConfig({ ...base, ADMIN_TOKENS: '[{"token":"a-long-enough-token-1","scopes":["keeper"]}]' });
     assert.equal((ok.ADMIN_TOKENS as AdminToken[])[0]!.scopes![0], "keeper");
+    assert.equal(loadConfig({ ...base, ADMIN_TOKEN: "" }).ADMIN_TOKEN, undefined);
+    assert.throws(() => loadConfig({ ...base, ADMIN_TOKEN: "short" }), /ADMIN_TOKEN/);
   });
 });
 

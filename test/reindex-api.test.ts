@@ -164,7 +164,29 @@ function withoutRequestIds(value: unknown): unknown {
   return value;
 }
 
-test("API responses survive projection rebuild and a full reindex", async () => {
+function projectionSnapshot(db: ReturnType<typeof openDatabase>): Record<string, Record<string, unknown>[]> {
+  const tables = [
+    "plans",
+    "plan_subscriber_counts",
+    "plan_active_subscribers",
+    "mandates",
+    "charges",
+    "vault_events",
+    "fee_history",
+    "mandate_events",
+    "mandate_timeline",
+    "contract_upgrades",
+    "merchant_profiles",
+  ];
+  return Object.fromEntries(tables.map((table) => {
+    // eslint-disable-next-line no-restricted-syntax -- table is a vetted static name from the closed list above
+    const rows = db.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
+    rows.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    return [table, rows];
+  }));
+}
+
+test("projection rebuild rolls back a mid-replay failure, resumes after repair, and survives a full reindex", async () => {
   const directory = mkdtempSync(join(tmpdir(), "payflow-api-reindex-"));
   const databasePath = join(directory, "payflow.db");
   const network: NetworkConfig = {
@@ -190,6 +212,15 @@ test("API responses survive projection rebuild and a full reindex", async () => 
   let app: Awaited<ReturnType<typeof serve>> | undefined;
 
   try {
+    const incremental = openDatabase(":memory:");
+    let expectedProjection: Record<string, Record<string, unknown>[]>;
+    try {
+      await new Indexer(incremental, rpc, network).catchUp();
+      expectedProjection = projectionSnapshot(incremental);
+    } finally {
+      incremental.close();
+    }
+
     const initial = await reindex(network, rpc, new Date("2026-01-01T00:00:00Z"));
     assert.equal(initial.backup, null);
     assert.equal(initial.events, 3);
@@ -215,7 +246,7 @@ test("API responses survive projection rebuild and a full reindex", async () => 
 
     db.prepare(`INSERT INTO events
       (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
-      VALUES ('corrupt-event', ?, 99, 'tx-corrupt', '', '["not-xdr"]', 'not-xdr', NULL)`)
+      VALUES ('corrupt-event', ?, 104, 'tx-corrupt', '', '["not-xdr"]', 'not-xdr', NULL)`)
       .run(CONTRACT);
     const failedRebuild = await fetch(`${app.base}/admin/reindex`, {
       method: "POST",
@@ -248,6 +279,11 @@ test("API responses survive projection rebuild and a full reindex", async () => 
     db = openDatabase(databasePath);
     app = await serve(db, config);
     assert.deepEqual(await apiSnapshot(app.base), before, "API data is unchanged after a full reindex from the start ledger");
+    assert.deepEqual(
+      projectionSnapshot(db),
+      expectedProjection,
+      "every event-derived projection matches the independently incrementally built database",
+    );
   } finally {
     await app?.close();
     db?.close();

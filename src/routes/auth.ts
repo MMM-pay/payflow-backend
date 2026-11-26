@@ -7,7 +7,7 @@ import type { RpcLike } from "../lib/stellar.ts";
 import type { Storage } from "../lib/store/types.ts";
 import type { AuthChallengeResponse, AuthTokenResponse } from "./types.ts";
 import { sendApiError } from "./errors.ts";
-import { validate, type Validated } from "./validate.ts";
+import { queryOnly, validate, type Validated } from "./validate.ts";
 
 /**
  * SEP-10 sign-in (https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md).
@@ -90,7 +90,11 @@ export interface Sep10Options {
   /** The JWT `iss`: this network's auth endpoint, so a token is valid on that network only. */
   issuer: string;
   tokenTtlS: number;
+  /** Lifetime of a refresh token in seconds. */
+  refreshTtlS: number;
   loadAccount: AccountLoader;
+  /** Persistence for refresh-token hashes. */
+  db: Storage;
 }
 
 const claimsSchema = z.object({
@@ -115,7 +119,9 @@ export class Sep10Auth {
   readonly #jwtKey: Buffer;
   private readonly issuer: string;
   private readonly tokenTtlS: number;
+  private readonly refreshTtlS: number;
   private readonly loadAccount: AccountLoader;
+  private readonly db: Storage;
   /**
    * Hashes of challenges already exchanged for a token, with the unix second
    * after which the SDK would refuse them anyway. Insertion order tracks
@@ -132,7 +138,9 @@ export class Sep10Auth {
     this.networkPassphrase = options.networkPassphrase;
     this.issuer = options.issuer;
     this.tokenTtlS = options.tokenTtlS;
+    this.refreshTtlS = options.refreshTtlS;
     this.loadAccount = options.loadAccount;
+    this.db = options.db;
   }
 
   /** A server-signed challenge for `account` (a `G...` address). */
@@ -200,14 +208,68 @@ export class Sep10Auth {
     const body = `${JWT_HEADER}.${Buffer.from(
       JSON.stringify({ iss: this.issuer, sub: clientAccountID, iat: now, exp: now + this.tokenTtlS, jti }),
     ).toString("base64url")}`;
-    return { token: `${body}.${this.mac(body)}` };
+    const token = `${body}.${this.mac(body)}`;
+    const refreshToken = await this.issueRefreshToken(clientAccountID);
+    return { token, refresh_token: refreshToken };
   }
 
   /**
-   * The account a JWT was issued to, or null when it is malformed, signed
-   * with another key or algorithm, tampered with, expired, or issued for
-   * another network.
+   * Rotate a refresh token: validate it, issue a new short-lived JWT and a
+   * new refresh token, and revoke the consumed one. Returns null when the
+   * refresh token is unknown, revoked or expired. The returned refresh token
+   * replaces the consumed one, so a leaked refresh token can only be used
+   * once — its second use fails because the hash is already revoked.
    */
+  async rotate(refreshToken: string): Promise<AuthTokenResponse | null> {
+    const now = nowSeconds();
+    const tokenHash = this.hashRefreshToken(refreshToken);
+    const row = await this.db.get<{ account: string; expires_at: number; revoked_at: number | null }>(
+      "SELECT account, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = ?",
+      [tokenHash],
+    );
+    if (!row) return null;
+    if (row.revoked_at !== null) return null;
+    if (row.expires_at <= now) {
+      await this.db.run("UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?", [now, tokenHash]);
+      return null;
+    }
+    // Consume the old token and issue the next.
+    await this.db.run("UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?", [now, tokenHash]);
+    const newRefreshToken = await this.issueRefreshToken(row.account);
+    const token = this.issueJwt(row.account, now);
+    return { token, refresh_token: newRefreshToken };
+  }
+
+  /** Mint a refresh token for an account: store its hash, return the plaintext once. */
+  private async issueRefreshToken(account: string): Promise<string> {
+    const plaintext = randomUUID();
+    const tokenHash = this.hashRefreshToken(plaintext);
+    const now = nowSeconds();
+    await this.db.run(
+      "INSERT INTO refresh_tokens (token_hash, account, expires_at, created_at) VALUES (?, ?, ?, ?)",
+      [tokenHash, account, now + this.refreshTtlS, now],
+    );
+    return plaintext;
+  }
+
+  /** HMAC-SHA256 of a refresh token, so plaintexts are never stored. */
+  private hashRefreshToken(token: string): string {
+    return createHmac("sha256", this.#jwtKey).update(token).digest("hex");
+  }
+
+  /** Build a signed JWT for an account at a given now. */
+  private issueJwt(account: string, now: number): string {
+    const jti = createHmac("sha256", this.#jwtKey).update(`${account}:${now}:${randomUUID()}`).digest("hex");
+    const body = `${JWT_HEADER}.${Buffer.from(
+      JSON.stringify({ iss: this.issuer, sub: account, iat: now, exp: now + this.tokenTtlS, jti }),
+    ).toString("base64url")}`;
+    return `${body}.${this.mac(body)}`;
+  }
+
+  private mac(body: string): string {
+    return createHmac("sha256", this.#jwtKey).update(body).digest("base64url");
+  }
+
   verify(token: string): string | null {
     const [header, payload, signature, ...rest] = token.split(".");
     if (header !== JWT_HEADER || payload === undefined || signature === undefined || rest.length > 0) {
@@ -227,10 +289,6 @@ export class Sep10Auth {
     if (!parsed.success) return null;
     const { iss, sub, exp } = parsed.data;
     return iss === this.issuer && exp > nowSeconds() ? sub : null;
-  }
-
-  private mac(body: string): string {
-    return createHmac("sha256", this.#jwtKey).update(body).digest("base64url");
   }
 
   private assertUnused(jti: string): void {
@@ -259,6 +317,7 @@ export function sep10For(
   config: Config,
   network: NetworkConfig,
   rpc: Pick<RpcLike, "getLedgerEntries">,
+  db: Storage,
 ): Sep10Auth | undefined {
   const { SEP10_SIGNING_KEY: signingKey, SEP10_JWT_SECRET: jwtSecret, SEP10_HOME_DOMAIN: homeDomain } = config;
   if (!signingKey || !jwtSecret || !homeDomain) return undefined;
@@ -271,7 +330,9 @@ export function sep10For(
     networkPassphrase: network.networkPassphrase,
     issuer: `https://${webAuthDomain}/api/${network.name}/auth`,
     tokenTtlS: config.SEP10_JWT_TTL_S,
+    refreshTtlS: config.SEP10_REFRESH_TTL_S,
     loadAccount: accountLoader(rpc),
+    db,
   });
 }
 
@@ -301,7 +362,7 @@ export function sessionOf(req: Request, res: Response, auth: Sep10Auth | undefin
   const header = req.headers.authorization;
   if (header === undefined) return { ok: true, value: null };
   const token = /^Bearer\s+(\S+)$/i.exec(header)?.[1];
-  const account = token !== undefined && auth ? auth.verify(token) : null;
+  const account = token !== undefined && token.length <= 4_096 && auth ? auth.verify(token) : null;
   if (account === null) {
     sendApiError(
       res,
@@ -377,17 +438,27 @@ const challengeQuerySchema = z.object({
   account: z
     .string()
     .refine((value) => StrKey.isValidEd25519PublicKey(value), "must be a Stellar account (G...)"),
-  memo: z.string().optional(),
-  home_domain: z.string().optional(),
-});
+  memo: z.string().max(256).optional(),
+  home_domain: authDomainSchema.optional(),
+  // SEP-10 permits clients to send this; the server does not use it to
+  // authenticate the account.
+  client_domain: authDomainSchema.optional(),
+}).strict();
 
-const tokenBodySchema = z.object({ transaction: z.string().min(1) });
+const tokenBodySchema = z.object({ transaction: z.string().min(1).max(16_384) }).strict();
+
+/** Rotating a refresh token returns a new short-lived JWT and the next refresh token. */
+const rotateBodySchema = z.object({
+  refresh_token: z.string().min(1),
+});
 
 /**
  * `GET /api/auth`: a SEP-10 challenge. `POST /api/auth`: a JWT for a signed
  * challenge, sent as JSON or as a form, as SEP-10 requires both. Every
  * answer, including an error, carries `Access-Control-Allow-Origin: *` (set
  * in app.ts) and `Cache-Control: no-store`.
+ * `POST /api/auth/rotate`: exchange a refresh token for a new JWT and the
+ * next refresh token; the consumed token is revoked.
  */
 export function authRouter(auth: Sep10Auth): Router {
   const r = Router();
@@ -397,7 +468,7 @@ export function authRouter(auth: Sep10Auth): Router {
     next();
   });
 
-  r.get("/auth", (req, res) => {
+  r.get("/auth", queryOnly("account", "memo", "home_domain", "client_domain"), (req, res) => {
     const parsed = validate(req, res, "query", challengeQuerySchema, req.query);
     if (!parsed.ok) return;
     const { account, memo, home_domain: homeDomain } = parsed.value;
@@ -419,7 +490,11 @@ export function authRouter(auth: Sep10Auth): Router {
     res.json(body);
   });
 
-  r.post("/auth", express.urlencoded({ extended: false, limit: "64kb" }), async (req, res) => {
+  r.post(
+    "/auth",
+    queryOnly(),
+    express.urlencoded({ extended: false, limit: "64kb" }),
+    async (req, res) => {
     const parsed = validate(req, res, "body", tokenBodySchema, req.body);
     if (!parsed.ok) return;
     let body: AuthTokenResponse;
@@ -433,6 +508,26 @@ export function authRouter(auth: Sep10Auth): Router {
       return;
     }
     res.json(body);
+    },
+  );
+
+  /**
+   * Rotate a refresh token: the caller presents the refresh token received
+   * at sign-in or at the last rotation, and receives a new short-lived JWT
+   * plus the next refresh token. The consumed token is revoked, so a stolen
+   * refresh token can only be used once.
+   */
+  r.post("/auth/rotate", express.json({ limit: "64kb" }), async (req, res) => {
+    const parsed = validate(req, res, "body", rotateBodySchema, req.body);
+    if (!parsed.ok) return;
+    const rotated = await auth.rotate(parsed.value.refresh_token);
+    if (rotated === null) {
+      sendApiError(res, req, 401, "unauthorized", "The refresh token is unknown, revoked or expired.", [
+        { path: "refresh_token", message: "refresh token is not valid for rotation" },
+      ]);
+      return;
+    }
+    res.json(rotated);
   });
 
   return r;

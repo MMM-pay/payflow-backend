@@ -1,11 +1,10 @@
 import { Router } from "express";
+import { StrKey } from "@stellar/stellar-sdk";
 import { TokenMetadataUnavailable, type TokenMetadataService } from "../lib/tokens.ts";
 import { logger } from "../lib/logger.ts";
 import { sendApiError } from "./errors.ts";
+import { queryOnly } from "./validate.ts";
 import type { TokenMetadata } from "./types.ts";
-
-/** Contract ids are strkey-encoded ed25519 addresses; `native` is also accepted. */
-const TOKEN_ID = /^(native|[A-Z0-9]{56})$/i;
 
 /**
  * `GET /tokens/:id` — what a token contract id means.
@@ -16,16 +15,16 @@ const TOKEN_ID = /^(native|[A-Z0-9]{56})$/i;
 export function tokensRouter(tokens: TokenMetadataService): Router {
   const r = Router();
 
-  r.get("/tokens/:id", async (req, res) => {
-    const id = String(req.params.id);
-    if (!TOKEN_ID.test(id)) {
+  r.get("/tokens/:id", queryOnly(), async (req, res) => {
+    const id = req.params.id;
+    if (typeof id !== "string" || (id.toLowerCase() !== "native" && !StrKey.isValidContract(id))) {
       sendApiError(res, req, 400, "invalid_token_id");
       return;
     }
 
     let body: TokenMetadata;
     try {
-      body = await tokens.fetch(id);
+      body = await tokens.fetch(id.toLowerCase() === "native" ? "native" : id);
     } catch (err) {
       if (err instanceof TokenMetadataUnavailable) {
         // Transient by definition: the next request reads the contract again.

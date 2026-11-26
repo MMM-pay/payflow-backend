@@ -11,6 +11,7 @@ import {
   addressSchema,
   daysSchema,
   present,
+  queryOnly,
   unixSecondsSchema,
   validate,
 } from "./validate.ts";
@@ -37,7 +38,7 @@ function daysOf(raw: unknown, fallback = DEFAULT_FORECAST_DAYS): number {
 export function subscribersRouter(db: Storage, auth?: Sep10Auth): Router {
   const r = Router();
 
-  r.get("/subscribers/:address/summary", async (req, res) => {
+  r.get("/subscribers/:address/summary", queryOnly(), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
 
@@ -55,7 +56,7 @@ export function subscribersRouter(db: Storage, auth?: Sep10Auth): Router {
    * charge's ledger close time in ISO 8601 UTC. Rows are streamed a page at a
    * time, so neither the response nor a single query grows with the history.
    */
-  r.get("/subscribers/:address/charges.csv", async (req, res) => {
+  r.get("/subscribers/:address/charges.csv", queryOnly("from", "to"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
@@ -123,7 +124,7 @@ export function subscribersRouter(db: Storage, auth?: Sep10Auth): Router {
    * `now + period` rather than walking the ones it skipped. Subsequent
    * occurrences step by `period` while they stay inside `[now, until)`.
    */
-  r.get("/subscribers/:address/upcoming", async (req, res) => {
+  r.get("/subscribers/:address/upcoming", queryOnly("days"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));
@@ -196,7 +197,7 @@ export function subscribersRouter(db: Storage, auth?: Sep10Auth): Router {
    * charges, keeper attempts, total paid, and the timestamp at which the
    * export was generated.
    */
-  r.get("/subscribers/:address/export", async (req, res) => {
+  r.get("/subscribers/:address/export", queryOnly(), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
 

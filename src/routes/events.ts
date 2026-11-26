@@ -1,8 +1,9 @@
 import { Router } from "express";
-import { xdr, scValToNative } from "@stellar/stellar-sdk";
+import { StrKey, xdr, scValToNative } from "@stellar/stellar-sdk";
 import type { Storage } from "../lib/store/types.ts";
 import { sendApiError } from "./errors.ts";
 import { listRawContractEvents } from "../lib/queries.ts";
+import { queryOnly } from "./validate.ts";
 
 const PAGE_SIZE = 50;
 const SCAN_SIZE = 200;
@@ -28,15 +29,18 @@ function parseAfter(value: string): [number, string] | null {
  */
 export function rawEventsRouter(db: Storage): Router {
   const router = Router();
-  router.get("/events", async (req, res) => {
+  router.get("/events", queryOnly("contract", "name", "after"), async (req, res) => {
     const contract = req.query.contract;
     const name = req.query.name;
     const after = req.query.after;
     if (
-      Object.keys(req.query).some((key) => !["contract", "name", "after"].includes(key)) ||
-      (contract !== undefined && (typeof contract !== "string" || contract.length > MAX_FILTER_LENGTH)) ||
-      (name !== undefined && (typeof name !== "string" || name.length > MAX_FILTER_LENGTH)) ||
-      (after !== undefined && (typeof after !== "string" || after.length > 1024))
+      (contract !== undefined &&
+        (typeof contract !== "string" ||
+          contract.length > MAX_FILTER_LENGTH ||
+          !StrKey.isValidContract(contract))) ||
+      (name !== undefined &&
+        (typeof name !== "string" || name.length === 0 || name.length > MAX_FILTER_LENGTH)) ||
+      (after !== undefined && (typeof after !== "string" || after.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(after)))
     ) {
       sendApiError(res, req, 400, "invalid_request");
       return;

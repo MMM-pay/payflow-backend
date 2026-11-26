@@ -6,7 +6,7 @@ import type { Storage } from "../lib/store/types.ts";
 import type { WebhookDeliveriesResponse, WebhookListResponse } from "./types.ts";
 import { sessionOf, type Sep10Auth } from "./auth.ts";
 import { sendApiError } from "./errors.ts";
-import { addressSchema, validate } from "./validate.ts";
+import { addressSchema, idSchema, queryOnly, validate } from "./validate.ts";
 
 /** A registration proves control of the merchant's Stellar address: the
  *  merchant signs `payflow-webhook:v1:<merchant>:<url>:<timestamp>` with
@@ -41,6 +41,7 @@ const timestampSchema = z
 const registrationSchema = z.object({
   url: z
     .string()
+    .max(2_048)
     .url()
     .refine(
       (value) => {
@@ -60,25 +61,23 @@ const registrationSchema = z.object({
 const registerSchema = registrationSchema.extend({
   merchant: addressSchema,
   /** Base64-encoded ed25519 signature of the signed message. */
-  signature: z.string().min(1),
+  signature: z.string().min(1).max(128),
   /** Replay window of ten minutes. */
   timestamp: timestampSchema,
-});
+}).strict();
 
 /** A registration under a SEP-10 token: the merchant is the token's account. */
-const sessionRegisterSchema = registrationSchema.extend({ merchant: addressSchema.optional() });
+const sessionRegisterSchema = registrationSchema.extend({ merchant: addressSchema.optional() }).strict();
 
 /** The proof a merchant sends to list or delete its webhooks. */
 const proofSchema = z.object({
   merchant: addressSchema,
-  signature: z.string().min(1),
+  signature: z.string().min(1).max(128),
   timestamp: timestampSchema,
-});
+}).strict();
 
 /** Under a SEP-10 token a `merchant`, when given, must be the token's account. */
-const sessionSchema = z.object({ merchant: addressSchema.optional() });
-
-const idSchema = z.coerce.number().int().positive();
+const sessionSchema = z.object({ merchant: addressSchema.optional() }).strict();
 
 /** Whether `timestamp` is inside the replay window around the server's clock. */
 function fresh(timestamp: number): boolean {
@@ -119,17 +118,16 @@ function authorized(
   signature: string,
   timestamp: number,
 ): boolean {
+  // `details` belongs to `invalid_request` only (see the README's "Error
+  // responses" table and the OpenAPI Error schema), so a 401 carries copy
+  // but no field list.
   if (!fresh(timestamp)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.", [
-      { path: "timestamp", message: "must be within ten minutes of the server's clock" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.");
     return false;
   }
   const bytes = signatureBytesOf(signature);
   if (bytes === null || !verifies(merchant, message, bytes)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.", [
-      { path: "signature", message: "signature does not prove control of the merchant address" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.");
     return false;
   }
   return true;
@@ -137,9 +135,7 @@ function authorized(
 
 /** Answer a SEP-10 session whose account is not the merchant the request names. */
 function sendWrongAccount(req: Request, res: Response): void {
-  sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.", [
-    { path: "merchant", message: "must be the account the bearer token was issued to" },
-  ]);
+  sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.");
 }
 
 /**
@@ -187,7 +183,7 @@ function merchantOf(
 export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?: Sep10Auth): Router {
   const r = Router();
 
-  r.post("/webhooks", async (req, res) => {
+  r.post("/webhooks", queryOnly(), async (req, res) => {
     const session = sessionOf(req, res, auth);
     if (!session.ok) return;
     if (session.value !== null) {
@@ -252,7 +248,7 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
    * The proof travels in the query string: `merchant`, `timestamp` and
    * `signature` over `payflow-webhook-list:v1:<merchant>:<timestamp>`.
    */
-  r.get("/webhooks", async (req, res) => {
+  r.get("/webhooks", queryOnly("merchant", "timestamp", "signature"), async (req, res) => {
     const merchant = merchantOf(req, res, auth, "query", req.query, (m, t) => `${LIST_MESSAGE_PREFIX}:${m}:${t}`);
     if (merchant === null) return;
 
@@ -273,11 +269,15 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
    * that does not exist, is already deleted or belongs to another merchant
    * is a 404, so the endpoint does not reveal other merchants' ids.
    */
-  r.delete("/webhooks/:id", async (req, res) => {
+  r.delete("/webhooks/:id", queryOnly("merchant", "timestamp", "signature"), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const hasBody =
       typeof req.body === "object" && req.body !== null && Object.keys(req.body as object).length > 0;
+    if (hasBody) {
+      const query = validate(req, res, "query", z.object({}).strict(), req.query);
+      if (!query.ok) return;
+    }
     const merchant = merchantOf(
       req,
       res,
@@ -301,7 +301,7 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
    * `Payflow-Signature`) until `previousSecretExpiresAt`. The proof is a
    * JSON body signed over `payflow-webhook-rotate:v1:<merchant>:<id>:<timestamp>`.
    */
-  r.post("/webhooks/:id/rotate", async (req, res) => {
+  r.post("/webhooks/:id/rotate", queryOnly(), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const merchant = merchantOf(req, res, auth, "body", req.body, (m, t) => `${ROTATE_MESSAGE_PREFIX}:${m}:${id.value}:${t}`);
@@ -322,7 +322,7 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
    * latency). The proof is a JSON body signed over
    * `payflow-webhook-test:v1:<merchant>:<id>:<timestamp>`.
    */
-  r.post("/webhooks/:id/test", async (req, res) => {
+  r.post("/webhooks/:id/test", queryOnly(), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const merchant = merchantOf(req, res, auth, "body", req.body, (m, t) => `${TEST_MESSAGE_PREFIX}:${m}:${id.value}:${t}`);
@@ -343,7 +343,7 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
    * keeps its history. The proof travels in the query string, signed over
    * `payflow-webhook-deliveries:v1:<merchant>:<id>:<timestamp>`.
    */
-  r.get("/webhooks/:id/deliveries", async (req, res) => {
+  r.get("/webhooks/:id/deliveries", queryOnly("merchant", "timestamp", "signature"), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const merchant = merchantOf(req, res, auth, "query", req.query, (m, t) => `${DELIVERIES_MESSAGE_PREFIX}:${m}:${id.value}:${t}`);

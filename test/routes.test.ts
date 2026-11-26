@@ -4,6 +4,7 @@ import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
 import { Keypair, Networks } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
@@ -351,7 +352,9 @@ describe("GET /api/subscribers/:address/export", () => {
     networkPassphrase: Networks.TESTNET,
     issuer: ISSUER,
     tokenTtlS: 900,
+    refreshTtlS: 900,
     loadAccount: async () => null,
+    db: asStorage(exportDb),
   });
 
   /** Forge a JWT for `account` without going through the full SEP-10 dance. */

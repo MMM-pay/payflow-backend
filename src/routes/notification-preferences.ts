@@ -11,7 +11,7 @@ import {
 import { sessionOf, type Sep10Auth } from "./auth.ts";
 import { sendApiError } from "./errors.ts";
 import type { MerchantNotificationPreferences } from "./types.ts";
-import { validate } from "./validate.ts";
+import { queryOnly, validate } from "./validate.ts";
 
 const merchantSchema = z.string().refine(
   (value) => StrKey.isValidEd25519PublicKey(value),
@@ -24,15 +24,15 @@ const timestampSchema = z
   .refine(Number.isSafeInteger, "must be a unix timestamp in seconds");
 const preferencesSchema = z.object({
   events: notificationEventsSchema,
-});
+}).strict();
 const signedGetSchema = z.object({
   timestamp: timestampSchema,
-  signature: z.string().min(1),
-});
+  signature: z.string().min(1).max(128),
+}).strict();
 const signedPutSchema = preferencesSchema.extend({
   timestamp: timestampSchema,
-  signature: z.string().min(1),
-});
+  signature: z.string().min(1).max(128),
+}).strict();
 const SIGNATURE_TOLERANCE_S = 10 * 60;
 
 function fresh(timestamp: number): boolean {
@@ -52,17 +52,16 @@ function authorized(
   signature: string,
   timestamp: number,
 ): boolean {
+  // `details` belongs to `invalid_request` only (see the README's "Error
+  // responses" table and the OpenAPI Error schema), so a 401 carries copy
+  // but no field list.
   if (!fresh(timestamp)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.", [
-      { path: "timestamp", message: "must be within ten minutes of the server's clock" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature has expired; sign a fresh timestamp.");
     return false;
   }
   const bytes = signatureBytes(signature);
   if (bytes === null || !Keypair.fromPublicKey(merchant).verify(Buffer.from(message, "utf8"), bytes)) {
-    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.", [
-      { path: "signature", message: "signature does not prove control of the merchant address" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The signature does not prove control of the merchant address.");
     return false;
   }
   return true;
@@ -77,9 +76,7 @@ function sessionMatches(
   const session = sessionOf(req, res, auth);
   if (!session.ok) return { ok: false };
   if (session.value !== null && session.value !== merchant) {
-    sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.", [
-      { path: "address", message: "must be the account the bearer token was issued to" },
-    ]);
+    sendApiError(res, req, 401, "unauthorized", "The bearer token was issued for a different account.");
     return { ok: false };
   }
   return { ok: true, authenticated: session.value !== null };
@@ -96,13 +93,19 @@ function putMessage(merchant: string, events: string[], timestamp: number): stri
 export function notificationPreferencesRouter(db: Storage, auth?: Sep10Auth): Router {
   const r = Router();
 
-  r.get("/merchants/:address/notification-preferences", async (req, res) => {
+  r.get(
+    "/merchants/:address/notification-preferences",
+    queryOnly("timestamp", "signature"),
+    async (req, res) => {
     const address = validate(req, res, "address", merchantSchema, req.params.address);
     if (!address.ok) return;
     const session = sessionMatches(req, res, auth, address.value);
     if (!session.ok) return;
 
-    if (!session.authenticated) {
+    if (session.authenticated) {
+      const query = validate(req, res, "query", z.object({}).strict(), req.query);
+      if (!query.ok) return;
+    } else {
       const proof = validate(req, res, "query", signedGetSchema, req.query);
       if (!proof.ok) return;
       if (!authorized(
@@ -122,9 +125,10 @@ export function notificationPreferencesRouter(db: Storage, auth?: Sep10Auth): Ro
     };
     res.setHeader("Cache-Control", "no-store");
     res.json(body);
-  });
+    },
+  );
 
-  r.put("/merchants/:address/notification-preferences", async (req, res) => {
+  r.put("/merchants/:address/notification-preferences", queryOnly(), async (req, res) => {
     const address = validate(req, res, "address", merchantSchema, req.params.address);
     if (!address.ok) return;
     const session = sessionMatches(req, res, auth, address.value);

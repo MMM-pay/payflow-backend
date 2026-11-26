@@ -268,6 +268,7 @@ describe("the OpenAPI document", () => {
       "/admin/keeper/backoff",
       "/admin/indexer/pause",
       "/admin/indexer/resume",
+      "/admin/db/vacuum",
     ]) {
       assert.ok(path in spec.paths, `${path} is missing from the OpenAPI document`);
       const item = spec.paths[path] ?? {};

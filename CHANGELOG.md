@@ -7,6 +7,49 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **Graceful keeper shutdown finishes in-flight charges (#255).** `Keeper.stop()`
+  now returns a promise that resolves once every running pass — scheduled or
+  triggered from `/admin` — has finished, and the API process's shutdown waits
+  on it (bounded by `SHUTDOWN_TIMEOUT_MS`). The one-shot `npm run keeper`
+  command, which used to die mid-transaction on `SIGTERM`, now stops picking
+  up mandates, lets the charges in flight confirm and be recorded, and closes
+  the database afterwards; past the deadline it exits non-zero. Charges a
+  worker had claimed but not yet submitted when the signal landed are released
+  immediately instead of being held for `KEEPER_CLAIM_TTL_S`. The HTTP API is
+  unchanged.
+- **Tests: a failed transfer never advances a mandate's due date (#256).** A
+  charge that fails on chain, is rejected on submission, is refused by the
+  contract or by authorization, never confirms, or cannot reach the RPC leaves
+  the mandate row untouched and the same due charge is retried once its
+  backoff lapses — including the failing member of a `charge_many`.
+- **Configurable indexing batch size and poll interval (#241).**
+  `INDEXER_BATCH_SIZE` sets how many ledgers one batch reads and applies
+  before the cursor moves (default 8,000, the RPC's getEvents window; 1–8,000),
+  replacing the hard-coded window, and each network may pace itself with
+  `<NAME>_INDEXER_BATCH_SIZE` and `<NAME>_INDEXER_INTERVAL_MS`. A smaller batch
+  commits more often and replays less after a crash; a larger one still starts
+  no later than the RPC allows. Responses are unchanged.
+- **PostgreSQL pooling is sized and bounded (#263).**
+  `DATABASE_POOL_MAX` (default 10) caps the connections one process holds,
+  `DATABASE_ACQUIRE_TIMEOUT_MS` (default 10,000) bounds the wait for a free
+  connection — a saturated pool fails with an error naming that variable
+  instead of queueing forever — and `DATABASE_STATEMENT_TIMEOUT_MS`
+  (default 30,000) is sent as `statement_timeout` with every connection, so
+  PostgreSQL cancels a runaway query instead of pinning the connection. The
+  schema-creation connection at startup uses one connection and the same
+  timeouts.
+- **Concurrent settlement with a bounded worker pool (#249).**
+  `KEEPER_CONCURRENCY` caps the settlement transactions a keeper pass keeps in
+  flight (default: one per channel account; a cap above the number of channels
+  fails startup). Each in-flight transaction leases its own channel account
+  from a pool, so no account ever has two transactions in flight, and a
+  `txBadSeq` re-reads the channel's sequence and resubmits up to twice. Before
+  submitting, each due charge is claimed in the new `keeper_claims` table with
+  one atomic upsert, so two workers or two keeper processes sharing a database
+  never settle the same mandate; an abandoned claim lapses after
+  `KEEPER_CLAIM_TTL_S` (default 300 s). On shutdown the keeper starts nothing
+  new and lets in-flight settlements finish. New gauge:
+  `payflow_keeper_in_flight`. The HTTP API is unchanged.
 - **A versioned API (#173).** Every route is served under `/api/v1/...` and
   `/api/...` remains an alias, mounted from the same router, so an existing
   client keeps working and a breaking change lands in the next version. The
@@ -86,6 +129,32 @@ All notable changes to payflow-backend. The format follows
   projection file on its own does not hold. `reindex --from` refuses to move
   the cursor *forwards*, because the ledgers in between would never be applied;
   `--skip-ahead` is how an operator accepts that gap on purpose.
+- **A `doctor` command (#300).** `npm run cli -- doctor` is the pre-flight
+  check: it validates the environment, validates the keeper's signing keys
+  (printing only public keys), opens the projection — SQLite from its file, or
+  PostgreSQL through the same store the service uses — probes every configured
+  RPC endpoint through the failover client, and reports the projection's lag.
+  Each check is its own line with `OK`, `WARN` or `FAIL`; a failure exits
+  non-zero so a deployment probe can gate on it, while a warning (no keeper
+  key, or a node that is catching up) does not. `--json` prints the same
+  report as a machine-readable object, and secrets and PostgreSQL passwords
+  never reach either form.
+- **The error envelope is checked across routes (#297).** `test/error-envelope.test.ts`
+  exercises one error path from every mounted router — plans, mandates,
+  merchants, the fallthrough 404 and the unauthenticated admin 401 — and
+  asserts the single documented `{ error: { code, message, requestId } }`
+  shape, the status code, the JSON content type and the echoed request id on
+  both `/api/v1` and its `/api` alias.
+- **A raised, enforced coverage gate (#298).** `npm run test:coverage` now
+  fails below 95% lines, 90% functions and 85% branches of `src/` instead of
+  the line-only 94% gate, so a new branch or handler without a test is caught
+  by CI rather than by review.
+- **Simultaneous writes are tested (#299).** `test/concurrency.test.ts` sends
+  a burst of parallel PUTs to the notification-preferences endpoint — across
+  merchants and to one merchant — and asserts every write lands, the upsert
+  leaves exactly one row per merchant, each stored set is one complete
+  submission rather than a torn mixture, and a burst of badly signed writes
+  is refused with 401 and leaves nothing behind.
 - **An API changelog and a deprecation policy (#172).** `API_CHANGELOG.md`
   records what changed in the HTTP API apart from the service's own changelog,
   and states how long a deprecated field or route keeps working: one minor
@@ -289,6 +358,19 @@ All notable changes to payflow-backend. The format follows
 
 ### Changed
 
+- **The indexer writes a batch in one transaction, ledger by ledger (#247).**
+  A batch's raw events, projection rows and cursor still commit together in a
+  single transaction, and inside it each ledger is now written as a group: one
+  multi-row `INSERT OR IGNORE` retains a ledger's raw events instead of one
+  statement per event, then that ledger's decoded events are applied. One
+  transaction per pass was rejected deliberately — a fetch failure after some
+  batches have been applied has to leave their cursor in place, so the next
+  pass resumes at the failed batch. Retain statements for a 4,000-event window
+  drop from 4,000 to 400 (`npm run bench:indexer`), and indexing the same
+  window through the real indexer went from 8,193 ms to 3,517 ms on PostgreSQL
+  16 (2.33×) and from 730 ms to 541 ms on file-backed SQLite (1.35×).
+  Responses and cursor semantics are unchanged.
+
 - **The raw event feed reads one page per request (#364).** `GET /api/events`
   without a `name` filter now asks the database for one page plus one row
   (51) instead of a 200-row batch, and a `contract` filter is served by a new
@@ -364,7 +446,10 @@ All notable changes to payflow-backend. The format follows
   line.
 
 ### Fixed
-
+- **A `charge_many` fallback no longer collides on its own channel (#249).**
+  When a batch fell back to single charges, they were submitted side by side
+  from the same account and raced for one sequence number; they now go one
+  after another.
 - **Merchant totals no longer mix tokens (#56).** `/api/merchants/:address/summary`
   summed every charge into one figure even when the merchant's plans used
   several tokens. Revenue and MRR are now also grouped per token in a `tokens`
@@ -373,6 +458,16 @@ All notable changes to payflow-backend. The format follows
 
 ### Security
 
+- **No PII in logs at info level (#285).** Subscriber and merchant accounts
+  are masked to `GABC...WXYZ` in access lines and in keeper, reconciler and
+  webhook lines; client IPs are cut to their /24 or /48, `Forwarded`, `Cookie`
+  and `Set-Cookie` are redacted, and webhook failures log the endpoint's host
+  instead of its URL. Log searches that matched a full account must match the
+  masked form; see SECURITY.md.
+- **The bearer-token check is fuzzed (#284).** `test/auth-fuzz.test.ts` feeds
+  `Sep10Auth.verify` and the `Authorization` header on merchant routes
+  thousands of seeded malformed, expired, tampered and foreign tokens and
+  asserts every one is refused the same way.
 - Patched transitive advisories in `proxy-addr` (critical) and `qs`
   (moderate) with `npm audit fix`; the production audit is clean.
 
