@@ -76,8 +76,8 @@ export function loggableError(err: unknown): Error {
  * Express 5 awaits a handler's return value and forwards a rejected promise to
  * the error middleware, so an `async` route no longer needs a manual
  * `try`/`catch` to avoid a dangling request or an unhandled rejection.
- * Malformed/oversized request bodies become safe 400s; other unexpected
- * failures become a 500.
+ * Malformed request bodies become safe 400s, oversized bodies become 413s,
+ * and other unexpected failures become a 500.
  *
  * Neither half of the contract leaks: the body is a fixed shape because
  * `err.message` can carry a bound SQL value or an RPC URL, and the log line is
@@ -111,6 +111,10 @@ export function errorHandler(
     "unhandled request error",
   );
   if (parserError) {
+    if (type === "entity.too.large") {
+      sendApiError(res, _req, 413, "payload_too_large");
+      return;
+    }
     sendApiError(res, _req, 400, "invalid_request");
     return;
   }

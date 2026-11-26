@@ -50,6 +50,10 @@ and impact. Acknowledgement within 72 hours.
   repeated query parameters, malformed path/body values, and invalid JSON with
   `400 invalid_request` before invoking downstream handlers. Validation errors
   use the shared error envelope and do not echo request bodies or secrets.
+- **Request bodies are capped at 64 KB.** JSON bodies are limited globally and
+  the SEP-10 form parser uses the same limit. Oversized bodies are rejected with
+  `413 payload_too_large` and are not echoed in the response. Clients sending
+  larger requests must reduce or split their payloads.
 - **SEP-10 JWTs are short-lived** (`SEP10_JWT_TTL_S`, an hour by default), so a
   leaked JWT's blast radius is small. `POST /api/auth` issues a JWT together
   with a single-use refresh token; `POST /api/auth/rotate` exchanges a refresh

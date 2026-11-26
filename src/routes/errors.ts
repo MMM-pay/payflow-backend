@@ -17,6 +17,7 @@ export type ApiErrorCode =
   | "invalid_ids"
   | "too_many_ids"
   | "invalid_request"
+  | "payload_too_large"
   | "invalid_token_id"
   | "token_metadata_unavailable"
   | "unauthorized"
@@ -89,6 +90,7 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   invalid_ids: "The `ids` parameter must be a comma-separated list of positive integers.",
   too_many_ids: "The `ids` parameter accepts at most 100 mandate ids.",
   invalid_request: "The request parameters are not valid.",
+  payload_too_large: "The request body exceeds the allowed size.",
   invalid_token_id: "The token id must be `native` or a contract address.",
   token_metadata_unavailable: "The token contract's metadata could not be read; try again.",
   unauthorized: "A valid bearer token is required for this endpoint.",

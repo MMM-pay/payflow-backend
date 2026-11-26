@@ -1037,6 +1037,7 @@ the server's public key as `SIGNING_KEY` and the endpoint as
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
 | `too_many_ids` | 400 | `?ids=` lists more than 100 ids |
 | `invalid_request` | 400 | A query or path parameter is not valid; `error.details` says which |
+| `payload_too_large` | 413 | A JSON or SEP-10 form request body exceeds the 64 KB limit |
 | `invalid_token_id` | 400 | `GET /api/tokens/:id` with a malformed contract id |
 | `token_metadata_unavailable` | 502 | `GET /api/tokens/:id` while the token contract cannot be read |
 | `rate_limited` | 429 | API request exceeded the configured per-IP limit; includes `Retry-After` |

@@ -612,6 +612,22 @@ describe("request parser failures", () => {
     assert.ok(!JSON.stringify(body).includes("GB343X"), "the caller's payload reached the error body");
   });
 
+  test("reject oversized JSON bodies with 413 without echoing the payload", async () => {
+    const payload = "x".repeat(65_536);
+    const res = await fetch(`${base}/api/v1/auth/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: payload }),
+    });
+    const body = await assertErrorEnvelope(
+      res,
+      { status: 413, code: "payload_too_large" },
+      "oversized JSON body",
+    );
+    assert.equal(body.error.message, "The request body exceeds the allowed size.");
+    assert.ok(!JSON.stringify(body).includes(payload), "the caller's payload reached the error body");
+  });
+
   test("the readiness probe is the one documented non-envelope 503", async () => {
     const localDb = openDatabase(":memory:");
     const app = createApp(localDb, { CORS_ORIGIN: "*" } as unknown as Config);
