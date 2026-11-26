@@ -664,7 +664,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["webhooks"],
         summary: "List a merchant's webhooks",
         description:
-          "The merchant's registered webhooks, newest first, including ones that gave up after failed deliveries. Secrets are never returned, only their last four characters. The caller proves control of the merchant address with an ed25519 signature over `payflow-webhook-list:v1:<merchant>:<timestamp>`.",
+          "The merchant's registered webhooks, newest first, including paused endpoints. Secrets are never returned, only their last four characters. Repeated delivery failures open a per-endpoint circuit for a cooldown; `pausedUntil` identifies the pause and `circuitState` reports open, half-open or closed. The caller proves control of the merchant address with an ed25519 signature over `payflow-webhook-list:v1:<merchant>:<timestamp>`.",
         operationId: `listWebhooks${operationSuffix(root)}`,
         parameters: [
           {
@@ -2501,13 +2501,16 @@ function componentSchemas(): Record<string, SchemaObject> {
           type: "string",
           description: "The signing secret's last four characters; the secret itself is never returned again.",
         },
-        failed: { type: "boolean", description: "Deliveries gave up after repeated failures." },
+        failed: { type: "boolean", description: "The per-endpoint circuit is open or in its half-open cooldown state." },
         failures: { type: "integer" },
         lastAttempt: { type: ["integer", "null"], description: "Unix seconds of the last failed attempt." },
         lastStatus: { type: ["integer", "null"], description: "HTTP status of the last failed attempt." },
+        paused: { type: "boolean", description: "True while repeated failures have opened the endpoint circuit." },
+        pausedUntil: { type: ["integer", "null"], description: "Unix seconds when the cooldown ends; null outside the open state." },
+        circuitState: { type: "string", enum: ["open", "half-open", "closed"], description: "Current per-endpoint circuit state." },
         createdAt: { type: "integer", description: "Unix seconds." },
       },
-      required: ["id", "merchant", "url", "secretLast4", "failed", "failures", "lastAttempt", "lastStatus", "createdAt"],
+      required: ["id", "merchant", "url", "secretLast4", "failed", "failures", "lastAttempt", "lastStatus", "paused", "pausedUntil", "circuitState", "createdAt"],
     },
     WebhookDeleteRequest: {
       type: "object",

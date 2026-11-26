@@ -57,6 +57,8 @@ const runtimes = await Promise.all(networks.map(async (network) => {
     db,
     events: indexer.events,
     secretOverlapSeconds: config.WEBHOOK_SECRET_OVERLAP_S,
+    circuitFailureThreshold: config.WEBHOOK_CIRCUIT_FAILURE_THRESHOLD,
+    circuitCooldownSeconds: config.WEBHOOK_CIRCUIT_COOLDOWN_S,
   });
   dispatcher.bind(indexer.events);
   const runPass = serial(async () => {

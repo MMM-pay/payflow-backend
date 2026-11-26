@@ -360,7 +360,7 @@ describe("webhooks", () => {
     await dispatcher.deactivate(merchant, errorHook.id);
   });
 
-  test("delivery retries with backoff and gives up after five attempts", async () => {
+  test("delivery retries with backoff then opens a circuit after five attempts", async () => {
     const failing = Keypair.random().publicKey();
     await dispatcher.register(failing, "https://payflow.example/failing", "another-secret");
     calls.length = 0;
@@ -405,23 +405,25 @@ describe("webhooks", () => {
     }
     assert.equal(calls.length, 4, "attempts 2 through 4 happen at their retry times");
 
-    // Attempt 5 is due next; attempt 6 exceeds MAX_ATTEMPTS, so the delivery
-    // and the webhook are marked failed and nothing is retried after that.
+    // Attempt 5 opens the per-endpoint circuit and pauses the delivery until
+    // the cooldown expires.
     db.prepare("UPDATE webhook_deliveries SET retry_at = ? WHERE id = ?")
       .run(T - 1, row1.id);
     await dispatcher.retryDue(T);
     assert.equal(calls.length, 5, "fifth and final attempt");
     const row = db
       .prepare("SELECT * FROM webhook_deliveries ORDER BY id DESC LIMIT 1")
-      .get() as { attempt: number; status: string };
+      .get() as { attempt: number; status: string; retry_at: number };
     assert.equal(row.attempt, 5);
-    assert.equal(row.status, "failed");
+    assert.equal(row.status, "pending");
+    assert.ok(row.retry_at >= T + 899 && row.retry_at <= T + 901);
 
     const webhook = db.prepare("SELECT * FROM webhooks WHERE merchant = ?").get(failing) as {
-      failed: number; failures: number;
+      failed: number; failures: number; circuit_open_until: number | null;
     };
     assert.equal(webhook.failed, 1);
     assert.equal(webhook.failures, 5);
+    assert.ok(webhook.circuit_open_until! >= T + 899);
 
     calls.length = 0;
     await ix.apply(ev("charged", [8n, SUBSCRIBER, failing], {
@@ -430,6 +432,35 @@ describe("webhooks", () => {
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(calls.length, 0, "a failed webhook receives nothing more");
+  });
+
+  test("an open circuit pauses delivery and resumes after cooldown", async () => {
+    const merchantWithCircuit = Keypair.random().publicKey();
+    const hook = await dispatcher.register(
+      merchantWithCircuit,
+      "https://payflow.example/circuit-recovery",
+      "circuit-secret",
+    );
+    const now = nowSec();
+    db.prepare(
+      "UPDATE webhooks SET failed = 1, failures = 5, circuit_open_until = ? WHERE id = ?",
+    ).run(now + 60, hook.id);
+
+    calls.length = 0;
+    assert.equal(await dispatcher.ping(merchantWithCircuit, hook.id), null);
+    assert.equal(calls.length, 0, "an open circuit receives no test delivery");
+
+    db.prepare("UPDATE webhooks SET circuit_open_until = ? WHERE id = ?")
+      .run(now - 1, hook.id);
+    const result = await dispatcher.ping(merchantWithCircuit, hook.id);
+    assert.ok(result);
+    assert.equal(result.status, "delivered");
+
+    const webhook = db.prepare("SELECT failed, failures, circuit_open_until FROM webhooks WHERE id = ?")
+      .get(hook.id) as { failed: number; failures: number; circuit_open_until: number | null };
+    assert.equal(webhook.failed, 0);
+    assert.equal(webhook.failures, 0);
+    assert.equal(webhook.circuit_open_until, null);
   });
 
   test("retryDue delivers pending deliveries at their retry time", async () => {
@@ -569,7 +600,10 @@ describe("webhooks", () => {
       await waitFor(() => calls.length >= 1);
       await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(calls.map((c) => c.url), ["https://c.example/keep"]);
+      const merchantCalls = calls.filter((call) =>
+        call.url === "https://c.example/keep" || call.url === "https://c.example/failing-gone",
+      );
+      assert.deepEqual(merchantCalls.map((c) => c.url), ["https://c.example/keep"]);
 
       // It is gone from the list, and deleting it again is a 404.
       const listed = (await (await fetch(listUrl(merchantC, t, listSig(merchantC, t, seedC)))).json()) as {

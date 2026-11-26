@@ -253,7 +253,9 @@ None of these come from the chain. A rebuild leaves them alone.
 
 Merchant webhook registrations: `merchant`, `url`, signing `secret`,
 `active`, and delivery health (`failed`, `failures`, `last_attempt`,
-`last_status`). During a secret rotation, `previous_secret` keeps signing
+`last_status`, `circuit_open_until`). Repeated failures open a per-endpoint
+circuit until the cooldown expires; the next delivery is a half-open probe.
+During a secret rotation, `previous_secret` keeps signing
 beside the new one until `previous_secret_expires_at` (unix seconds; see
 `WEBHOOK_SECRET_OVERLAP_S`).
 

@@ -556,6 +556,12 @@ export interface WebhookSummary {
   /** Unix seconds of the last failed delivery attempt, if any. */
   lastAttempt: number | null;
   lastStatus: number | null;
+  /** True while this endpoint's circuit is open and deliveries are paused. */
+  paused: boolean;
+  /** Unix seconds when the cooldown ends; null while closed or in half-open state. */
+  pausedUntil: number | null;
+  /** The endpoint circuit: open, half-open after cooldown, or closed. */
+  circuitState: "open" | "half-open" | "closed";
   /** Unix seconds. */
   createdAt: number;
 }

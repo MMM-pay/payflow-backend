@@ -444,6 +444,10 @@ const schema = z.object({
    * old secret at once (a leak). At most seven days.
    */
   WEBHOOK_SECRET_OVERLAP_S: z.coerce.number().int().min(0).max(604_800).default(86_400),
+  /** Consecutive delivery failures before pausing a webhook endpoint. */
+  WEBHOOK_CIRCUIT_FAILURE_THRESHOLD: z.coerce.number().int().min(1).max(100).default(5),
+  /** Seconds an open webhook circuit remains paused before a half-open probe. */
+  WEBHOOK_CIRCUIT_COOLDOWN_S: z.coerce.number().int().min(1).max(604_800).default(900),
 
   /**
    * SEP-10 sign-in (`GET`/`POST /api/auth`). The server account's secret seed

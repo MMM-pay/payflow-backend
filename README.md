@@ -974,8 +974,11 @@ verification fails; do not parse or process it first. The same delivery keeps
 its `Idempotency-Key` across retries, so handlers should deduplicate that key.
 
 Failing deliveries retry with exponential backoff (1 minute, doubling, up to
-six hours) for at most five attempts. A webhook that gives up is marked
-failed and stops receiving deliveries until re-registered. Undelivered
+six hours) for repeated failures. After `WEBHOOK_CIRCUIT_FAILURE_THRESHOLD`
+consecutive failures (five by default), the endpoint circuit opens for
+`WEBHOOK_CIRCUIT_COOLDOWN_S` seconds (15 minutes by default). It then allows
+one half-open probe; success resumes delivery and failure reopens the circuit.
+Undelivered
 deliveries are retried on a short cadence, so a silent indexer still makes
 delivery progress.
 
@@ -1245,6 +1248,8 @@ examined without API downtime.
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
 | `ADMIN_TOKEN` | — | Bearer token for `/admin`. Unset keeps those routes disabled |
 | `WEBHOOK_SECRET_OVERLAP_S` | `86400` | Seconds a rotated webhook secret keeps signing beside the new one (0–604800) |
+| `WEBHOOK_CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures that pause deliveries to one webhook endpoint (1–100) |
+| `WEBHOOK_CIRCUIT_COOLDOWN_S` | `900` | Seconds an open webhook circuit is paused before a half-open retry (1–604800) |
 | `SEP10_SIGNING_KEY` | — | Secret seed of the SEP-10 server account. Unset keeps `/api/auth` disabled |
 | `SEP10_JWT_SECRET` | — | HMAC key for SEP-10 JWTs, at least 32 characters; required with `SEP10_SIGNING_KEY` |
 | `SEP10_HOME_DOMAIN` | — | Home domain of the challenge (`<home domain> auth`); required with `SEP10_SIGNING_KEY` |
