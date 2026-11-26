@@ -56,6 +56,8 @@ export interface PlanRow extends TokenFields {
    * null when the merchant has not set a profile. Not verified by anyone.
    */
   merchantName?: string | null;
+  /** The plan's self-declared payout address. */
+  payoutAddress?: string | null;
 }
 
 /**
@@ -109,6 +111,8 @@ export interface ChargeRow {
   amount: string;
   /** String protocol fee in the same unit. */
   fee: string;
+  /** Token contract id (e.g. "native" or SAC id). */
+  token: string;
   charges_made: number;
   next_charge: number;
   ledger: number;

@@ -45,33 +45,40 @@ CREATE TABLE IF NOT EXISTS cursor (
 );
 
 CREATE TABLE IF NOT EXISTS plans (
-  id          INTEGER PRIMARY KEY,
-  merchant    TEXT    NOT NULL,
-  name        TEXT    NOT NULL DEFAULT '',
-  token       TEXT    NOT NULL,
-  amount      TEXT    NOT NULL,
-  period      INTEGER NOT NULL,
-  active      INTEGER NOT NULL DEFAULT 1,
-  ledger      INTEGER NOT NULL
+  id                  INTEGER PRIMARY KEY,
+  merchant            TEXT    NOT NULL,
+  name                TEXT    NOT NULL DEFAULT '',
+  token               TEXT    NOT NULL,
+  amount              TEXT    NOT NULL,
+  period              INTEGER NOT NULL,
+  active              INTEGER NOT NULL DEFAULT 1,
+  ledger              INTEGER NOT NULL,
+  payout_address      TEXT    NOT NULL DEFAULT '',
+  created_at          INTEGER NOT NULL DEFAULT 0,
+  updated_at          INTEGER NOT NULL DEFAULT 0,
+  deleted_at          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS plans_merchant ON plans(merchant);
 
 CREATE TABLE IF NOT EXISTS mandates (
-  id           INTEGER PRIMARY KEY,
-  subscriber   TEXT    NOT NULL,
-  merchant     TEXT    NOT NULL,
-  plan_id      INTEGER NOT NULL,
-  amount       TEXT    NOT NULL,
-  period       INTEGER NOT NULL,
-  next_charge  INTEGER NOT NULL,
-  last_charge  INTEGER NOT NULL DEFAULT 0,
-  charges_made INTEGER NOT NULL DEFAULT 0,
-  max_charges  INTEGER NOT NULL DEFAULT 0,
-  fee_bps      INTEGER NOT NULL DEFAULT 0,
-  status       TEXT    NOT NULL DEFAULT 'Active',
+  id                  INTEGER PRIMARY KEY,
+  subscriber          TEXT    NOT NULL,
+  merchant            TEXT    NOT NULL,
+  plan_id             INTEGER NOT NULL,
+  amount              TEXT    NOT NULL,
+  period              INTEGER NOT NULL,
+  next_charge         INTEGER NOT NULL,
+  last_charge         INTEGER NOT NULL DEFAULT 0,
+  charges_made        INTEGER NOT NULL DEFAULT 0,
+  max_charges         INTEGER NOT NULL DEFAULT 0,
+  fee_bps             INTEGER NOT NULL DEFAULT 0,
+  status              TEXT    NOT NULL DEFAULT 'Active',
   -- 'subscriber' or 'merchant' once cancelled; NULL otherwise.
-  ended_by     TEXT,
-  ledger       INTEGER NOT NULL
+  ended_by            TEXT,
+  ledger              INTEGER NOT NULL,
+  created_at          INTEGER NOT NULL DEFAULT 0,
+  updated_at          INTEGER NOT NULL DEFAULT 0,
+  deleted_at          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS mandates_subscriber ON mandates(subscriber);
 CREATE INDEX IF NOT EXISTS mandates_merchant   ON mandates(merchant);
@@ -92,19 +99,22 @@ CREATE TABLE IF NOT EXISTS plan_subscriber_counts (
 );
 
 CREATE TABLE IF NOT EXISTS charges (
-  tx_hash      TEXT    NOT NULL,
-  mandate_id   INTEGER NOT NULL,
-  subscriber   TEXT    NOT NULL,
-  merchant     TEXT    NOT NULL,
-  amount       TEXT    NOT NULL,
-  fee          TEXT    NOT NULL,
-  charges_made INTEGER NOT NULL,
-  next_charge  INTEGER NOT NULL,
-  ledger       INTEGER NOT NULL,
+  tx_hash           TEXT    NOT NULL,
+  mandate_id        INTEGER NOT NULL,
+  subscriber        TEXT    NOT NULL,
+  merchant          TEXT    NOT NULL,
+  amount            TEXT    NOT NULL,
+  fee               TEXT    NOT NULL,
+  token             TEXT    NOT NULL DEFAULT 'native',
+  charges_made      INTEGER NOT NULL,
+  next_charge       INTEGER NOT NULL,
+  ledger            INTEGER NOT NULL,
   -- When the charge happened: the close time of its ledger, in unix
   -- milliseconds. The chain's clock, so a backfill stores the same value a
   -- live index would have.
-  created_at   INTEGER NOT NULL,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL DEFAULT 0,
+  deleted_at        INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (tx_hash, mandate_id)
 );
 CREATE INDEX IF NOT EXISTS charges_merchant   ON charges(merchant);
@@ -180,6 +190,17 @@ CREATE TABLE IF NOT EXISTS merchant_profiles (
   url      TEXT    NOT NULL,
   ledger   INTEGER NOT NULL
 );
+
+-- Plan payout address history: tracks changes to a plan's payout address
+-- over time. Each change is recorded with the ledger and timestamp.
+CREATE TABLE IF NOT EXISTS plan_payout_addresses (
+  plan_id      INTEGER NOT NULL,
+  payout_address TEXT    NOT NULL,
+  ledger       INTEGER NOT NULL,
+  changed_at   INTEGER NOT NULL,
+  PRIMARY KEY (plan_id, payout_address)
+);
+CREATE INDEX IF NOT EXISTS plan_payout_addresses_plan ON plan_payout_addresses(plan_id);
 
 CREATE TABLE IF NOT EXISTS merchant_notification_preferences (
   merchant  TEXT    PRIMARY KEY,
@@ -353,6 +374,7 @@ CREATE INDEX IF NOT EXISTS refresh_tokens_expires ON refresh_tokens(expires_at);
  */
 const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]> = [
   ["plans", "name", "TEXT NOT NULL DEFAULT ''"],
+  ["plans", "payout_address", "TEXT NOT NULL DEFAULT ''"],
   ["mandates", "fee_bps", "INTEGER NOT NULL DEFAULT 0"],
   ["mandates", "ended_by", "TEXT"],
   ["webhooks", "previous_secret", "TEXT"],

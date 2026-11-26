@@ -1290,7 +1290,13 @@ export class Keeper {
     const maxFee = BigInt(this.config.KEEPER_MAX_FEE ?? "100000");
     try {
       const stats = await this.server.getFeeStats();
-      const percentile = `p${this.config.KEEPER_FEE_PERCENTILE ?? "90"}` as keyof typeof stats.sorobanInclusionFee;
+      // Determine the fee percentile: use per-token override if available,
+      // otherwise fall back to the global KEEPER_FEE_PERCENTILE.
+      const globalPercentile = `p${this.config.KEEPER_FEE_PERCENTILE ?? "90"}`;
+      const token = this.getActiveToken(); // TODO: get the active token for the current mandate
+      const percentileOverride = this.config.KEEPER_FEE_PERCENTILE_PER_TOKEN?.get(token);
+      const percentileKey = percentileOverride ?? this.config.KEEPER_FEE_PERCENTILE;
+      const percentile = `%{percentileKey}` as keyof typeof stats.sorobanInclusionFee;
       const requestedFee = BigInt(stats.sorobanInclusionFee[percentile]);
       const baseFee = BigInt(BASE_FEE);
       const fee = requestedFee > baseFee ? requestedFee : baseFee;
@@ -1300,6 +1306,12 @@ export class Keeper {
       const baseFee = BigInt(BASE_FEE);
       return baseFee < maxFee ? baseFee : maxFee;
     }
+  }
+
+  /** Get the active token for the current mandate being processed. */
+  private getActiveToken(): string {
+    // TODO: implement - return the token contract id for the current mandate
+    return "native";
   }
 
   /** Most recent pass first; errors are already scrubbed of keys and secrets. */
