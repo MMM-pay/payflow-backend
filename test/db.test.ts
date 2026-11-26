@@ -149,6 +149,37 @@ describe("forward-only schema migrations", () => {
     db.close();
   });
 
+  test("marks legacy raw events projected but keeps later staged events pending", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE events (
+        event_id TEXT PRIMARY KEY, contract_id TEXT NOT NULL, ledger INTEGER NOT NULL,
+        tx_hash TEXT NOT NULL, event_index TEXT NOT NULL, topics TEXT NOT NULL,
+        data TEXT NOT NULL, close_time INTEGER
+      );
+      INSERT INTO events VALUES ('legacy', 'contract', 1, 'tx-1', '1', '[]', 'data', NULL);
+    `);
+
+    migrate(db);
+    assert.equal(
+      (db.prepare("SELECT projected FROM events WHERE event_id = 'legacy'").get() as { projected: number }).projected,
+      1,
+      "existing rows came from previously projected windows",
+    );
+
+    db.prepare(`
+      INSERT INTO events (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+      VALUES ('staged', 'contract', 2, 'tx-2', '2', '[]', 'data', NULL)
+    `).run();
+    migrate(db);
+    assert.equal(
+      (db.prepare("SELECT projected FROM events WHERE event_id = 'staged'").get() as { projected: number }).projected,
+      0,
+      "a repeated migration leaves newly staged events pending",
+    );
+    db.close();
+  });
+
   test("an existing database gains keeper_claims on open, keeps its keeper rows, and reopens cleanly (#249)", () => {
     const dir = mkdtempSync(join(tmpdir(), "payflow-claims-migration-"));
     const path = join(dir, "legacy.db");

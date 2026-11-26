@@ -227,7 +227,7 @@ describe("per-ledger batched writes (#247)", () => {
     assert.equal(count(db, "events"), 4, "every event is retained");
   });
 
-  test("a failure mid-batch rolls the whole batch back, ledger by ledger", async () => {
+  test("a projection failure keeps staged events but rolls back projections and cursor", async () => {
     const db = openDatabase(":memory:");
     db.exec(`CREATE TRIGGER fail_second_plan BEFORE INSERT ON plans
       WHEN NEW.id = 2 BEGIN SELECT RAISE(ABORT, 'projection failure'); END`);
@@ -242,7 +242,12 @@ describe("per-ledger batched writes (#247)", () => {
     await assert.rejects(ix.tick(), /projection failure/);
 
     assert.deepEqual(planRows(db), [], "the first ledger's rows rolled back with the batch");
-    assert.equal(count(db, "events"), 0, "its raw events rolled back too");
+    assert.equal(count(db, "events"), 2, "raw events are durable before projection");
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS n FROM events WHERE projected = 1").get() as { n: number }).n,
+      0,
+      "staged events remain pending",
+    );
     assert.equal(cursorOf(db), 0, "the cursor did not advance");
   });
 

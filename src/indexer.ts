@@ -494,10 +494,11 @@ export class Indexer {
           pastEnd = true;
           break;
         }
-        await this.retain(raw);
+        const pending = await this.retain(raw);
+        if (!pending) continue;
         const decoded = decodeEvent(raw);
-        if (!decoded) continue;
-        if ((await this.apply(decoded)) !== "mismatched") applied += 1;
+        if (decoded && (await this.apply(decoded)) !== "mismatched") applied += 1;
+        await this.markProjected([eventIdOf(raw)]);
       }
       if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
       cursor = page.cursor;
@@ -534,12 +535,17 @@ export class Indexer {
 
     for (;;) {
       let pastEnd = false;
+      const retained: rpc.Api.EventResponse[] = [];
       for (const raw of page.events ?? []) {
         if (raw.ledger >= end) {
           pastEnd = true;
           break;
         }
         collected.push(raw);
+        retained.push(raw);
+      }
+      for (const ledgerEvents of groupByLedger(retained)) {
+        await this.retainAll(ledgerEvents);
       }
       if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
       page = await this.server.getEvents({ cursor: page.cursor, filters, limit: PAGE_LIMIT });
@@ -668,11 +674,15 @@ export class Indexer {
         let wMismatched = 0;
         let wLastSeenCloseTime: number | null = null;
         const notifications: DecodedEvent[] = [];
+        const seenEventIds = new Set<string>();
 
         for (const ledgerEvents of groupByLedger(rpcEvents)) {
-          const firstDeliveries = await this.retainAll(ledgerEvents, storage);
+          const pendingEvents = await this.pendingEventIds(ledgerEvents, storage);
           for (const raw of ledgerEvents) {
-            if (!firstDeliveries.has(eventIdOf(raw))) continue;
+            const eventId = eventIdOf(raw);
+            if (seenEventIds.has(eventId)) continue;
+            seenEventIds.add(eventId);
+            if (!pendingEvents.has(eventId)) continue;
             const closeTime = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
             if (closeTime !== null) wLastSeenCloseTime = closeTime;
             const decoded = decodeEvent(raw);
@@ -680,6 +690,7 @@ export class Indexer {
             if ((await this.apply(decoded, storage, notifications)) !== "mismatched") wApplied += 1;
             else wMismatched += 1;
           }
+          await this.markProjected([...pendingEvents], storage);
         }
 
         await storage.run(
@@ -712,8 +723,8 @@ export class Indexer {
 
 
   /** Preserve every event before decoding, including unknown contract events. */
-  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<void> {
-    await this.retainAll([raw], storage);
+  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<boolean> {
+    return (await this.retainAll([raw], storage)).has(eventIdOf(raw));
   }
 
   /**
@@ -723,24 +734,23 @@ export class Indexer {
    * `INSERT OR IGNORE` keeps a replay idempotent, whichever chunk a repeated
    * event lands in.
    *
-   * Returns the ids this delivery actually added. An id already present in the
-   * `events` table means the event was projected in the transaction that
-   * retained it, so the caller can drop the duplicate instead of applying and
-   * counting it again (#243).
+   * Returns the ids that still need projection. Raw pages can be durable
+   * before their window is applied, so presence in `events` alone no longer
+   * means an event has already been projected.
    */
   private async retainAll(
     events: readonly rpc.Api.EventResponse[],
     storage: Storage = this.db,
   ): Promise<Set<string>> {
-    const firstDeliveries = new Set<string>();
+    const pendingEvents = new Set<string>();
     for (let i = 0; i < events.length; i += RETAIN_CHUNK) {
       const chunk = events.slice(i, i + RETAIN_CHUNK);
       const ids = chunk.map(eventIdOf);
-      const existing = await storage.all<{ event_id: string }>(
-        `SELECT event_id FROM events WHERE event_id IN (${ids.map(() => "?").join(", ")})`,
+      const existing = await storage.all<{ event_id: string; projected: number }>(
+        `SELECT event_id, projected FROM events WHERE event_id IN (${ids.map(() => "?").join(", ")})`,
         ids,
       );
-      const retained = new Set(existing.map((row) => row.event_id));
+      const retained = new Map(existing.map((row) => [row.event_id, row.projected]));
       const values = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
       const parameters = chunk.flatMap((raw) => {
         const topics = raw.topic.map((topic) => topic.toXDR("base64"));
@@ -762,10 +772,36 @@ export class Indexer {
         parameters,
       );
       for (const id of ids) {
-        if (!retained.has(id)) firstDeliveries.add(id);
+        if (retained.get(id) !== 1) pendingEvents.add(id);
       }
     }
-    return firstDeliveries;
+    return pendingEvents;
+  }
+
+  private async pendingEventIds(
+    events: readonly rpc.Api.EventResponse[],
+    storage: Storage,
+  ): Promise<Set<string>> {
+    const pendingEvents = new Set<string>();
+    for (let i = 0; i < events.length; i += RETAIN_CHUNK) {
+      const ids = events.slice(i, i + RETAIN_CHUNK).map(eventIdOf);
+      const pending = await storage.all<{ event_id: string }>(
+        `SELECT event_id FROM events WHERE projected = 0 AND event_id IN (${ids.map(() => "?").join(", ")})`,
+        ids,
+      );
+      for (const row of pending) pendingEvents.add(row.event_id);
+    }
+    return pendingEvents;
+  }
+
+  private async markProjected(eventIds: readonly string[], storage: Storage = this.db): Promise<void> {
+    for (let i = 0; i < eventIds.length; i += RETAIN_CHUNK) {
+      const chunk = eventIds.slice(i, i + RETAIN_CHUNK);
+      await storage.run(
+        `UPDATE events SET projected = 1 WHERE event_id IN (${chunk.map(() => "?").join(", ")})`,
+        chunk,
+      );
+    }
   }
 
   /** Rebuild event-derived projections locally, without querying RPC. */

@@ -3,16 +3,17 @@ import { openDatabase } from "../db.ts";
 import type { SqlParameters, Storage } from "./types.ts";
 
 function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
-  for (const [key, value] of Object.entries(row)) {
+  const normalized = { ...row };
+  for (const [key, value] of Object.entries(normalized)) {
     if (
       typeof value === "bigint" &&
       value <= BigInt(Number.MAX_SAFE_INTEGER) &&
       value >= BigInt(Number.MIN_SAFE_INTEGER)
     ) {
-      row[key] = Number(value);
+      normalized[key] = Number(value);
     }
   }
-  return row;
+  return normalized;
 }
 
 class SqliteTransaction implements Storage {

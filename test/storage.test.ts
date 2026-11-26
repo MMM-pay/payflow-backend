@@ -596,6 +596,7 @@ async function makeAuthApp(storage: Storage): Promise<{ server: Server; base: st
     SEP10_HOME_DOMAIN: "payflow.example",
     SEP10_WEB_AUTH_DOMAIN: "api.payflow.example",
     SEP10_JWT_TTL_S: 900,
+    SEP10_REFRESH_TTL_S: 604_800,
   } as unknown as Config;
   // No account exists on the fake RPC, so a master-key signature is enough to sign in.
   const fakeRpc = {

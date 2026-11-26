@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS events (
   event_index TEXT NOT NULL,
   topics      TEXT NOT NULL,
   data        TEXT NOT NULL,
-  close_time  INTEGER
+  close_time  INTEGER,
+  projected   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_ledger ON events(ledger, event_id);
 
@@ -492,6 +493,22 @@ export function migrate(db: DatabaseSync): void {
       db.exec("UPDATE webhook_deliveries SET response_body = NULL WHERE response_body IS NOT NULL");
     }
     db.prepare("INSERT INTO schema_migrations (version) VALUES (1)").run();
+  }
+
+  const eventProjectionMigration = db
+    .prepare("SELECT 1 FROM schema_migrations WHERE version = 2")
+    .get();
+  if (!eventProjectionMigration) {
+    const eventColumns = db.prepare("SELECT name FROM pragma_table_info('events')").all() as {
+      name: string;
+    }[];
+    if (eventColumns.length > 0) {
+      if (!eventColumns.some((column) => column.name === "projected")) {
+        db.exec("ALTER TABLE events ADD COLUMN projected INTEGER NOT NULL DEFAULT 0");
+        db.exec("UPDATE events SET projected = 1");
+      }
+      db.prepare("INSERT INTO schema_migrations (version) VALUES (2)").run();
+    }
   }
 
   // Seed these additive projections for databases created before the tables

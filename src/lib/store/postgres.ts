@@ -62,8 +62,10 @@ CREATE TABLE IF NOT EXISTS events (
   event_index TEXT NOT NULL,
   topics TEXT NOT NULL,
   data TEXT NOT NULL,
-  close_time BIGINT
+  close_time BIGINT,
+  projected INTEGER NOT NULL DEFAULT 0
 );
+ALTER TABLE events ADD COLUMN IF NOT EXISTS projected INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS events_ledger ON events(ledger, event_id);
 CREATE INDEX IF NOT EXISTS events_contract_ledger ON events(contract_id, ledger, event_id);
 CREATE TABLE IF NOT EXISTS cursor (
@@ -78,8 +80,16 @@ CREATE TABLE IF NOT EXISTS plans (
   amount TEXT NOT NULL,
   period BIGINT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
-  ledger BIGINT NOT NULL
+  ledger BIGINT NOT NULL,
+  payout_address TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL DEFAULT 0,
+  updated_at BIGINT NOT NULL DEFAULT 0,
+  deleted_at BIGINT NOT NULL DEFAULT 0
 );
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS payout_address TEXT NOT NULL DEFAULT '';
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS created_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS deleted_at BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS plans_merchant ON plans(merchant);
 CREATE TABLE IF NOT EXISTS mandates (
   id BIGINT PRIMARY KEY,
@@ -95,8 +105,14 @@ CREATE TABLE IF NOT EXISTS mandates (
   fee_bps INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'Active',
   ended_by TEXT,
-  ledger BIGINT NOT NULL
+  ledger BIGINT NOT NULL,
+  created_at BIGINT NOT NULL DEFAULT 0,
+  updated_at BIGINT NOT NULL DEFAULT 0,
+  deleted_at BIGINT NOT NULL DEFAULT 0
 );
+ALTER TABLE mandates ADD COLUMN IF NOT EXISTS created_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE mandates ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE mandates ADD COLUMN IF NOT EXISTS deleted_at BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS mandates_subscriber ON mandates(subscriber);
 CREATE INDEX IF NOT EXISTS mandates_merchant ON mandates(merchant);
 CREATE INDEX IF NOT EXISTS mandates_due ON mandates(status, next_charge);
@@ -123,8 +139,14 @@ CREATE TABLE IF NOT EXISTS charges (
   next_charge BIGINT NOT NULL,
   ledger BIGINT NOT NULL,
   created_at BIGINT NOT NULL,
+  token TEXT NOT NULL DEFAULT 'native',
+  updated_at BIGINT NOT NULL DEFAULT 0,
+  deleted_at BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (tx_hash, mandate_id)
 );
+ALTER TABLE charges ADD COLUMN IF NOT EXISTS token TEXT NOT NULL DEFAULT 'native';
+ALTER TABLE charges ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE charges ADD COLUMN IF NOT EXISTS deleted_at BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS charges_merchant ON charges(merchant);
 CREATE INDEX IF NOT EXISTS charges_merchant_created_at ON charges(merchant, created_at);
 CREATE INDEX IF NOT EXISTS charges_subscriber ON charges(subscriber);
@@ -178,6 +200,14 @@ CREATE TABLE IF NOT EXISTS merchant_profiles (
   url TEXT NOT NULL DEFAULT '',
   ledger BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plan_payout_addresses (
+  plan_id BIGINT NOT NULL,
+  payout_address TEXT NOT NULL,
+  ledger BIGINT NOT NULL,
+  changed_at BIGINT NOT NULL,
+  PRIMARY KEY (plan_id, payout_address)
+);
+CREATE INDEX IF NOT EXISTS plan_payout_addresses_plan ON plan_payout_addresses(plan_id);
 CREATE TABLE IF NOT EXISTS merchant_notification_preferences (
   merchant TEXT PRIMARY KEY,
   events TEXT NOT NULL,
@@ -363,7 +393,27 @@ class PgExecutor implements Storage {
   }
 
   async transaction<Result>(work: (storage: Storage) => Promise<Result>): Promise<Result> {
-    return work(this);
+    const releaseClient = this.client instanceof Pool;
+    const client = releaseClient ? await this.client.connect() : this.client;
+    try {
+      await client.query("BEGIN");
+      const result = await work(new PgExecutor(client));
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Database transaction failed and rollback also failed",
+          { cause: rollbackError },
+        );
+      }
+      throw error;
+    } finally {
+      if (releaseClient) client.release();
+    }
   }
 
   async close(): Promise<void> {}
@@ -409,6 +459,13 @@ export class PostgresStorage extends PgExecutor implements Storage {
     if (!webhookResponseRedaction) {
       await storage.run("UPDATE webhook_deliveries SET response_body = NULL WHERE response_body IS NOT NULL");
       await storage.run("INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT DO NOTHING");
+    }
+    const eventProjectionMigration = await storage.get<{ version: number }>(
+      "SELECT version FROM schema_migrations WHERE version = 2",
+    );
+    if (!eventProjectionMigration) {
+      await storage.run("UPDATE events SET projected = 1");
+      await storage.run("INSERT INTO schema_migrations (version) VALUES (2) ON CONFLICT DO NOTHING");
     }
     await storage.run(`
       INSERT INTO plan_active_subscribers (plan_id, subscriber, mandate_count)
