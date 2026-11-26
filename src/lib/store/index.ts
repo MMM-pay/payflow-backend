@@ -69,7 +69,10 @@ export function asStorage(database: Storage | DatabaseSync): Storage {
 
 export async function openStorage(network: NetworkConfig): Promise<Storage> {
   if (network.databaseUrl) {
-    return PostgresStorage.open(network.databaseUrl, network.name);
+    // The pool is sized per process (#263): every API, indexer and keeper
+    // process holds its own, so the cap has to leave room inside the server's
+    // max_connections for the others.
+    return PostgresStorage.open(network.databaseUrl, network.name, network.pool);
   }
   return SqliteStorage.open(network.databasePath);
 }

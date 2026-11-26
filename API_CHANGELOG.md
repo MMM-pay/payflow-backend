@@ -151,6 +151,12 @@ release that ships them numbers them here.
 
 ### Changed
 
+- **`failures` on `GET /api/mandates/:id/attempts` counts only the mandate's
+  own failures (#248).** An attempt that failed for a reason outside the
+  mandate (the RPC or network, a stale sequence number, a refused keeper
+  signer) keeps the streak it found and carries a `retryAt` one base delay
+  away; a permanent refusal carries a `retryAt` at the longest backoff. The
+  response shape is unchanged.
 - **The typed client calls `/api/v1`.** Response types and behaviour are
   unchanged; only the path prefix moves. A client still calling `/api` keeps
   working through the alias (#173).

@@ -49,3 +49,7 @@ services:
         sync: false
       - key: CORS_ORIGIN
         value: https://mmm-pay.github.io
+      # Reject plaintext requests; Render terminates TLS and sets
+      # X-Forwarded-Proto. /health stays reachable for the platform probe.
+      - key: REQUIRE_HTTPS
+        value: "true"

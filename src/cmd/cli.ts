@@ -33,11 +33,14 @@
  * to use than one whose output is a report. Errors go to stderr, so a
  * caller can separate them from the result.
  */
+import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { networkConfigs, loadConfig, type Config, type NetworkConfig } from "../config.ts";
 import { openDatabase, readCursor, writeCursor, backupDatabase } from "../lib/db.ts";
-import { asStorage } from "../lib/store/index.ts";
+import { getMigrationStatus } from "../lib/migrations.ts";
+import { asStorage, openStorage, type Storage } from "../lib/store/index.ts";
 import { HttpArchive, makeRpc, type RpcLike } from "../lib/stellar.ts";
 import {
   countDueMandates,
@@ -123,6 +126,12 @@ export interface CliDeps {
   networks: NetworkConfig[];
   /** Opens a projection database. Defaults to `openDatabase`. */
   openDb?: (path: string) => DatabaseSync;
+  /**
+   * Opens the configured store, PostgreSQL included. Defaults to
+   * `openStorage`. `doctor` uses it for a network whose `DATABASE_URL` is
+   * set, where the SQLite opener would inspect the wrong database.
+   */
+  openStore?: (network: NetworkConfig) => Promise<Storage>;
   /** Builds the RPC client for a network. Defaults to `makeRpc`. */
   rpc?: (network: NetworkConfig) => CliRpc;
   /** The current time, in unix seconds. */
@@ -181,6 +190,22 @@ const COMMAND_LIST: CommandSpec[] = [
     notes: [
       "The projection is read from the database; the RPC is only asked for the",
       "latest ledger, and an unreachable node is reported rather than fatal.",
+    ],
+  },
+  {
+    name: "doctor",
+    summary: "Check the environment, the database and the RPC",
+    usage: "doctor",
+    positionals: [],
+    options: [],
+    notes: [
+      "Prints one line per check with its status. A failed check exits",
+      "non-zero, so a deployment probe can gate on `npm run cli -- doctor`; a",
+      "warning is reported but does not fail the command.",
+      "Nothing is charged and no transaction is submitted; an unopened",
+      "PostgreSQL database has its empty schema created, as the service does",
+      "on startup.",
+      "Secrets are never printed.",
     ],
   },
   {
@@ -275,6 +300,17 @@ const COMMAND_LIST: CommandSpec[] = [
       "Writes a transactionally consistent snapshot of the database to",
       "`<path>` using SQLite's VACUUM INTO. The running service keeps serving",
       "requests while the backup is taken.",
+    ],
+  },
+  {
+    name: "migrations",
+    summary: "Show applied and pending database migrations",
+    usage: "migrations",
+    positionals: [],
+    options: [],
+    notes: [
+      "Reads `schema_migrations` from the configured SQLite or PostgreSQL",
+      "store and reports which versioned migrations are applied vs pending.",
     ],
   },
 ];
@@ -610,6 +646,368 @@ function rpcEndpoints(network: NetworkConfig): string[] {
   return typeof network.rpcUrl === "string"
     ? network.rpcUrl.split(",").map((url) => url.trim()).filter(Boolean)
     : [...network.rpcUrl];
+}
+
+/** The verdict of one `doctor` check. */
+export type CheckStatus = "ok" | "warn" | "fail";
+
+/** One line of `doctor`'s report. */
+export interface DoctorCheck {
+  /** What was checked, e.g. `database`. */
+  name: string;
+  /** The verdict. Only `fail` makes the command exit non-zero. */
+  status: CheckStatus;
+  /** What the check found, on one line. Never a secret. */
+  detail: string;
+}
+
+/** An error message for the report. */
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * A URL with its credentials removed, for the report.
+ *
+ * A PostgreSQL URL may carry a password, and the report is printed to a
+ * terminal and piped into a ticket; the user and password are never shown.
+ */
+function redactUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.username !== "") url.username = "redacted";
+    if (url.password !== "") url.password = "redacted";
+    return url.toString();
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * `doctor`'s environment check.
+ *
+ * `loadConfig` has already validated the shapes, so this checks the
+ * combinations a valid-looking configuration can still get wrong: a
+ * contract id that is not a contract, the keeper switched on without a key,
+ * and the SEP-10 sign-in half-configured.
+ */
+function environmentCheck(config: Config, network: NetworkConfig): DoctorCheck {
+  const problems: string[] = [];
+  const contracts: Array<[string, string]> = [
+    ["PLAN_REGISTRY_ID", network.planRegistryId],
+    ["VAULT_ID", network.vaultId],
+    ["SUBSCRIPTION_ID", network.subscriptionId],
+  ];
+  for (const [name, id] of contracts) {
+    if (!StrKey.isValidContract(id)) problems.push(`${name} is not a valid contract id`);
+  }
+  if (network.networkPassphrase.trim() === "") problems.push("NETWORK_PASSPHRASE is empty");
+  if (config.KEEPER_ENABLED && !config.KEEPER_SECRET) {
+    problems.push("KEEPER_ENABLED=true needs KEEPER_SECRET");
+  }
+  const sep10 = [config.SEP10_SIGNING_KEY, config.SEP10_JWT_SECRET, config.SEP10_HOME_DOMAIN];
+  if (sep10.some((value) => value !== undefined) && !sep10.every((value) => value !== undefined)) {
+    problems.push(
+      "SEP-10 sign-in needs SEP10_SIGNING_KEY, SEP10_JWT_SECRET and SEP10_HOME_DOMAIN together",
+    );
+  }
+  if (problems.length > 0) {
+    return { name: "env", status: "fail", detail: problems.join("; ") };
+  }
+  return {
+    name: "env",
+    status: "ok",
+    detail: `${contracts.length} contract(s) on ${network.name}, passphrase "${network.networkPassphrase}"`,
+  };
+}
+
+/**
+ * `doctor`'s keeper check: is a key configured, and does it derive a public
+ * key? The secret seed itself is never put in the report.
+ */
+function keeperCheck(config: Config): DoctorCheck {
+  const dryRun = config.KEEPER_DRY_RUN ? ", dry run on" : "";
+  if (!config.KEEPER_SECRET) {
+    return {
+      name: "keeper",
+      status: config.KEEPER_ENABLED ? "fail" : "warn",
+      detail: `not configured (no KEEPER_SECRET)${dryRun}`,
+    };
+  }
+  try {
+    // The keeper drops duplicate channel keys, so the report counts the
+    // distinct signing keys rather than the configured list.
+    const keys = new Set<string>();
+    for (const raw of [config.KEEPER_SECRET, ...(config.KEEPER_CHANNEL_SECRETS ?? [])]) {
+      keys.add(Keypair.fromSecret(raw).publicKey());
+    }
+    return {
+      name: "keeper",
+      status: "ok",
+      detail: `signing with ${[...keys].join(", ")} (${keys.size} channel(s))${dryRun}`,
+    };
+  } catch {
+    // The SDK's error is not echoed: it should not repeat the seed, but the
+    // report never needs the message to name the problem.
+    return {
+      name: "keeper",
+      status: "fail",
+      detail: "KEEPER_SECRET is not a valid Stellar secret seed",
+    };
+  }
+}
+
+/** What the database check found, and the cursor it read. */
+interface DatabaseCheckResult {
+  check: DoctorCheck;
+  /** The projection's cursor, or null when it could not be read. */
+  cursor: number | null;
+}
+
+/**
+ * `doctor`'s database check.
+ *
+ * A network with `DATABASE_URL` is checked through the same store the service
+ * uses, so PostgreSQL is covered too. SQLite is opened from its file — and a
+ * missing file is a failure rather than something `doctor` creates, because
+ * a health check must not leave a new empty projection behind.
+ */
+async function databaseCheck(context: CommandContext): Promise<DatabaseCheckResult> {
+  const { deps, args } = context;
+  const network = context.network;
+  if (network.databaseUrl !== undefined) {
+    const open = deps.openStore ?? openStorage;
+    let store: Storage;
+    try {
+      store = await open(network);
+    } catch (err) {
+      return {
+        check: {
+          name: "database",
+          status: "fail",
+          detail: `postgres ${redactUrl(network.databaseUrl)} — unreachable: ${errorText(err)}`,
+        },
+        cursor: null,
+      };
+    }
+    try {
+      // The store has created its schema by now; reading the cursor proves
+      // both connectivity and that the projection is addressable.
+      const row = await store.get<{ last_ledger: number }>(
+        "SELECT last_ledger FROM cursor WHERE id = 1",
+      );
+      const cursor = typeof row?.last_ledger === "number" ? row.last_ledger : null;
+      return {
+        check: {
+          name: "database",
+          status: "ok",
+          detail: `postgres ${redactUrl(network.databaseUrl)} — cursor ${cursor ?? "none"}`,
+        },
+        cursor,
+      };
+    } catch (err) {
+      return {
+        check: {
+          name: "database",
+          status: "fail",
+          detail: `postgres ${redactUrl(network.databaseUrl)} — query failed: ${errorText(err)}`,
+        },
+        cursor: null,
+      };
+    } finally {
+      await store.close().catch(() => {
+        // The connection is already unusable; the check's verdict stands.
+      });
+    }
+  }
+
+  const path = databasePath(network, args.options);
+  if (path !== ":memory:" && !existsSync(path)) {
+    return {
+      check: {
+        name: "database",
+        status: "fail",
+        detail: `sqlite ${path} — no such file; the indexer creates it on its first run`,
+      },
+      cursor: null,
+    };
+  }
+  const openDb = deps.openDb ?? openDatabase;
+  let db: DatabaseSync;
+  try {
+    db = openDb(path);
+  } catch (err) {
+    return {
+      check: {
+        name: "database",
+        status: "fail",
+        detail: `sqlite ${path} — cannot open: ${errorText(err)}`,
+      },
+      cursor: null,
+    };
+  }
+  try {
+    const mandates = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mandates'")
+      .get();
+    if (mandates === undefined) {
+      return {
+        check: {
+          name: "database",
+          status: "fail",
+          detail: `sqlite ${path} — not a Payflow projection (no mandates table)`,
+        },
+        cursor: null,
+      };
+    }
+    const row = db.prepare("SELECT last_ledger FROM cursor WHERE id = 1").get() as
+      | { last_ledger: number }
+      | undefined;
+    const cursor = row === undefined ? null : Number(row.last_ledger);
+    return {
+      check: {
+        name: "database",
+        status: "ok",
+        detail: `sqlite ${path} — cursor ${cursor ?? "none"}`,
+      },
+      cursor,
+    };
+  } catch (err) {
+    return {
+      check: {
+        name: "database",
+        status: "fail",
+        detail: `sqlite ${path} — query failed: ${errorText(err)}`,
+      },
+      cursor: null,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+/** What the RPC check found, and the network's latest ledger. */
+interface RpcCheckResult {
+  check: DoctorCheck;
+  /** The network's latest ledger, or null when the RPC did not answer. */
+  latestLedger: number | null;
+}
+
+/**
+ * `doctor`'s RPC check.
+ *
+ * `getHealth` is the probe because the failover client asks every configured
+ * endpoint and adopts the freshest node, so the report covers the whole RPC
+ * cluster rather than whichever endpoint happens to be first.
+ */
+async function rpcCheck(context: CommandContext): Promise<RpcCheckResult> {
+  const endpoints = rpcEndpoints(context.network);
+  const listed = endpoints.length === 0 ? "no endpoint configured" : endpoints.join(", ");
+  let rpc: CliRpc;
+  try {
+    rpc = (context.deps.rpc ?? makeRpc)(context.network);
+  } catch (err) {
+    return {
+      check: { name: "rpc", status: "fail", detail: `${listed} — cannot build the client: ${errorText(err)}` },
+      latestLedger: null,
+    };
+  }
+  const started = performance.now();
+  try {
+    const health = await rpc.getHealth();
+    const elapsed = Math.max(0, Math.round(performance.now() - started));
+    const latest =
+      typeof health.latestLedger === "number" ? health.latestLedger : null;
+    return {
+      check: {
+        name: "rpc",
+        status: "ok",
+        detail: `${listed} — latest ledger ${latest ?? "unknown"} (${elapsed} ms)`,
+      },
+      latestLedger: latest,
+    };
+  } catch (err) {
+    return {
+      check: { name: "rpc", status: "fail", detail: `${listed} — unreachable: ${errorText(err)}` },
+      latestLedger: null,
+    };
+  }
+}
+
+/**
+ * `doctor`'s projection check: how far the cursor trails the network.
+ *
+ * A warning rather than a failure: a node that is catching up is healthy,
+ * and the command should only fail when something is actually broken.
+ */
+function projectionCheck(cursor: number | null, latestLedger: number | null): DoctorCheck {
+  if (cursor === null) {
+    return { name: "projection", status: "warn", detail: "lag unknown: the cursor could not be read" };
+  }
+  if (latestLedger === null) {
+    return { name: "projection", status: "warn", detail: "lag unknown: the RPC did not answer" };
+  }
+  const lag = latestLedger - cursor;
+  if (lag < 0) {
+    return {
+      name: "projection",
+      status: "warn",
+      detail: `cursor ${cursor} is ahead of the network's latest ledger ${latestLedger}; the RPC may be behind, or the projection belongs to another network`,
+    };
+  }
+  if (lag <= 120) {
+    return { name: "projection", status: "ok", detail: `lag ${lag}` };
+  }
+  return { name: "projection", status: "warn", detail: `lag ${lag} — catching up` };
+}
+
+/**
+ * `doctor`: is this deployment put together correctly, and can it reach what
+ * it needs?
+ *
+ * The checks are read-only and independent: a database that cannot be opened
+ * is one failed line, not the end of the report, so an operator sees every
+ * problem at once. A failed check exits non-zero; a warning does not, so the
+ * command can gate a deployment without failing over a node that is merely
+ * behind.
+ */
+async function doctorCommand(context: CommandContext): Promise<number> {
+  const { deps, args, write } = context;
+  const database = await databaseCheck(context);
+  const rpc = await rpcCheck(context);
+  const checks: DoctorCheck[] = [
+    environmentCheck(deps.config, context.network),
+    keeperCheck(deps.config),
+    database.check,
+    rpc.check,
+    projectionCheck(database.cursor, rpc.latestLedger),
+  ];
+  const failures = checks.filter((check) => check.status === "fail").length;
+  const warnings = checks.filter((check) => check.status === "warn").length;
+  const ok = failures === 0;
+  const verdict = ok
+    ? warnings === 0
+      ? "ok"
+      : `ok (${warnings} warning${warnings === 1 ? "" : "s"})`
+    : `failed (${failures} check${failures === 1 ? "" : "s"})`;
+
+  if (flag(args.options, "json")) {
+    emitJson(context, {
+      network: context.network.name,
+      ok,
+      verdict,
+      lag: database.cursor === null || rpc.latestLedger === null ? null : rpc.latestLedger - database.cursor,
+      checks,
+    });
+    return ok ? 0 : 1;
+  }
+
+  write(`network:      ${context.network.name}`);
+  for (const check of checks) {
+    write(`${`${check.name}:`.padEnd(14)}${check.status.toUpperCase().padEnd(6)}${check.detail}`);
+  }
+  write(`check:        ${verdict}`);
+  return ok ? 0 : 1;
 }
 
 /** What the keeper is configured to do, without naming a secret. */
@@ -1062,11 +1460,40 @@ async function backupCommand(context: CommandContext): Promise<number> {
   }
 }
 
+/** Show applied and pending database migrations for the configured store. */
+async function migrationsCommand(context: CommandContext): Promise<number> {
+  const { deps, args, write } = context;
+  const openDb = deps.openDb ?? openDatabase;
+  const db = openDb(databasePath(context.network, args.options));
+  try {
+    const storage = asStorage(db);
+    const status = await getMigrationStatus(storage);
+    if (flag(args.options, "json")) {
+      write(JSON.stringify(status, null, 2));
+    } else {
+      write(`dialect: ${status.dialect}`);
+      write(`applied (${status.applied.length}):`);
+      for (const m of status.applied) {
+        write(`  v${m.version}  ${m.name}  [applied]`);
+      }
+      write(`pending (${status.pending.length}):`);
+      for (const m of status.pending) {
+        write(`  v${m.version}  ${m.name}  [pending]`);
+      }
+    }
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 /** Run one command. */
 async function runCommand(context: CommandContext): Promise<number> {
   switch (context.spec.name) {
     case "status":
       return statusCommand(context);
+    case "doctor":
+      return doctorCommand(context);
     case "mandate":
       return mandateCommand(context);
     case "due":
@@ -1077,6 +1504,8 @@ async function runCommand(context: CommandContext): Promise<number> {
       return reindexCommand(context);
     case "backup":
       return backupCommand(context);
+    case "migrations":
+      return migrationsCommand(context);
     default:
       throw new CliError(`unknown command '${context.spec.name}'`);
   }

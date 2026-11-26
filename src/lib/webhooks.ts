@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -17,7 +17,7 @@ import type {
   WebhookSummary,
   WebhookTestResult,
 } from "../routes/types.ts";
-import { logger } from "./logger.ts";
+import { logger, maskAccount } from "./logger.ts";
 
 /** Most delivery attempts before a webhook is marked failed. */
 const MAX_ATTEMPTS = 5;
@@ -145,15 +145,22 @@ function postToPinnedAddress(
     request.on("error", reject);
     request.on("response", (response) => {
       const status = response.statusCode ?? 0;
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk: string) => { body += chunk; });
       response.on("error", reject);
-      response.on("end", () => resolve({ status, ok: status >= 200 && status < 300, text: async () => body }));
+      response.on("end", () => resolve({ status, ok: status >= 200 && status < 300 }));
+      response.resume();
     });
     if (typeof init.body === "string") request.write(init.body);
     request.end();
   });
+}
+
+/** A webhook URL's host, for a log line; never its path or query. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "[invalid url]";
+  }
 }
 
 function backoffSeconds(attempt: number): number {
@@ -177,7 +184,7 @@ export interface Webhook {
 interface FetchResponse {
   status: number;
   ok: boolean;
-  text: () => Promise<string>;
+  body?: { cancel: () => Promise<void> } | null;
 }
 
 interface DeliveryRow {
@@ -188,7 +195,6 @@ interface DeliveryRow {
   attempt: number;
   status: string;
   http_status: number | null;
-  response_body: string | null;
   error: string | null;
   payload: string;
   retry_at: number;
@@ -211,6 +217,22 @@ interface WebhookRow {
 
 /** How one delivery attempt went. */
 type AttemptOutcome = Omit<WebhookTestResult, "deliveryId">;
+
+/**
+ * The `Idempotency-Key` a delivery carries: stable per (webhook, event), so
+ * the same event delivered twice — and every retry of it — presents the same
+ * key to the receiver, which can drop a repeat it has already processed.
+ */
+function idempotencyKeyFor(webhookId: number, eventId: string): string {
+  const digest = createHash("sha256").update(`${webhookId}:${eventId}`, "utf8").digest("hex");
+  return [
+    digest.slice(0, 8),
+    digest.slice(8, 12),
+    digest.slice(12, 16),
+    digest.slice(16, 20),
+    digest.slice(20, 32),
+  ].join("-");
+}
 
 /**
  * The `Payflow-Signature` header: `sha256=<hex>` under the current secret
@@ -453,7 +475,8 @@ export class WebhookDispatcher {
     );
     if (!webhook) return null;
     const payload = JSON.stringify({ event: "ping", webhook_id: id, merchant });
-    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, randomUUID(), payload);
+    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, payload);
+    if (!delivery) throw new Error("webhook ping unexpectedly matched an existing event");
     return { deliveryId: delivery.id, ...(await this.attempt(delivery, webhook)) };
   }
 
@@ -510,7 +533,6 @@ export class WebhookDispatcher {
       attempt: number;
       status: string;
       http_status: number | null;
-      response_body: string | null;
       error: string | null;
       payload: string;
       retry_at: number;
@@ -522,7 +544,7 @@ export class WebhookDispatcher {
       previous_secret_expires_at: number | null;
     }>(
         `SELECT d.id, d.webhook_id, d.event_id, d.idempotency_key, d.attempt, d.status,
-                d.http_status, d.response_body, d.error, d.payload, d.retry_at, d.created_at,
+                d.http_status, d.error, d.payload, d.retry_at, d.created_at,
                 w.merchant, w.url, w.secret, w.previous_secret, w.previous_secret_expires_at
            FROM webhook_deliveries d
            JOIN webhooks w ON w.id = d.webhook_id
@@ -540,7 +562,6 @@ export class WebhookDispatcher {
         attempt: row.attempt,
         status: row.status,
         http_status: row.http_status,
-        response_body: row.response_body,
         error: row.error,
         payload: row.payload,
         retry_at: row.retry_at,
@@ -602,7 +623,7 @@ export class WebhookDispatcher {
     const webhooks = await this.listWebhooks(merchantAddress);
     if (webhooks.length === 0) return;
 
-    const eventId = `charge:${e.txHash}`;
+    const eventId = `charge:${e.txHash}:${num(mandateId)}`;
     const payload = JSON.stringify({
       event: e.name,
       mandate_id: num(mandateId),
@@ -646,41 +667,50 @@ export class WebhookDispatcher {
 
   /** One pending delivery and a first attempt per webhook, under one idempotency key. */
   private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
-    const idempotencyKey = randomUUID();
     for (const webhook of webhooks) {
-      await this.attempt(await this.enqueue(webhook.id, eventId, idempotencyKey, payload), webhook);
+      const delivery = await this.enqueue(webhook.id, eventId, payload);
+      if (delivery) await this.attempt(delivery, webhook);
     }
   }
 
-  /** Store a pending delivery due now, before its first attempt. */
+  /** Store one pending delivery per webhook and event, before its first attempt. */
   private async enqueue(
     webhookId: number,
     eventId: string,
-    idempotencyKey: string,
     payload: string,
-  ): Promise<DeliveryRow> {
+  ): Promise<DeliveryRow | null> {
+    const idempotencyKey = idempotencyKeyFor(webhookId, eventId);
     const now = Math.floor(Date.now() / 1000);
-    const row = await this.db.get<{ id: number }>(
-      `INSERT INTO webhook_deliveries
-         (webhook_id, event_id, idempotency_key, attempt, status, retry_at, payload, created_at)
-       VALUES (?, ?, ?, 1, 'pending', ?, ?, ?) RETURNING id`,
-      [webhookId, eventId, idempotencyKey, now, payload, now],
-    );
-    if (!row) throw new Error("webhook delivery insert returned no id");
-    return {
-      id: row.id,
-      webhook_id: webhookId,
-      event_id: eventId,
-      idempotency_key: idempotencyKey,
-      attempt: 1,
-      status: "pending",
-      http_status: null,
-      response_body: null,
-      error: null,
-      payload,
-      retry_at: now,
-      created_at: now,
-    };
+    return this.db.transaction(async (storage) => {
+      const receipt = await storage.get<{ event_key: string }>(
+        `INSERT INTO webhook_event_receipts (webhook_id, event_key)
+         VALUES (?, ?) ON CONFLICT (webhook_id, event_key) DO NOTHING
+         RETURNING event_key`,
+        [webhookId, eventId],
+      );
+      if (!receipt) return null;
+
+      const row = await storage.get<{ id: number }>(
+        `INSERT INTO webhook_deliveries
+           (webhook_id, event_id, idempotency_key, attempt, status, retry_at, payload, created_at)
+         VALUES (?, ?, ?, 1, 'pending', ?, ?, ?) RETURNING id`,
+        [webhookId, eventId, idempotencyKey, now, payload, now],
+      );
+      if (!row) throw new Error("webhook delivery insert returned no id");
+      return {
+        id: row.id,
+        webhook_id: webhookId,
+        event_id: eventId,
+        idempotency_key: idempotencyKey,
+        attempt: 1,
+        status: "pending",
+        http_status: null,
+        error: null,
+        payload,
+        retry_at: now,
+        created_at: now,
+      };
+    });
   }
 
   /** Attempt one delivery once: success marks it delivered, failure
@@ -690,7 +720,6 @@ export class WebhookDispatcher {
   private async attempt(delivery: DeliveryRow, webhook: WebhookRow): Promise<AttemptOutcome> {
     const now = Math.floor(Date.now() / 1000);
     let httpStatus: number | null = null;
-    let responseBody = "";
     let error: string | null = null;
     let ok = false;
     const started = performance.now();
@@ -712,9 +741,16 @@ export class WebhookDispatcher {
         : await postToPinnedAddress(target.url, target.addresses, init);
       httpStatus = res.status;
       ok = res.ok;
-      responseBody = await res.text();
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      try {
+        await res.body?.cancel();
+      } catch {
+        logger.debug(
+          { webhookId: webhook.id, status: httpStatus },
+          "could not discard webhook response body",
+        );
+      }
+    } catch {
+      error = "delivery request failed";
     }
     const latencyMs = Math.round(performance.now() - started);
 
@@ -722,15 +758,15 @@ export class WebhookDispatcher {
     const nextAttempt = delivery.attempt + 1;
     if (ok) {
       await this.db.run(
-        `UPDATE webhook_deliveries SET status = 'delivered', http_status = ?, response_body = ?, error = NULL WHERE id = ?`,
-        [httpStatus, responseBody, delivery.id],
+        `UPDATE webhook_deliveries SET status = 'delivered', http_status = ?, response_body = NULL, error = NULL WHERE id = ?`,
+        [httpStatus, delivery.id],
       );
       outcome = { status: "delivered", statusCode: httpStatus, latencyMs, error: null, nextRetryAt: null };
     } else if (nextAttempt > MAX_ATTEMPTS) {
       const finalError = error ?? "delivery failed";
       await this.db.run(
-        `UPDATE webhook_deliveries SET status = 'failed', http_status = ?, response_body = ?, error = ? WHERE id = ?`,
-        [httpStatus, responseBody, finalError, delivery.id],
+        `UPDATE webhook_deliveries SET status = 'failed', http_status = ?, response_body = NULL, error = ? WHERE id = ?`,
+        [httpStatus, finalError, delivery.id],
       );
       await this.db.run(
         `UPDATE webhooks SET failed = 1, failures = failures + 1, last_attempt = ?, last_status = ? WHERE id = ?`,
@@ -739,10 +775,12 @@ export class WebhookDispatcher {
       logger.warn(
         {
           webhookId: webhook.id,
-          merchant: webhook.merchant,
-          url: webhook.url,
+          merchant: maskAccount(webhook.merchant),
+          // The path and query of a merchant's endpoint can carry its own
+          // tokens; the host is enough to tell endpoints apart.
+          host: hostOf(webhook.url),
           attempts: nextAttempt,
-          lastError: error,
+          lastError: error === null ? null : maskAccount(error),
         },
         "webhook marked failed after exhausting delivery retries",
       );
@@ -751,9 +789,9 @@ export class WebhookDispatcher {
       const nextRetryAt = now + backoffSeconds(nextAttempt);
       await this.db.run(
         `UPDATE webhook_deliveries
-           SET attempt = ?, retry_at = ?, status = 'pending', error = ?, http_status = ?, response_body = ?
+           SET attempt = ?, retry_at = ?, status = 'pending', error = ?, http_status = ?, response_body = NULL
          WHERE id = ?`,
-        [nextAttempt, nextRetryAt, error, httpStatus, responseBody, delivery.id],
+        [nextAttempt, nextRetryAt, error, httpStatus, delivery.id],
       );
       await this.db.run(
         `UPDATE webhooks SET last_attempt = ?, last_status = ?, failures = failures + 1 WHERE id = ?`,

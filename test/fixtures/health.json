@@ -13,7 +13,9 @@
     "reconciliations": 0,
     "corrections": 0,
     "eventsLedger": 0,
-    "eventsLag": 0
+    "eventsLag": 0,
+    "rawEventRetentionDays": null,
+    "lastPrunedAt": null
   },
   "rpc": null,
   "contracts": {
@@ -21,6 +23,7 @@
     "vault": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
     "subscription": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
   },
+  "keeper": null,
   "networks": {
     "testnet": {
       "status": "ok",
@@ -37,14 +40,17 @@
         "reconciliations": 0,
         "corrections": 0,
         "eventsLedger": 0,
-        "eventsLag": 0
+        "eventsLag": 0,
+        "rawEventRetentionDays": null,
+        "lastPrunedAt": null
       },
       "rpc": null,
       "contracts": {
         "planRegistry": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
         "vault": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
         "subscription": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-      }
+      },
+      "keeper": null
     }
   }
 }

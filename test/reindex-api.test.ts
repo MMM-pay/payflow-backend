@@ -164,7 +164,7 @@ function withoutRequestIds(value: unknown): unknown {
   return value;
 }
 
-test("API responses survive projection rebuild and a full reindex", async () => {
+test("projection rebuild rolls back a mid-replay failure, resumes after repair, and survives a full reindex", async () => {
   const directory = mkdtempSync(join(tmpdir(), "payflow-api-reindex-"));
   const databasePath = join(directory, "payflow.db");
   const network: NetworkConfig = {
@@ -215,7 +215,7 @@ test("API responses survive projection rebuild and a full reindex", async () => 
 
     db.prepare(`INSERT INTO events
       (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
-      VALUES ('corrupt-event', ?, 99, 'tx-corrupt', '', '["not-xdr"]', 'not-xdr', NULL)`)
+      VALUES ('corrupt-event', ?, 104, 'tx-corrupt', '', '["not-xdr"]', 'not-xdr', NULL)`)
       .run(CONTRACT);
     const failedRebuild = await fetch(`${app.base}/admin/reindex`, {
       method: "POST",

@@ -21,6 +21,28 @@ cp .env.example .env
 docker compose up
 ```
 
+## Running the full local stack
+
+A single command brings up the full local stack for contributors — the REST
+API, the indexer and the settlement keeper, all in one process:
+
+```bash
+npm run dev
+```
+
+`npm run dev` runs `src/index.ts` with `RUN_API`, `RUN_INDEXER` and
+`RUN_KEEPER` all enabled by default, so the API serves on `:8080` while the
+indexer catches up with the testnet contracts and the keeper settles due
+mandates. `cp .env.example .env` is all the configuration it needs; leave
+`KEEPER_ENABLED=false` (the default) to run without settlement.
+
+The same stack runs in a container:
+
+```bash
+cp .env.example .env
+docker compose up         # builds the image and serves the API on :8080
+```
+
 ## What CI enforces
 
 | Job | Command |

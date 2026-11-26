@@ -155,6 +155,24 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     type: "counter",
   },
   {
+    key: "keeper_backoffs",
+    name: "payflow_keeper_backoffs_total",
+    help: "Failed charges the keeper scheduled a retry for since the process started, labelled by reason: mandate and permanent grow the mandate's backoff, keeper and infrastructure do not.",
+    type: "counter",
+  },
+  {
+    key: "keeper_in_flight",
+    name: "payflow_keeper_in_flight",
+    help: "Settlement transactions the keeper has in flight right now; never above KEEPER_CONCURRENCY.",
+    type: "gauge",
+  },
+  {
+    key: "keeper_low_fee_balance",
+    name: "payflow_keeper_low_fee_balance_total",
+    help: "Times a keeper signing account XLM balance was observed below the configured minimum threshold.",
+    type: "counter",
+  },
+  {
     key: "http_requests",
     name: "payflow_http_requests_total",
     help: "HTTP requests handled since the process started, labelled by method and status class (2xx, 4xx, 5xx).",

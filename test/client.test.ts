@@ -209,6 +209,24 @@ describe("typed api client", () => {
     const subscriber = await client.subscriberSummary(SUBSCRIBER);
     assert.equal(subscriber.totalPaid, "10000000");
 
+    const upcoming = await client.subscriberUpcoming(SUBSCRIBER, 7);
+    assert.equal(upcoming.subscriber, SUBSCRIBER);
+    assert.equal(upcoming.days, 7);
+    assert.equal(upcoming.until, upcoming.now + 7 * 86_400);
+    // Mandate 1's next charge is far outside the window, so the merged view
+    // is empty; the route's own tests cover multi-mandate projection.
+    assert.deepEqual(upcoming.upcoming, []);
+    assert.equal(upcoming.totalUpcoming, "0");
+    assert.equal(upcoming.truncated, false);
+
+    const defaulted = await client.subscriberUpcoming(SUBSCRIBER);
+    assert.equal(defaulted.days, 30);
+
+    await assert.rejects(
+      () => client.subscriberUpcoming("not-an-address"),
+      (err: unknown) => err instanceof PayflowApiError && err.status === 400,
+    );
+
     const merchantsSubs = await client.merchantSubscribers(MERCHANT);
     assert.equal(merchantsSubs.merchant, MERCHANT);
     assert.deepEqual(merchantsSubs.subscribers, [
