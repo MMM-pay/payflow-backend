@@ -4,7 +4,7 @@ import type { Storage } from "../lib/store/types.ts";
 import { getMandateMerchant } from "../lib/queries.ts";
 import { num, type DecodedEvent } from "../lib/stellar.ts";
 import { sendApiError } from "./errors.ts";
-import { addressSchema, present, validate } from "./validate.ts";
+import { addressSchema, present, queryOnly, validate } from "./validate.ts";
 
 const HEARTBEAT_MS = 25_000;
 const MAX_STREAMS = 100;
@@ -39,7 +39,7 @@ export function streamRouter(
   events.setMaxListeners(Math.max(events.getMaxListeners(), maxStreams + 1));
   let activeStreams = 0;
 
-  router.get("/stream", (req, res) => {
+  router.get("/stream", queryOnly("merchant", "subscriber"), (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     // The filters are checked before a stream slot is taken, so a malformed
     // request is answered with an error rather than a stream that never

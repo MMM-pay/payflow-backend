@@ -46,13 +46,71 @@ const postgresUrl = z.preprocess(
     .optional(),
 );
 
+/**
+ * A browser origin: `scheme://host` with an optional port, and nothing else.
+ *
+ * The `Origin` header a browser sends is exactly that shape, so an entry with
+ * a path, query, fragment or credentials could never match it. A wildcard
+ * host is refused because the CORS middleware compares exact origins and
+ * does not expand subdomain patterns.
+ */
+function parseCorsOrigin(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`"${raw}" is not a valid origin (use scheme://host[:port])`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`"${raw}" must use http or https`);
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error(`"${raw}" must not contain credentials`);
+  }
+  if (url.hostname.includes("*")) {
+    throw new Error(`"${raw}" must not contain a wildcard; list each origin`);
+  }
+  if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    throw new Error(`"${raw}" must be an origin only (no path, query or fragment)`);
+  }
+  return url.origin;
+}
+
+/**
+ * Resolve `CORS_ORIGIN` to the browser origins allowed to call the API.
+ *
+ * Every entry is pinned to an exact origin (`https://app.example`), so only
+ * that scheme, host and port is reflected. `*` — as the whole value, never
+ * beside a list — is the explicit opt-in to allow every origin. An empty
+ * value allows none: a deployment that has not listed its frontend refuses
+ * cross-origin browser reads instead of exposing the API to every site.
+ * SEP-10 paths are exempt and always answer `*`, as that spec requires.
+ */
+export function corsOrigins(raw: string | string[] | undefined): "*" | string[] {
+  if (Array.isArray(raw)) {
+    const listed = raw.map((value) => value.trim()).filter((value) => value !== "");
+    if (listed.includes("*")) {
+      if (listed.length === 1) return "*";
+      throw new Error('"*" must be the only value, or list the exact origins');
+    }
+    return [...new Set(listed.map(parseCorsOrigin))];
+  }
+  const value = (raw ?? "").trim();
+  if (value === "*") return "*";
+  const entries = value.split(",").map((part) => part.trim()).filter((part) => part !== "");
+  if (entries.includes("*")) {
+    throw new Error('"*" must be the only value, or list the exact origins');
+  }
+  return [...new Set(entries.map(parseCorsOrigin))];
+}
+
 const adminTokensSchema = z.array(
   z.object({
-    token: z.string().min(16, "each admin token needs at least 16 characters"),
+    token: z.string().min(16, "each admin token needs at least 16 characters").max(4_096),
     scopes: z.array(z.enum(["reindex", "keeper", "indexer", "*"])).nonempty().optional(),
     expiresAt: z.number().int().positive().optional(),
-  }),
-);
+  }).strict(),
+).max(100, "at most 100 admin tokens may be configured");
 
 const schema = z.object({
   STELLAR_NETWORK: z.string().default("testnet"),
@@ -201,6 +259,14 @@ const schema = z.object({
     .transform((v) => v === "true"),
 
   INDEXER_INTERVAL_MS: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Ledgers one indexing batch reads and applies before the cursor moves
+   * (#241). This is the tuning knob for a catch-up: a larger batch means
+   * fewer, longer RPC windows and fewer cursor commits; a smaller one keeps
+   * each pass short, so a stop or a `SIGHUP` takes effect sooner. It must
+   * stay inside the RPC's getEvents window, so 8,000 is the ceiling.
+   */
+  INDEXER_BATCH_SIZE: z.coerce.number().int().positive().max(8_000).default(8_000),
   INDEXER_START_LEDGER: z.coerce.number().int().nonnegative().default(0),
   /**
    * A full-history archive that can re-serve ledgers the RPC node no longer
@@ -250,13 +316,17 @@ const schema = z.object({
 
   /**
    * Days to retain raw contract events before pruning. Events older than this
-   * are removed by the prune operation. Set to 0 to keep all events indefinitely.
-   * @deprecated Use RAW_EVENT_RETENTION_DAYS for per-table control.
+   * are removed by the prune operation and by each periodic indexer pass.
+   * Set to 0 to keep all events indefinitely.
+   * Superseded by `RAW_EVENT_RETENTION_DAYS` when that is set.
    */
   DATA_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(30),
   /**
    * Days to retain raw contract events (`events` table). Overrides
-   * `DATA_RETENTION_DAYS` when set. Set to 0 to keep events indefinitely.
+   * `DATA_RETENTION_DAYS` when set. The indexer prunes events older than
+   * this window on each pass, coordinated with the projection cursor so
+   * pruning never removes events that have not yet been projected.
+   * Set to 0 to keep events indefinitely.
    */
   RAW_EVENT_RETENTION_DAYS: z.coerce.number().int().nonnegative().optional(),
   /**
@@ -274,8 +344,44 @@ const schema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   DATABASE_URL: postgresUrl,
+  /**
+   * Most connections one process opens to PostgreSQL (#263). Every API
+   * process and every indexer/keeper process holds its own pool, so the cap
+   * must leave room for the others inside the server's max_connections.
+   */
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),
+  /**
+   * How long a query waits for a free pooled connection before it fails
+   * (#263). Without a bound, a saturated pool makes every request wait
+   * forever and a slow query takes the whole process down with it.
+   */
+  DATABASE_ACQUIRE_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  /**
+   * Server-side cap on how long a single statement may run (#263). A query
+   * that exceeds it is cancelled by PostgreSQL and answers with an error
+   * instead of pinning a connection; the indexer retries on its next pass.
+   */
+  DATABASE_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
   DATABASE_PATH: z.string().default("./payflow.db"),
-  CORS_ORIGIN: z.string().default("*"),
+  /**
+   * Comma-separated exact origins a browser may call the API from. Empty
+   * (the default) allows none; `*` allows every origin. Validated at startup
+   * so a typo fails the boot instead of silently matching no request.
+   */
+  CORS_ORIGIN: z
+    .string()
+    .default("")
+    .transform((value, ctx) => {
+      try {
+        return corsOrigins(value);
+      } catch (err) {
+        ctx.addIssue({
+          code: "custom",
+          message: err instanceof Error ? err.message : "invalid origin list",
+        });
+        return z.NEVER;
+      }
+    }),
   /** Read only to pick the `REQUIRE_HTTPS` default. */
   NODE_ENV: z.string().default("development"),
   /**
@@ -305,7 +411,12 @@ const schema = z.object({
     .transform((value) => (value === "" ? undefined : value))
     .refine((value) => value === undefined || isHttpUrl(value) || value.startsWith("redis://") || value.startsWith("rediss://"), "must be a redis(s) URL"),
 
-  ADMIN_TOKEN: z.string().optional(),
+  ADMIN_TOKEN: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || value.length >= 16, "must be at least 16 characters")
+    .refine((value) => value === undefined || value.length <= 4_096, "must be at most 4096 characters"),
   /**
    * Scoped operator tokens, as a JSON array of
    * `{ "token": "...", "scopes": ["reindex" | "keeper" | "indexer" | "*"], "expiresAt": <unix seconds> }`.
@@ -363,9 +474,25 @@ const schema = z.object({
     .refine((value) => value === undefined || isDomain(value, 64), "must be a domain of at most 64 characters"),
   /** Lifetime of an issued JWT in seconds; short-lived by design. */
   SEP10_JWT_TTL_S: z.coerce.number().int().min(60).max(86_400).default(3_600),
+  /**
+   * Lifetime of a refresh token in seconds. Refresh tokens rotate on use:
+   * each rotation consumes one and issues the next, so a leaked refresh
+   * token's blast radius is bounded to one rotation window.
+   */
+  SEP10_REFRESH_TTL_S: z.coerce.number().int().min(300).max(604_800).default(604_800),
 });
 
 export type Config = z.infer<typeof schema>;
+
+/** How a process sizes and bounds its pool for one PostgreSQL network (#263). */
+export interface PoolSettings {
+  /** Most connections this process opens at once. */
+  max: number;
+  /** How long a query waits for a free connection before it fails, in ms. */
+  acquireTimeoutMs: number;
+  /** Server-side cap on one statement's runtime, in ms. */
+  statementTimeoutMs: number;
+}
 
 /** One network this instance indexes and serves. */
 export interface NetworkConfig {
@@ -383,12 +510,25 @@ export interface NetworkConfig {
   databasePath: string;
   /** Shared PostgreSQL server, isolated by per-network schema when configured. */
   databaseUrl?: string | undefined;
+  /** Sizing and timeouts for this network's PostgreSQL pool (#263). */
+  pool?: PoolSettings | undefined;
   /** Full-history archive URL used to backfill a detected gap. */
   archiveUrl?: string | undefined;
   /** Advance the cursor past a gap the RPC cannot serve. */
   allowGaps?: boolean | undefined;
   /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
   progressLedgers?: number | undefined;
+  /** Ledgers one indexing batch reads and applies at a time (#241). */
+  batchSize?: number | undefined;
+  /** How often the indexer loop runs a pass, in milliseconds (#241). */
+  indexerIntervalMs?: number | undefined;
+  /**
+   * Days raw contract events are kept before pruning (#246). Populated from
+   * `RAW_EVENT_RETENTION_DAYS` (or `DATA_RETENTION_DAYS`); 0 keeps events
+   * indefinitely. The indexer enforces it on each pass, never pruning
+   * events the projection has not consumed yet.
+   */
+  rawEventRetentionDays?: number | undefined;
 }
 
 /**
@@ -517,6 +657,15 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
     archiveUrl: config.ARCHIVE_URL,
     allowGaps: config.ALLOW_GAPS,
     progressLedgers: config.INDEXER_PROGRESS_LEDGERS,
+    // A network may pace its own passes; otherwise it follows the defaults.
+    batchSize: network.batchSize ?? config.INDEXER_BATCH_SIZE,
+    indexerIntervalMs: network.indexerIntervalMs ?? config.INDEXER_INTERVAL_MS,
+    rawEventRetentionDays: config.RAW_EVENT_RETENTION_DAYS ?? config.DATA_RETENTION_DAYS,
+    pool: {
+      max: config.DATABASE_POOL_MAX,
+      acquireTimeoutMs: config.DATABASE_ACQUIRE_TIMEOUT_MS,
+      statementTimeoutMs: config.DATABASE_STATEMENT_TIMEOUT_MS,
+    },
   }));
 }
 
@@ -529,6 +678,13 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     [`${prefix}_VAULT_ID`]: contractId,
     [`${prefix}_SUBSCRIPTION_ID`]: contractId,
     [`${prefix}_INDEXER_START_LEDGER`]: z.coerce.number().int().nonnegative().default(0),
+    [`${prefix}_INDEXER_BATCH_SIZE`]: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(8_000)
+      .optional(),
+    [`${prefix}_INDEXER_INTERVAL_MS`]: z.coerce.number().int().positive().optional(),
     [`${prefix}_DATABASE_PATH`]: z.string().min(1).optional(),
   });
   const parsed = schema.safeParse(env);
@@ -548,6 +704,12 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     vaultId: String(data[`${prefix}_VAULT_ID`]),
     subscriptionId: String(data[`${prefix}_SUBSCRIPTION_ID`]),
     startLedger: Number(data[`${prefix}_INDEXER_START_LEDGER`] ?? 0),
+    ...(data[`${prefix}_INDEXER_BATCH_SIZE`] === undefined
+      ? {}
+      : { batchSize: Number(data[`${prefix}_INDEXER_BATCH_SIZE`]) }),
+    ...(data[`${prefix}_INDEXER_INTERVAL_MS`] === undefined
+      ? {}
+      : { indexerIntervalMs: Number(data[`${prefix}_INDEXER_INTERVAL_MS`]) }),
     databasePath:
       databasePath === undefined ? databasePathFor(base.DATABASE_PATH, name) : String(databasePath),
     databaseUrl: base.DATABASE_URL,

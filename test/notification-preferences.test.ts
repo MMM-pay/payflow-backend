@@ -153,3 +153,20 @@ test("preference updates reject invalid, duplicate, stale and unauthorized reque
   const badAddress = await fetch(`${base}/api/v1/merchants/not-an-address/notification-preferences`);
   assert.equal(badAddress.status, 400);
 });
+
+test("strict request bodies reject extra fields before preferences are stored", async () => {
+  const before = (db.prepare(
+    "SELECT events FROM merchant_notification_preferences WHERE merchant = ?",
+  ).get(merchant) as { events: string } | undefined)?.events;
+  const events = ["charged"];
+  const res = await fetch(`${base}/api/v1/merchants/${merchant}/notification-preferences`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ events, ...setProof(events), unexpected: "ignored" }),
+  });
+  assert.equal(res.status, 400);
+  const after = (db.prepare(
+    "SELECT events FROM merchant_notification_preferences WHERE merchant = ?",
+  ).get(merchant) as { events: string } | undefined)?.events;
+  assert.equal(after, before);
+});

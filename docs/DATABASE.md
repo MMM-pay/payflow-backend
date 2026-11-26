@@ -261,8 +261,10 @@ beside the new one until `previous_secret_expires_at` (unix seconds; see
 
 The delivery queue: one row per event per webhook, with `status`
 (`pending`, `delivered` or `failed`), `attempt`, `retry_at`, the `payload`
-sent, an `idempotency_key`, and the last `http_status`, `response_body` and
-`error`. `(status, retry_at)` is indexed for the dispatcher's due scan.
+sent, an `idempotency_key`, and the last `http_status` and sanitized `error`.
+`response_body` is kept nullable for compatibility but is never populated;
+startup migration clears values saved by older versions.
+`(status, retry_at)` is indexed for the dispatcher's due scan.
 
 ### `webhook_event_receipts`
 

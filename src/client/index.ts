@@ -13,6 +13,7 @@
  * ```
  */
 import type {
+  AuthTokenResponse,
   ChargeAttemptPage,
   ChargePage,
   ChurnBucketSize,
@@ -37,12 +38,18 @@ import type {
   UpcomingChargesResponse,
   VaultBalancePage,
   VaultEventPage,
+  WebhookDeliveriesResponse,
+  WebhookListResponse,
+  WebhookRegistration,
+  WebhookRotation,
+  WebhookTestResult,
 } from "../routes/types.ts";
 
 // Types shared with the backend, not copied: one declaration in
 // src/routes/types.ts serves the handlers, this client and every consumer.
 export type {
   ApiErrorResponse,
+  AuthTokenResponse,
   ChargeAttemptPage,
   ChargeAttemptRow,
   ChargePage,
@@ -83,6 +90,11 @@ export type {
   VaultBalancePage,
   VaultEventPage,
   VaultEventRow,
+  WebhookDeliveriesResponse,
+  WebhookListResponse,
+  WebhookRegistration,
+  WebhookRotation,
+  WebhookTestResult,
 } from "../routes/types.ts";
 
 /**
@@ -349,4 +361,90 @@ export class PayflowClient {
   keeper(): Promise<KeeperHistoryResponse> {
     return this.get<KeeperHistoryResponse>(`${API_PATH}/keeper`);
   }
+
+  /** Exchange a signed SEP-10 challenge for a short-lived JWT and a refresh token. */
+  auth(transaction: string): Promise<AuthTokenResponse> {
+    return this.request<AuthTokenResponse>(new URL(`${API_PATH}/auth`, this.baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ transaction }),
+    });
+  }
+
+  /**
+   * Rotate a refresh token: returns a new short-lived JWT and the next refresh
+   * token. The consumed refresh token is revoked, so it cannot be used again.
+   */
+  rotateAuthToken(refreshToken: string): Promise<AuthTokenResponse> {
+    return this.request<AuthTokenResponse>(new URL(`${API_PATH}/auth/rotate`, this.baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+  }
+
+  /** Register a webhook: proves control of the merchant address with a signed message. */
+  registerWebhook(
+    merchant: string,
+    url: string,
+    proof: WebhookProof,
+    secret?: string,
+  ): Promise<WebhookRegistration> {
+    return this.request<WebhookRegistration>(new URL(`${API_PATH}/webhooks`, this.baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ merchant, url, secret, ...proof }),
+    });
+  }
+
+  /** List a merchant's webhooks, newest first, without their secrets. */
+  listWebhooks(merchant: string, proof: WebhookProof): Promise<WebhookListResponse> {
+    return this.get<WebhookListResponse>(
+      `${API_PATH}/webhooks`,
+      { merchant, ...proof },
+    );
+  }
+
+  /** Delete a merchant's webhook and drop its scheduled retries. */
+  deleteWebhook(id: number, proof: WebhookProof): Promise<void> {
+    return this.request<unknown>(new URL(`${API_PATH}/webhooks/${id}`, this.baseUrl), {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(proof),
+    }).then(() => undefined);
+  }
+
+  /** Rotate a webhook's signing secret: returns the new secret once. */
+  rotateWebhookSecret(id: number, proof: WebhookProof): Promise<WebhookRotation> {
+    return this.request<WebhookRotation>(new URL(`${API_PATH}/webhooks/${id}/rotate`, this.baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(proof),
+    });
+  }
+
+  /** Send a webhook a signed `ping` through the normal delivery path. */
+  testWebhook(id: number, proof: WebhookProof): Promise<WebhookTestResult> {
+    return this.request<WebhookTestResult>(new URL(`${API_PATH}/webhooks/${id}/test`, this.baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(proof),
+    });
+  }
+
+  /** List a webhook's last 100 delivery attempts, newest first. */
+  listWebhookDeliveries(id: number, proof: WebhookProof): Promise<WebhookDeliveriesResponse> {
+    return this.get<WebhookDeliveriesResponse>(
+      `${API_PATH}/webhooks/${id}/deliveries`,
+      { ...proof },
+    );
+  }
+}
+
+/** Proof of control of a merchant address for webhook management endpoints. */
+export interface WebhookProof {
+  /** Unix seconds, within ten minutes of the API's clock. */
+  timestamp: number;
+  /** Base64 ed25519 signature of the endpoint's documented message. */
+  signature: string;
 }

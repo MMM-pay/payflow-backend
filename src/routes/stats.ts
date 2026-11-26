@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Storage } from "../lib/store/types.ts";
 import { getProtocolStats } from "../lib/queries.ts";
+import { queryOnly } from "./validate.ts";
 
 /** Window for /api/stats' recent-volume figure. */
 const DAY_MS = 86_400_000;
@@ -9,7 +10,7 @@ const DAY_MS = 86_400_000;
 export function statsRouter(db: Storage): Router {
   const r = Router();
 
-  r.get("/stats", async (_req, res) => {
+  r.get("/stats", queryOnly(), async (_req, res) => {
     // Volume is gross: the merchant's net amount plus the protocol fee. The
     // 24-hour window uses created_at, which is the close time of the ledger
     // the charge was emitted in -- the chain's clock, not the indexer's.

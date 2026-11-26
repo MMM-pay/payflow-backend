@@ -35,6 +35,7 @@ import {
   daysSchema,
   limitSchema,
   present,
+  queryOnly,
   unixSecondsSchema,
   validate,
 } from "./validate.ts";
@@ -139,7 +140,7 @@ export function merchantsRouter(
 ): Router {
   const r = Router();
 
-  r.get("/merchants/:address/summary", async (req, res) => {
+  r.get("/merchants/:address/summary", queryOnly(), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
 
@@ -160,7 +161,7 @@ export function merchantsRouter(
    * last set through the plan registry's `set_profile`. Self-declared: the
    * contract does not verify either, so neither does this route.
    */
-  r.get("/merchants/:address/profile", async (req, res) => {
+  r.get("/merchants/:address/profile", queryOnly(), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
 
@@ -178,7 +179,7 @@ export function merchantsRouter(
    * long each has been due, longest overdue first. The same funded test as
    * `/due`, so the balance can trail the chain the same way.
    */
-  r.get("/merchants/:address/unpaid", async (req, res) => {
+  r.get("/merchants/:address/unpaid", queryOnly("limit"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
@@ -194,7 +195,7 @@ export function merchantsRouter(
   });
 
   /** The merchant's distinct subscribers, grouped by lifetime value. */
-  r.get("/merchants/:address/subscribers", async (req, res) => {
+  r.get("/merchants/:address/subscribers", queryOnly("limit"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
@@ -221,7 +222,7 @@ export function merchantsRouter(
    * bucket. Both the cohort and the departures follow ledger close times;
    * `limit` keeps the most recent cohorts.
    */
-  r.get("/merchants/:address/cohorts", async (req, res) => {
+  r.get("/merchants/:address/cohorts", queryOnly("bucket", "limit"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
@@ -248,7 +249,7 @@ export function merchantsRouter(
    * bucketed by the ledger close time of each event, so they are the chain's
    * own history rather than the indexer's view of it.
    */
-  r.get("/merchants/:address/churn", async (req, res) => {
+  r.get("/merchants/:address/churn", queryOnly("bucket", "limit"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
@@ -275,7 +276,7 @@ export function merchantsRouter(
    * range in unix seconds; without them the report covers the merchant's
    * whole history.
    */
-  r.get("/merchants/:address/revenue", async (req, res) => {
+  r.get("/merchants/:address/revenue", queryOnly("bucket", "from", "to", "limit"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
@@ -310,7 +311,7 @@ export function merchantsRouter(
    * ledger close time in ISO 8601 UTC. Rows are streamed a page at a time,
    * so neither the response nor a single query grows with the history.
    */
-  r.get("/merchants/:address/charges.csv", async (req, res) => {
+  r.get("/merchants/:address/charges.csv", queryOnly("from", "to"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
@@ -370,7 +371,7 @@ export function merchantsRouter(
   });
 
   /** Projected charges over the next `days`, net of the protocol fee. */
-  r.get("/merchants/:address/forecast", async (req, res) => {
+  r.get("/merchants/:address/forecast", queryOnly("days", "from"), async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));

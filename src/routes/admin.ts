@@ -1,7 +1,9 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type Response } from "express";
+import { z } from "zod";
 import { logger } from "../lib/logger.ts";
 import { sendApiError, type ApiErrorCode } from "./errors.ts";
+import { hasRequestBody, limitSchema, queryOnly, validate } from "./validate.ts";
 
 /**
  * Operations the process can perform on demand. A hook is absent when the
@@ -22,6 +24,11 @@ export interface AdminHooks {
   getAuditLogs?: (limit: number) => unknown;
   getPastDueMandates?: () => unknown;
   vacuumDb?: () => Promise<unknown>;
+  /**
+   * Returns the current raw-event retention policy: how many days events are
+   * kept, when the last automatic prune ran, and how many raw events exist.
+   */
+  getRetentionPolicy?: () => Promise<unknown>;
 }
 
 /** Scoped operation that a token is allowed to perform. */
@@ -59,6 +66,10 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   const tokens: AdminToken[] = Array.isArray(token)
     ? token
     : [{ token }];
+  const tokenDigests = tokens.map((configured) => ({
+    configured,
+    digest: digest(configured.token),
+  }));
 
   const r = Router();
 
@@ -74,14 +85,19 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   r.use((req, res, next) => {
     const header = req.get("authorization") ?? "";
     const supplied = /^Bearer\s+(.+)$/i.exec(header)?.[1];
-    if (!supplied) {
+    if (!supplied || supplied.length > 4_096) {
       logger.warn({ method: req.method, path: req.path }, "admin request rejected");
       res.status(401).set("WWW-Authenticate", "Bearer");
       sendApiError(res, req, 401, "unauthorized");
       return;
     }
 
-    const token = tokens.find((t) => timingSafeEqual(digest(t.token), digest(supplied)));
+    const suppliedDigest = digest(supplied);
+    let token: AdminToken | undefined;
+    for (const candidate of tokenDigests) {
+      const matches = timingSafeEqual(candidate.digest, suppliedDigest);
+      if (matches && token === undefined) token = candidate.configured;
+    }
     if (!token) {
       logger.warn({ method: req.method, path: req.path }, "admin request rejected");
       res.status(401).set("WWW-Authenticate", "Bearer");
@@ -97,6 +113,16 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
 
     (req as Request & { adminToken?: AdminToken }).adminToken = token;
+    next();
+  });
+
+  r.use((req, res, next) => {
+    if (hasRequestBody(req)) {
+      sendApiError(res, req, 400, "invalid_request", undefined, [
+        { path: "body", message: "is not accepted for this route" },
+      ]);
+      return;
+    }
     next();
   });
 
@@ -117,7 +143,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
   }
 
-  r.post("/reindex", async (req, res) => {
+  r.post("/reindex", queryOnly(), async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "reindex")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -131,7 +157,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     await respond(req, res, "reindex_failed", run);
   });
 
-  r.post("/keeper/run", async (req, res) => {
+  r.post("/keeper/run", queryOnly(), async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "keeper")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -145,7 +171,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     await respond(req, res, "keeper_pass_failed", run);
   });
 
-  r.get("/keeper/backoff", (req, res) => {
+  r.get("/keeper/backoff", queryOnly(), (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "keeper")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -162,7 +188,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   // Runtime indexer control. Pause holds the scheduled passes back; the API
   // keeps serving the projection as it stands. The body reports the new state
   // so an operator can confirm the switch took.
-  r.post("/indexer/pause", async (req, res) => {
+  r.post("/indexer/pause", queryOnly(), async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "indexer")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -176,7 +202,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     res.json({ status: "ok", paused: true, result: (await pause()) ?? null });
   });
 
-  r.post("/indexer/resume", async (req, res) => {
+  r.post("/indexer/resume", queryOnly(), async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "indexer")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -190,14 +216,34 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     res.json({ status: "ok", paused: false, result: (await resume()) ?? null });
   });
 
-  r.post("/data/prune", async (req, res) => {
+  r.post("/data/prune", queryOnly("days"), async (req, res) => {
     const prune = hooks.pruneData;
     if (!prune) {
       sendApiError(res, req, 503, "prune_unavailable", undefined, undefined, 30);
       return;
     }
-    const daysToKeep = req.query.days !== undefined ? Math.max(0, Number(req.query.days)) : undefined;
+    const parsedDays = validate(
+      req,
+      res,
+      "days",
+      z.string().regex(/^\d+$/, "must be a non-negative integer")
+        .transform(Number)
+        .refine(Number.isSafeInteger, "must be a non-negative integer")
+        .optional(),
+      req.query.days,
+    );
+    if (!parsedDays.ok) return;
+    const daysToKeep = parsedDays.value;
     await respond(req, res, "prune_failed", () => prune(daysToKeep));
+  });
+
+  r.get("/data/retention", async (req, res) => {
+    const read = hooks.getRetentionPolicy;
+    if (!read) {
+      sendApiError(res, req, 503, "retention_unavailable", undefined, undefined, 30);
+      return;
+    }
+    await respond(req, res, "retention_failed", read);
   });
 
   r.get("/audit-logs", async (req, res) => {
@@ -206,11 +252,13 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
       sendApiError(res, req, 503, "audit_unavailable", undefined, undefined, 30);
       return;
     }
-    const limit = Math.min(1000, Math.max(1, Number(req.query.limit ?? 100)));
+    const parsedLimit = validate(req, res, "limit", limitSchema.optional(), req.query.limit);
+    if (!parsedLimit.ok) return;
+    const limit = Math.min(1000, parsedLimit.value ?? 100);
     res.json({ status: "ok", logs: (await read(limit)) ?? [] });
   });
 
-  r.get("/past-due", async (req, res) => {
+  r.get("/past-due", queryOnly(), async (req, res) => {
     const read = hooks.getPastDueMandates;
     if (!read) {
       sendApiError(res, req, 503, "indexer_unavailable", undefined, undefined, 30);

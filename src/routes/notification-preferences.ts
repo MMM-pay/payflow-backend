@@ -11,7 +11,7 @@ import {
 import { sessionOf, type Sep10Auth } from "./auth.ts";
 import { sendApiError } from "./errors.ts";
 import type { MerchantNotificationPreferences } from "./types.ts";
-import { validate } from "./validate.ts";
+import { queryOnly, validate } from "./validate.ts";
 
 const merchantSchema = z.string().refine(
   (value) => StrKey.isValidEd25519PublicKey(value),
@@ -24,15 +24,15 @@ const timestampSchema = z
   .refine(Number.isSafeInteger, "must be a unix timestamp in seconds");
 const preferencesSchema = z.object({
   events: notificationEventsSchema,
-});
+}).strict();
 const signedGetSchema = z.object({
   timestamp: timestampSchema,
-  signature: z.string().min(1),
-});
+  signature: z.string().min(1).max(128),
+}).strict();
 const signedPutSchema = preferencesSchema.extend({
   timestamp: timestampSchema,
-  signature: z.string().min(1),
-});
+  signature: z.string().min(1).max(128),
+}).strict();
 const SIGNATURE_TOLERANCE_S = 10 * 60;
 
 function fresh(timestamp: number): boolean {
@@ -93,13 +93,19 @@ function putMessage(merchant: string, events: string[], timestamp: number): stri
 export function notificationPreferencesRouter(db: Storage, auth?: Sep10Auth): Router {
   const r = Router();
 
-  r.get("/merchants/:address/notification-preferences", async (req, res) => {
+  r.get(
+    "/merchants/:address/notification-preferences",
+    queryOnly("timestamp", "signature"),
+    async (req, res) => {
     const address = validate(req, res, "address", merchantSchema, req.params.address);
     if (!address.ok) return;
     const session = sessionMatches(req, res, auth, address.value);
     if (!session.ok) return;
 
-    if (!session.authenticated) {
+    if (session.authenticated) {
+      const query = validate(req, res, "query", z.object({}).strict(), req.query);
+      if (!query.ok) return;
+    } else {
       const proof = validate(req, res, "query", signedGetSchema, req.query);
       if (!proof.ok) return;
       if (!authorized(
@@ -119,9 +125,10 @@ export function notificationPreferencesRouter(db: Storage, auth?: Sep10Auth): Ro
     };
     res.setHeader("Cache-Control", "no-store");
     res.json(body);
-  });
+    },
+  );
 
-  r.put("/merchants/:address/notification-preferences", async (req, res) => {
+  r.put("/merchants/:address/notification-preferences", queryOnly(), async (req, res) => {
     const address = validate(req, res, "address", merchantSchema, req.params.address);
     if (!address.ok) return;
     const session = sessionMatches(req, res, auth, address.value);

@@ -33,6 +33,8 @@ export type ApiErrorCode =
   | "audit_unavailable"
   | "vacuum_unavailable"
   | "vacuum_failed"
+  | "retention_unavailable"
+  | "retention_failed"
   | "internal_error";
 
 /**
@@ -97,6 +99,8 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   audit_unavailable: "The audit log is not available on this instance.",
   vacuum_unavailable: "Database maintenance is not available on this instance.",
   vacuum_failed: "The database maintenance operation failed.",
+  retention_unavailable: "The retention policy endpoint is not available on this instance.",
+  retention_failed: "The retention policy query failed.",
   keeper_unavailable: "The keeper is not available on this instance.",
   indexer_unavailable: "Runtime indexer control is not available on this instance.",
   reindex_failed: "The reindex action failed.",

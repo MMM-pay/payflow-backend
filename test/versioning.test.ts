@@ -197,7 +197,7 @@ describe("the versioned API", () => {
       db,
       { CORS_ORIGIN: "*", KEEPER_ENABLED: true } as unknown as Config,
       undefined,
-      { keeperHistory: () => [{ pass: 1 }] },
+      { keeperHistory: () => ({ passes: [{ pass: 1 }], lastSuccessfulRunAt: null }) },
     );
     const local = await new Promise<Server>((resolve) => {
       const s = keeperApp.listen(0, () => resolve(s));
@@ -208,7 +208,7 @@ describe("the versioned API", () => {
       for (const path of ["/api/keeper", "/api/v1/keeper"]) {
         const res = await fetch(url + path);
         assert.equal(res.status, 200, `${path} answers`);
-        assert.deepEqual(await res.json(), { passes: [{ pass: 1 }] });
+        assert.deepEqual(await res.json(), { passes: [{ pass: 1 }], lastSuccessfulRunAt: null });
       }
     } finally {
       local.close();

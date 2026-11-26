@@ -329,6 +329,13 @@ export interface KeeperPassSummary {
 
 export interface KeeperHistoryResponse {
   passes: KeeperPassSummary[];
+  /**
+   * Unix timestamp (seconds) when the keeper last completed a pass without
+   * throwing. Null until the first successful pass, or when the keeper is
+   * not running. A watchdog can alert when this is null or too far in the
+   * past relative to `KEEPER_INTERVAL_MS` (#258).
+   */
+  lastSuccessfulRunAt: number | null;
 }
 
 export interface DuePage {
@@ -578,6 +585,7 @@ export interface WebhookTestResult {
   /** The endpoint's HTTP status; null when no response arrived. */
   statusCode: number | null;
   latencyMs: number;
+  /** Sanitized failure category; never contains receiver or transport text. */
   error: string | null;
   nextRetryAt: number | null;
 }
@@ -592,6 +600,7 @@ export interface WebhookDelivery {
   attempt: number;
   status: WebhookDeliveryStatus;
   statusCode: number | null;
+  /** Sanitized failure category; never contains receiver or transport text. */
   error: string | null;
   /** Unix seconds of the retry this attempt scheduled; null unless `pending`. */
   nextRetryAt: number | null;
@@ -613,7 +622,10 @@ export interface AuthChallengeResponse {
 
 /** `POST /api/auth`: a SEP-10 JWT, sent as `Authorization: Bearer <token>`. */
 export interface AuthTokenResponse {
+  /** A JWT to send as `Authorization: Bearer <token>` to merchant-only routes. */
   token: string;
+  /** A refresh token, returned once: rotate it at `POST /api/auth/rotate` for a new JWT and the next refresh token. */
+  refresh_token: string;
 }
 
 export interface StatsResponse {
@@ -656,6 +668,13 @@ export interface HealthResponse {
     eventsLedger: number;
     /** Ledgers the projection trails the raw event stream by. */
     eventsLag: number;
+    /**
+     * Days raw events are kept before they are pruned. Zero means indefinite.
+     * Null when the indexer has not reported the policy yet.
+     */
+    rawEventRetentionDays: number | null;
+    /** Unix seconds when the last automatic prune completed; null until the first prune. */
+    lastPrunedAt: number | null;
   } | null;
   rpc?: {
     active: string;
@@ -666,6 +685,17 @@ export interface HealthResponse {
     vault: string;
     subscription: string;
   };
+  /**
+   * Keeper staleness information. Present when the keeper is running in this
+   * process; null when the keeper is disabled or not attached (#258).
+   */
+  keeper?: {
+    /**
+     * Unix timestamp (seconds) when the keeper last completed a pass without
+     * throwing. Null until the first successful pass.
+     */
+    lastSuccessfulRunAt: number | null;
+  } | null;
   networks?: Record<string, HealthResponse>;
 }
 
