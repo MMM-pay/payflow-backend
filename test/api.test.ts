@@ -381,7 +381,7 @@ describe("http api", () => {
       db,
       { ...config, KEEPER_ENABLED: true } as Config,
       status,
-      { keeperHistory: () => [pass] },
+      { keeperHistory: () => ({ passes: [pass], lastSuccessfulRunAt: null }) },
     );
     const testServer = app.listen(0);
     const addr = testServer.address();
@@ -389,7 +389,7 @@ describe("http api", () => {
     try {
       const res = await fetch(`${testBase}/api/keeper`);
       assert.equal(res.status, 200);
-      assert.deepEqual(await res.json(), { passes: [pass] });
+      assert.deepEqual(await res.json(), { passes: [pass], lastSuccessfulRunAt: null });
     } finally {
       testServer.close();
     }
@@ -413,7 +413,7 @@ describe("http api", () => {
       db,
       { ...config, KEEPER_ENABLED: true } as Config,
       status,
-      { keeperHistory: () => [pass] },
+      { keeperHistory: () => ({ passes: [pass], lastSuccessfulRunAt: 1_700_000_000 }) },
     );
     const testServer = app.listen(0);
     const addr = testServer.address();
@@ -421,7 +421,7 @@ describe("http api", () => {
     try {
       const res = await fetch(`${testBase}/api/keeper`);
       assert.equal(res.status, 200);
-      assert.deepEqual(await res.json(), { passes: [pass] });
+      assert.deepEqual(await res.json(), { passes: [pass], lastSuccessfulRunAt: 1_700_000_000 });
     } finally {
       testServer.close();
     }

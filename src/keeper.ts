@@ -5,14 +5,15 @@ import {
   BASE_FEE,
   Contract,
   Keypair,
+  StrKey,
   TransactionBuilder,
   nativeToScVal,
   rpc,
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
-import type { Config } from "./config.ts";
-import { childLogger } from "./lib/logger.ts";
+import { keeperBackoffProblem, type Config } from "./config.ts";
+import { childLogger, maskAccount } from "./lib/logger.ts";
 import { withSpan } from "./lib/telemetry.ts";
 
 const logger = childLogger("keeper");
@@ -41,10 +42,14 @@ export interface DueMandate {
 /** Re-export so existing imports of `KeeperRpc` from `keeper.ts` continue to work. */
 export type { KeeperRpc } from "./lib/stellar.ts";
 
-/** First retry delay after a failed charge; doubles per failure. */
-const BACKOFF_BASE_S = 60;
-/** Longest a failing mandate waits between attempts. */
-const BACKOFF_MAX_S = 6 * 60 * 60;
+/** First retry delay after a failed charge when `KEEPER_BACKOFF_BASE_S` is not set (#248). */
+const DEFAULT_BACKOFF_BASE_S = 60;
+/** Growth of the retry delay per failure when `KEEPER_BACKOFF_MULTIPLIER` is not set. */
+const DEFAULT_BACKOFF_MULTIPLIER = 2;
+/** Longest a failing mandate waits when `KEEPER_BACKOFF_MAX_S` is not set. */
+const DEFAULT_BACKOFF_MAX_S = 6 * 60 * 60;
+/** Share of a retry delay shaved off at random when `KEEPER_BACKOFF_JITTER` is not set. */
+const DEFAULT_BACKOFF_JITTER = 0.1;
 /** Most charges submitted in one pass. */
 const BATCH = 25;
 /** Mandates per `charge_many` call when `KEEPER_BATCH_SIZE` is not set. */
@@ -65,6 +70,7 @@ const DEFAULT_CLAIM_TTL_S = 300;
  * off) instead of looping.
  */
 const BAD_SEQ_RETRIES = 2;
+const XLM_STROOPS = 10_000_000n;
 
 /**
  * Whether a failed submission was refused for a stale sequence number: the
@@ -109,6 +115,11 @@ function isKeyFailure(err: unknown): boolean {
   return /not found|no such account|missing source|not funded/i.test(message);
 }
 
+function xlmToStroops(amount: string): bigint {
+  const [whole, fraction = ""] = amount.split(".");
+  return BigInt(whole!) * XLM_STROOPS + BigInt(fraction.padEnd(7, "0"));
+}
+
 function isCongestionFailure(err: unknown): boolean {
   const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
   if (/txINSUFFICIENT_FEE|txInsufficientFee|TRY_AGAIN_LATER/i.test(message)) return true;
@@ -140,6 +151,103 @@ function isMissingBatchEntryError(err: unknown): boolean {
   );
 }
 
+/**
+ * How a failed attempt moves its mandate's backoff (#248).
+ *
+ * - `mandate`: the mandate cannot be charged right now — the vault or the
+ *   allowance falls short, or the contract refused it for a reason the keeper
+ *   cannot pin on anything else. It counts toward the failure streak and the
+ *   wait grows with it.
+ * - `permanent`: the contract says the mandate is not chargeable at all (not
+ *   found, not active, charge cap reached). It counts toward the streak and
+ *   waits the longest backoff at once: the indexer drops the mandate from the
+ *   due list as soon as it projects the new status, so retrying sooner only
+ *   repeats the refusal.
+ * - `keeper`: the keeper's own signing account or authorization was refused.
+ *   Every mandate would fail the same way until an operator fixes it, so the
+ *   streak is left alone and the mandate retries after the base delay.
+ * - `infrastructure`: RPC, network, sequence-number or fee trouble, or the
+ *   whole protocol paused. Not the mandate's doing either, so it is treated
+ *   like `keeper`: an outage never pushes every mandate hours into the future.
+ */
+export type FailureClass = "mandate" | "permanent" | "keeper" | "infrastructure";
+
+/** Subscription contract errors that mean the mandate cannot be charged at all. */
+const PERMANENT_CONTRACT_ERRORS = new Set([
+  2003, // MandateNotFound
+  2005, // MandateNotActive
+  2009, // MaxChargesReached
+  2036, // PlanNotFound
+]);
+/** Subscription contract errors that hold every mandate back alike. */
+const GLOBAL_CONTRACT_ERRORS = new Set([
+  2039, // ProtocolPaused
+]);
+/** Transaction result codes that blame the keeper's own source account or signature. */
+const KEEPER_RESULT_CODES = new Set(["txBadAuth", "txBadAuthExtra", "txNoAccount", "txInsufficientBalance"]);
+/** RPC statuses and transaction result codes that blame the network, not the mandate. */
+const INFRASTRUCTURE_CODES = new Set([
+  "TRY_AGAIN_LATER",
+  "NOT_FOUND",
+  "txBadSeq",
+  "txInsufficientFee",
+  "txTooEarly",
+  "txTooLate",
+  "txInternalError",
+]);
+/** A request that never got an answer: the RPC could not be reached or timed out. */
+const TRANSPORT_FAILURE =
+  /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|network error|timed? ?out|\b50[234]\b|service unavailable|bad gateway/i;
+
+/**
+ * Classify a failed attempt by its recorded code and (scrubbed) message; see
+ * {@link FailureClass}. Anything the keeper cannot positively attribute to
+ * the network or to itself stays `mandate`, the behaviour before #248, so an
+ * unrecognised failure still backs off rather than being retried every pass.
+ */
+export function classifyFailure(
+  errorCode: string | null | undefined,
+  error: string | null | undefined,
+): FailureClass {
+  const code = errorCode ?? "";
+  const message = error ?? "";
+  const contract = /^Error\(Contract, ?#(\d+)\)$/.exec(code);
+  if (contract) {
+    const number = Number(contract[1]);
+    if (PERMANENT_CONTRACT_ERRORS.has(number)) return "permanent";
+    if (GLOBAL_CONTRACT_ERRORS.has(number)) return "infrastructure";
+    return "mandate";
+  }
+  if (code.startsWith("Error(Auth,") || KEEPER_RESULT_CODES.has(code)) return "keeper";
+  if (INFRASTRUCTURE_CODES.has(code) || isBadSequence(code, message) || isCongestionFailure(message)) {
+    return "infrastructure";
+  }
+  if (code === "SUBMIT_FAILED") {
+    if (isKeyFailure(message)) return "keeper";
+    if (TRANSPORT_FAILURE.test(message)) return "infrastructure";
+  }
+  return "mandate";
+}
+
+/** The backoff settings a keeper applies, resolved from its config. */
+interface BackoffPolicy {
+  baseS: number;
+  multiplier: number;
+  maxS: number;
+  jitter: number;
+}
+
+/**
+ * The due-mandate filter that skips a mandate still backing off (#248): its
+ * newest `charge_attempts` row — the mandate's whole backoff state — names a
+ * retry time that has not come yet. One seek on the (mandate_id, id) index
+ * per candidate, on SQLite and PostgreSQL alike, so a backed-off mandate is
+ * never loaded and can never crowd the batch. Binds `now` once.
+ */
+const NOT_BACKING_OFF = `COALESCE((SELECT a.retry_at FROM charge_attempts a
+                    WHERE a.mandate_id = mandates.id
+                    ORDER BY a.id DESC LIMIT 1), 0) <= ?`;
+
 export interface SettleResult {
   mandateId: number;
   /**
@@ -167,6 +275,8 @@ interface ChargeAttempt {
   txHash: string | null;
   /** What the vault was missing, for a `skipped` attempt; decimal string. */
   shortfall: string | null;
+  /** How the failure moves the backoff (#248); null once the charge settled. */
+  failure: FailureClass | null;
 }
 
 /** A settle result as an attempt; null for a dry run, which records nothing. */
@@ -177,6 +287,7 @@ function attemptOf(result: SettleResult): ChargeAttempt | null {
     errorCode: result.errorCode ?? null,
     txHash: result.txHash ?? null,
     shortfall: null,
+    failure: result.status === "settled" ? null : classifyFailure(result.errorCode, result.error),
   };
 }
 
@@ -223,6 +334,8 @@ export interface Channel {
   active: number;
 }
 
+type ChannelBalance = { kind: "available"; stroops: bigint } | { kind: "missing" };
+
 /**
  * Settles mandates that have fallen due.
  *
@@ -266,10 +379,9 @@ export interface Channel {
  * Due mandates are pulled from one shared queue by one worker per channel
  * (see `tick`): distribution is dynamic, one slow channel cannot stall the
  * others, and with a single channel the pass is exactly the old sequential
- * loop. Before distributing, each channel's account is checked with one
- * `getAccount` (only when several channels are configured); an unusable
- * channel is dropped for the pass, logged by public key, so its mandates
- * settle through the live channels instead of backing off against a dead key.
+ * loop. Before distributing, each channel's account and native XLM balance
+ * are checked; a channel below `KEEPER_CHANNEL_MIN_XLM` rotates to its standby
+ * or is dropped for the pass so mandates use healthier channels instead.
  *
  * ### Bounded worker pool (#249)
  *
@@ -316,10 +428,23 @@ export interface Channel {
  *
  * Every real attempt is a row in `charge_attempts` — a mandate skipped for a
  * vault shortfall included, since that is the failure merchants most need to
- * see — carrying the mandate's failure streak and next retry. The in-memory
- * backoff is a cache of the newest row per mandate: it is rebuilt from the
- * table on construction, so a restart (or the next scheduled one-shot run)
- * resumes the backoff instead of hammering every failing mandate again.
+ * see — carrying the mandate's failure streak and next retry. A mandate's
+ * newest row is its backoff state: the due query skips a mandate whose
+ * newest `retry_at` is still ahead, so a restart (or the next scheduled
+ * one-shot run, or another keeper sharing the database) resumes the backoff
+ * instead of hammering every failing mandate again. The in-memory backoff is
+ * only a cache of those rows for `/admin` and the pass history.
+ *
+ * ### Per-mandate backoff (#248)
+ *
+ * After the n-th consecutive failure a mandate waits
+ * `min(KEEPER_BACKOFF_BASE_S * KEEPER_BACKOFF_MULTIPLIER^(n-1), KEEPER_BACKOFF_MAX_S)`
+ * (60 s doubling to 6 h by default), less a random share of up to
+ * `KEEPER_BACKOFF_JITTER` (10%) so mandates that failed together spread out.
+ * A settlement resets the streak. Only failures that are the mandate's own
+ * grow the streak; see {@link FailureClass} for how infrastructure and
+ * keeper-signer failures retry after the base delay instead, and how a
+ * permanent contract refusal waits the cap at once.
  *
  * When a streak reaches {@link FAILING_STREAK} the merchant is sent
  * `charge.failing`, and when a charge then settles, `charge.recovered`. The
@@ -331,14 +456,19 @@ export class Keeper {
   private readonly server: KeeperRpc;
   private config: Config;
   /**
-   * Mandates whose last charge failed, with when to try again. Without this,
-   * the oldest due mandates are retried first on every pass, so a batch's
-   * worth of underfunded vaults would block every other mandate forever.
-   * Restored from `charge_attempts` on construction.
+   * Mandates whose last charge failed, with when to try again: a cache of
+   * their newest `charge_attempts` rows for `/admin` and the pass history.
+   * The due query reads the table itself, so the cache never decides who is
+   * charged. Restored from `charge_attempts` on construction.
    */
   private readonly backoff = new Map<number, { failures: number; retryAt: number }>();
+  /** Backoff settings from the config, validated; replaced on reload. */
+  private backoffPolicy: BackoffPolicy;
+  /** Uniform in [0, 1); drives the jitter. Injectable so tests are deterministic. */
+  private readonly random: () => number;
   /** Told when a mandate starts or ends a failing streak; see the class notes. */
   private readonly onStreak: ((event: ChargeStreakEvent) => Promise<void>) | undefined;
+  private warnedMissingBalanceReader = false;
   /**
    * Signing lanes, primary first: `channels[0]` is `KEEPER_SECRET` (with
    * `KEEPER_SECRET_NEXT` as its standby in the same lane), every entry from
@@ -361,6 +491,14 @@ export class Keeper {
   private batchEntryMissing = false;
   private readonly passes: KeeperPassSummary[] = [];
   /**
+   * Unix timestamp (seconds) when the keeper last completed a pass without
+   * throwing — i.e. the settlement loop finished, regardless of whether any
+   * mandates were actually settled. Null until the first successful pass.
+   * Exposed via `passHistory()` and `/health` so a watchdog can alert when
+   * the keeper has been silent for too long (#258).
+   */
+  lastSuccessfulRunAt: number | null = null;
+  /**
    * Names this keeper instance in `keeper_claims`: host, PID and a random
    * suffix, so two keepers on one host (or a restarted one) never mistake
    * each other's claims for their own. Never derived from a secret.
@@ -370,6 +508,8 @@ export class Keeper {
   private stopping = false;
   /** Settlement transactions in flight right now, across every worker. */
   private inFlightCount = 0;
+  /** Passes running right now; {@link stop} waits for them to finish (#255). */
+  private readonly activePasses = new Set<Promise<unknown>>();
   /** Resolves when the persisted backoff has been loaded into memory. */
   readonly ready: Promise<void>;
 
@@ -378,15 +518,18 @@ export class Keeper {
     server: KeeperRpc,
     config: Config,
     onStreak?: (event: ChargeStreakEvent) => Promise<void>,
+    options: { random?: () => number } = {},
   ) {
     this.db = asStorage(db);
     this.server = server;
     this.config = config;
     this.onStreak = onStreak;
+    this.random = options.random ?? Math.random;
     if (!config.KEEPER_SECRET) {
       throw new Error("Keeper requires KEEPER_SECRET");
     }
     this.channels = Keeper.checkedChannels(config);
+    this.backoffPolicy = Keeper.checkedBackoff(config);
     // The backoff a previous process left behind is read once per start; the
     // pass methods await `ready` so a first pass never runs ahead of it.
     this.ready = this.restoreBackoff();
@@ -399,9 +542,10 @@ export class Keeper {
 
   /**
    * Resume the backoff a previous process left behind: a mandate's newest
-   * attempt carries its streak and next retry, so only mandates still in a
-   * failing streak come back. One pass over the (mandate_id, id) index, once
-   * per start; SQLite takes the bare columns from the row holding MAX(id).
+   * attempt carries its streak and next retry, so only mandates whose last
+   * attempt failed come back (a failure that did not grow the streak, #248,
+   * included). One pass over the (mandate_id, id) index, once per start;
+   * SQLite takes the bare columns from the row holding MAX(id).
    */
   private async restoreBackoff(): Promise<void> {
     const rows = await this.db.all<{ mandate_id: number; failures: number; retry_at: number }>(
@@ -409,7 +553,7 @@ export class Keeper {
          FROM (SELECT mandate_id, failures, retry_at, MAX(id)
                  FROM charge_attempts
                 GROUP BY mandate_id)
-        WHERE failures > 0`,
+        WHERE retry_at IS NOT NULL`,
     );
     for (const row of rows) {
       this.backoff.set(row.mandate_id, { failures: row.failures, retryAt: row.retry_at });
@@ -451,18 +595,29 @@ export class Keeper {
     return this.inFlightCount;
   }
 
+  /** True once {@link stop} has been called: no new mandate will be picked up. */
+  get isStopping(): boolean {
+    return this.stopping;
+  }
+
   /**
    * Begin a graceful shutdown: workers take no new mandates, while the
    * transactions already in flight finish (or time out) and are recorded.
    * The pass in progress resolves once they have; later passes do nothing.
+   *
+   * Resolves once every pass that was running has finished, so a caller
+   * (SIGTERM handler) can wait for in-flight charges before closing the
+   * database (#255). Never rejects: a pass's own error is its caller's.
    */
-  stop(): void {
-    if (this.stopping) return;
-    this.stopping = true;
-    logger.info(
-      { inFlight: this.inFlightCount },
-      "keeper stopping: in-flight settlements will finish, no new ones start",
-    );
+  stop(): Promise<void> {
+    if (!this.stopping) {
+      this.stopping = true;
+      logger.info(
+        { inFlight: this.inFlightCount, passes: this.activePasses.size },
+        "keeper stopping: in-flight settlements will finish, no new ones start",
+      );
+    }
+    return Promise.allSettled([...this.activePasses]).then(() => undefined);
   }
 
   /**
@@ -474,7 +629,9 @@ export class Keeper {
     // Validate before touching anything, so a rejected reload keeps the
     // running keeper exactly as it was.
     const channels = Keeper.checkedChannels(config);
+    const backoffPolicy = Keeper.checkedBackoff(config);
     this.config = config;
+    this.backoffPolicy = backoffPolicy;
     // The reloaded config may point at a contract that does support
     // `charge_many`; support is re-detected on the next batch attempt.
     this.batchEntryMissing = false;
@@ -540,24 +697,52 @@ export class Keeper {
   }
 
   /**
+   * The backoff settings `config` describes (#248), unset ones at their
+   * defaults, after the same checks `loadConfig` makes; this covers a
+   * hand-built config and a SIGHUP reload, which is refused without
+   * touching the running keeper.
+   */
+  private static checkedBackoff(config: Config): BackoffPolicy {
+    const policy: BackoffPolicy = {
+      baseS: config.KEEPER_BACKOFF_BASE_S ?? DEFAULT_BACKOFF_BASE_S,
+      multiplier: config.KEEPER_BACKOFF_MULTIPLIER ?? DEFAULT_BACKOFF_MULTIPLIER,
+      maxS: config.KEEPER_BACKOFF_MAX_S ?? DEFAULT_BACKOFF_MAX_S,
+      jitter: config.KEEPER_BACKOFF_JITTER ?? DEFAULT_BACKOFF_JITTER,
+    };
+    if (!Number.isInteger(policy.baseS) || policy.baseS < 1) {
+      throw new Error(`KEEPER_BACKOFF_BASE_S must be a whole number of at least 1, got ${String(policy.baseS)}`);
+    }
+    if (!Number.isFinite(policy.multiplier) || policy.multiplier < 1) {
+      throw new Error(`KEEPER_BACKOFF_MULTIPLIER must be at least 1, got ${String(policy.multiplier)}`);
+    }
+    if (!Number.isInteger(policy.maxS)) {
+      throw new Error(`KEEPER_BACKOFF_MAX_S must be a whole number, got ${String(policy.maxS)}`);
+    }
+    if (!(policy.jitter >= 0 && policy.jitter <= 0.5)) {
+      throw new Error(`KEEPER_BACKOFF_JITTER must be between 0 and 0.5, got ${String(policy.jitter)}`);
+    }
+    const problem = keeperBackoffProblem({
+      KEEPER_BACKOFF_BASE_S: policy.baseS,
+      KEEPER_BACKOFF_MAX_S: policy.maxS,
+      CHARGE_ATTEMPT_RETENTION_DAYS: config.CHARGE_ATTEMPT_RETENTION_DAYS ?? DEFAULT_ATTEMPT_RETENTION_DAYS,
+    });
+    if (problem) throw new Error(problem);
+    return policy;
+  }
+
+  /**
    * Mandates the indexer believes are chargeable right now, in the order set
    * by `KEEPER_ORDER` (`oldest` = oldest-due first, the default; `largest` =
    * largest amount first), skipping any that are backing off after a failed
-   * charge. With `KEEPER_MERCHANTS` set, only those merchants' mandates are
+   * charge — in the query itself, so they never take a place in the batch.
+   * With `KEEPER_MERCHANTS` set, only those merchants' mandates are
    * returned; empty means every merchant.
    */
   async findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): Promise<DueMandate[]> {
-    // Nothing settles before the persisted backoff is back in memory.
+    // The backoff cache is restored before the first pass, and a database
+    // that failed to load it fails the pass instead of running beside it.
     await this.ready;
-    const due: DueMandate[] = [];
-    // Read past the backing-off mandates so they cannot fill the batch.
-    for (const m of await this.queryDue(now, limit + this.backoff.size)) {
-      const wait = this.backoff.get(m.id);
-      if (wait && wait.retryAt > now) continue;
-      due.push(m);
-      if (due.length === limit) break;
-    }
-    return due;
+    return this.queryDue(now, limit);
   }
 
   private async queryDue(now: number, limit: number): Promise<DueMandate[]> {
@@ -574,10 +759,11 @@ export class Keeper {
         WHERE status = 'Active'
           AND next_charge <= ?
           AND (max_charges = 0 OR charges_made < max_charges)
+          AND ${NOT_BACKING_OFF}
           ${merchantFilter}
         ORDER BY next_charge ASC
         LIMIT ?`,
-      [now, ...merchants, limit],
+      [now, now, ...merchants, limit],
     );
   }
 
@@ -599,8 +785,9 @@ export class Keeper {
         WHERE status = 'Active'
           AND next_charge <= ?
           AND (max_charges = 0 OR charges_made < max_charges)
+          AND ${NOT_BACKING_OFF}
           ${merchantFilter}`,
-      [now, ...merchants],
+      [now, now, ...merchants],
     );
     rows.sort((a, b) => {
       const amountDiff = BigInt(b.amount) - BigInt(a.amount);
@@ -631,6 +818,26 @@ export class Keeper {
   /** Seconds a claim on a due charge lasts; see `KEEPER_CLAIM_TTL_S`. */
   private claimTtl(): number {
     return this.config.KEEPER_CLAIM_TTL_S ?? DEFAULT_CLAIM_TTL_S;
+  }
+
+  /**
+   * Give back claims this instance took but never submitted, by expiring
+   * them now; another keeper (or this one after a restart) may claim the
+   * charge on its next pass.
+   */
+  private async releaseClaims(group: DueMandate[], now: number): Promise<void> {
+    for (const mandate of group) {
+      await holdClaim(this.db, {
+        mandateId: mandate.id,
+        dueAt: mandate.next_charge,
+        owner: this.instanceId,
+        until: now,
+      });
+    }
+    logger.info(
+      { mandateIds: group.map((mandate) => mandate.id) },
+      "keeper stopping: released claims on charges that were never submitted",
+    );
   }
 
   /** Track the in-flight count and publish it as the `keeper_in_flight` gauge. */
@@ -667,7 +874,13 @@ export class Keeper {
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
-    return withSpan("keeper.tick", () => this.tickInner(now));
+    const pass = withSpan("keeper.tick", () => this.tickInner(now));
+    this.activePasses.add(pass);
+    try {
+      return await pass;
+    } finally {
+      this.activePasses.delete(pass);
+    }
   }
 
   private async tickInner(now: number): Promise<SettleResult[]> {
@@ -689,7 +902,13 @@ export class Keeper {
       for (const skip of skipped) {
         await this.record(
           byId.get(skip.mandateId)!,
-          { result: "skipped", errorCode: "INSUFFICIENT_BALANCE", txHash: null, shortfall: skip.shortfall },
+          {
+            result: "skipped",
+            errorCode: "INSUFFICIENT_BALANCE",
+            txHash: null,
+            shortfall: skip.shortfall,
+            failure: "mandate",
+          },
           now,
         );
       }
@@ -739,6 +958,13 @@ export class Keeper {
           // A dry run submits nothing, so it has nothing to claim.
           const claimed = dryRun ? group : await this.claimGroup(group, clock());
           if (claimed.length === 0) continue;
+          // Stop landed while the claims were being taken: nothing has been
+          // submitted for them, so hand them back at once rather than make
+          // another keeper wait out the claim TTL (#255).
+          if (this.stopping) {
+            if (!dryRun) await this.releaseClaims(claimed, clock());
+            return;
+          }
           const channel = await pool.acquire();
           this.adjustInFlight(1);
           let results: SettleResult[];
@@ -789,6 +1015,7 @@ export class Keeper {
       );
     }
     await pruneClaims(this.db, now);
+    this.lastSuccessfulRunAt = now;
     metrics.increment("keeper_passes");
     for (const result of results) {
       if (result.status === "settled") metrics.increment("charges_settled");
@@ -902,7 +1129,7 @@ export class Keeper {
       const res = await this.server.simulateTransaction(tx);
       if ("error" in res && res.error) {
         logger.warn(
-          { subscriber, token, reason: res.error.slice(0, 200).replace(/\s+/g, " ") },
+          { subscriber: maskAccount(subscriber), token, reason: maskAccount(res.error.slice(0, 200).replace(/\s+/g, " ")) },
           "vault balance unavailable; settling as before",
         );
         return null;
@@ -916,7 +1143,7 @@ export class Keeper {
       return null;
     } catch (err) {
       logger.warn(
-        { subscriber, token, err: err instanceof Error ? err.message : String(err) },
+        { subscriber: maskAccount(subscriber), token, err: maskAccount(err instanceof Error ? err.message : String(err)) },
         "vault balance unavailable; settling as before",
       );
       return null;
@@ -925,51 +1152,113 @@ export class Keeper {
 
   /**
    * The channels this pass may distribute due mandates over: every configured
-   * channel whose signing account can pay, checked once per pass with a single
-   * `getAccount` each (and only when several channels are configured). A
-   * channel that cannot pay is dropped for the pass — logged by public key,
+   * channel whose signing account exists and has enough XLM to meet its
+   * configured minimum balance, checked once per pass. A channel that cannot
+   * pay is dropped for the pass — logged by public key,
    * never a secret — so its mandates settle through the live channels instead
    * of backing off against a dead key. A *transient* RPC error keeps the
    * channel: `settle` will fail the mandate and the usual backoff retries it
-   * on the next pass, never crashing the loop. If every channel looks unusable
-   * (an RPC outage misread as dead accounts), all of them are kept and
-   * per-mandate failure decides, exactly like the single-key path.
+   * on the next pass, never crashing the loop. If every channel is below the
+   * configured balance threshold, none is submitted; missing accounts retain
+   * the existing per-mandate failure and backoff behavior.
    */
   private async distributableChannels(): Promise<Channel[]> {
-    if (this.channels.length === 1) return this.channels;
     const checked = await Promise.all(
       this.channels.map(async (channel) => {
-        if (await this.canSign(channel)) return channel;
-        const unusable = channel.keys[channel.active]!.publicKey();
-        logger.warn(
-          { channel: unusable },
-          "keeper channel key cannot pay; skipping this channel for the pass",
-        );
-        return null;
+        const health = await this.canSign(channel);
+        if (health !== "usable") {
+          const unusable = channel.keys[channel.active]!.publicKey();
+          logger.warn(
+            { channel: unusable, health },
+            "keeper channel key cannot pay; skipping this channel for the pass",
+          );
+        }
+        return { channel, health };
       }),
     );
-    const usable = checked.filter((channel): channel is Channel => channel !== null);
-    return usable.length > 0 ? usable : this.channels;
+    const usable = checked.filter(({ health }) => health === "usable");
+    if (usable.length > 0) return usable.map(({ channel }) => channel);
+    // Preserve the established per-mandate failure/backoff path for missing
+    // accounts, but never fall back to channels confirmed below the threshold.
+    return checked
+      .filter(({ health }) => health !== "low_balance")
+      .map(({ channel }) => channel);
   }
 
   /**
-   * Whether the channel's active key can pay for a transaction, rotating to
-   * its standby first when the active key cannot — the same rotation
-   * `settle` performs mid-pass, done up front here so an unused channel never
-   * strands its standby. A non-key failure (RPC hiccup) answers `true`: the
-   * channel stays and the mandate's own error handling takes over.
+   * Check the active key's account and balance, rotating to its standby first
+   * when either is unusable. A transient RPC failure keeps the channel in
+   * rotation so normal transaction handling can apply its usual backoff.
    */
-  private async canSign(channel: Channel): Promise<boolean> {
+  private async canSign(channel: Channel): Promise<"usable" | "low_balance" | "unusable"> {
     for (;;) {
       const key = channel.keys[channel.active]!;
       try {
-        await this.server.getAccount(key.publicKey());
-        return true;
+        const balance = await this.channelBalance(key);
+        const minimum = xlmToStroops(this.config.KEEPER_CHANNEL_MIN_XLM ?? "1");
+        if (balance?.kind === "missing") {
+          if (this.rotateToStandby(channel)) continue;
+          return "unusable";
+        }
+        if (balance?.kind === "available" && balance.stroops < minimum) {
+          metrics.increment("keeper_low_fee_balance", 1, { channel: key.publicKey() });
+          logger.warn(
+            {
+              channel: key.publicKey(),
+              balanceStroops: balance.stroops.toString(),
+              minimumXlm: this.config.KEEPER_CHANNEL_MIN_XLM ?? "1",
+            },
+            "keeper channel XLM balance is below the minimum",
+          );
+          if (this.rotateToStandby(channel)) continue;
+          return "low_balance";
+        }
+        if (balance === null && this.channels.length > 1) {
+          await this.server.getAccount(key.publicKey());
+        }
+        return "usable";
       } catch (err) {
-        if (!isKeyFailure(err)) return true;
+        if (!isKeyFailure(err)) return "usable";
         if (this.rotateToStandby(channel)) continue;
-        return false;
+        return "unusable";
       }
+    }
+  }
+
+  /** Native XLM balance in stroops, or null when the RPC cannot read it. */
+  private async channelBalance(key: Keypair): Promise<ChannelBalance | null> {
+    if (!this.server.getLedgerEntries) {
+      if (!this.warnedMissingBalanceReader) {
+        this.warnedMissingBalanceReader = true;
+        logger.warn(
+          "keeper RPC does not support account balance reads; channel balance checks are disabled",
+        );
+      }
+      return null;
+    }
+    try {
+      const ledgerKey = xdr.LedgerKey.account(
+        new xdr.LedgerKeyAccount({
+          accountId: xdr.PublicKey.publicKeyTypeEd25519(
+            StrKey.decodeEd25519PublicKey(key.publicKey()),
+          ),
+        }),
+      );
+      const response = await this.server.getLedgerEntries(ledgerKey);
+      const account = response.entries[0]?.val;
+      if (!account) return { kind: "missing" };
+      return account.type === "account"
+        ? { kind: "available", stroops: account.account.balance }
+        : null;
+    } catch (err) {
+      logger.warn(
+        {
+          channel: key.publicKey(),
+          error: this.scrubError(err instanceof Error ? err.message : String(err)),
+        },
+        "keeper channel XLM balance unavailable; keeping channel for this pass",
+      );
+      return null;
     }
   }
 
@@ -1090,21 +1379,62 @@ export class Keeper {
   }
 
   /**
+   * Seconds until a mandate whose attempt just failed is tried again (#248),
+   * given its streak after the attempt: the exponential schedule for the
+   * mandate's own failures, the cap at once for a permanent refusal, and the
+   * base delay for a failure that is not the mandate's. Jitter only ever
+   * shortens the wait, so the cap holds.
+   */
+  private retryDelay(failure: FailureClass, failures: number): number {
+    const { baseS, multiplier, maxS, jitter } = this.backoffPolicy;
+    const delay =
+      failure === "mandate"
+        ? Math.min(Math.floor(baseS * multiplier ** (failures - 1)), maxS)
+        : failure === "permanent"
+          ? maxS
+          : baseS;
+    return delay - Math.floor(delay * jitter * this.random());
+  }
+
+  /**
    * Apply one attempt: advance or reset the mandate's backoff, append the
    * attempt to `charge_attempts` with the resulting streak, and tell the
    * merchant when the streak reaches {@link FAILING_STREAK} or ends after it.
-   * One indexed insert; nothing here waits on the network. Answers when the
-   * mandate is next tried, or null once it has settled.
+   * Two indexed statements; nothing here waits on the network. Answers when
+   * the mandate is next tried, or null once it has settled.
    */
   private async record(mandate: DueMandate, attempt: ChargeAttempt, now: number): Promise<number | null> {
-    const streak = this.backoff.get(mandate.id)?.failures ?? 0;
-    const failures = attempt.result === "settled" ? 0 : streak + 1;
-    const retryAt =
-      failures === 0
-        ? null
-        : now + Math.min(BACKOFF_BASE_S * 2 ** (failures - 1), BACKOFF_MAX_S);
+    // The streak comes from the attempt log rather than the cache, so a
+    // keeper sharing the database with others continues their streak.
+    const last = await this.db.get<{ failures: number }>(
+      "SELECT failures FROM charge_attempts WHERE mandate_id = ? ORDER BY id DESC LIMIT 1",
+      [mandate.id],
+    );
+    const streak = last?.failures ?? 0;
+    const failure = attempt.result === "settled" ? null : attempt.failure ?? "mandate";
+    const counted = failure === "mandate" || failure === "permanent";
+    const failures = failure === null ? 0 : counted ? streak + 1 : streak;
+    const retryAt = failure === null ? null : now + this.retryDelay(failure, failures);
     if (retryAt === null) this.backoff.delete(mandate.id);
     else this.backoff.set(mandate.id, { failures, retryAt });
+    if (failure !== null && retryAt !== null) {
+      const fields = {
+        mandateId: mandate.id,
+        failures,
+        reason: failure,
+        errorCode: attempt.errorCode,
+        retryAt,
+        retryIn: retryAt - now,
+      };
+      if (failure === "keeper") {
+        logger.error(fields, "keeper signer or authorization was refused; retrying without growing the mandate's backoff");
+      } else if (failure === "infrastructure") {
+        logger.warn(fields, "charge failed on the network, not the mandate; retrying without growing its backoff");
+      } else {
+        logger.warn(fields, "mandate backing off after a failed charge");
+      }
+      metrics.increment("keeper_backoffs", 1, { reason: failure });
+    }
 
     const inserted = await this.db.get<{ id: number }>(
       `INSERT INTO charge_attempts
@@ -1130,7 +1460,9 @@ export class Keeper {
       merchant: mandate.merchant,
       attemptId: Number(attemptId),
     };
-    if (failures === FAILING_STREAK && retryAt !== null) {
+    // Only a failure that grew the streak can reach the threshold, so a
+    // network blip during a failing streak never repeats `charge.failing`.
+    if (failures === FAILING_STREAK && failures > streak && retryAt !== null) {
       this.notify({
         ...subject,
         kind: "charge.failing",
@@ -1494,5 +1826,74 @@ export class Keeper {
       latest = await this.server.getTransaction(hash);
     }
     return latest;
+  }
+}
+
+/** What {@link settleOnce} listens to for shutdown signals; `process` in production. */
+export interface SignalSource {
+  once(signal: NodeJS.Signals, listener: () => void): unknown;
+  off(signal: NodeJS.Signals, listener: () => void): unknown;
+}
+
+export interface SettleOnceResult {
+  /** The pass's results, or undefined when it failed or was abandoned. */
+  results?: SettleResult[];
+  /** The pass's error, when it threw. */
+  error?: unknown;
+  /** The signal that stopped the pass early, if one arrived. */
+  signal?: NodeJS.Signals | undefined;
+  /** True when in-flight charges were still running at the shutdown deadline. */
+  timedOut: boolean;
+}
+
+/**
+ * Run one settlement pass the way the standalone keeper command does (#255).
+ *
+ * A SIGTERM or SIGINT while the pass runs stops it gracefully: no new mandate
+ * is picked up, and the transactions already in flight finish and are
+ * recorded before this resolves. If they are still running `timeoutMs` after
+ * the signal, it resolves with `timedOut` so the caller can exit instead of
+ * hanging on a stuck RPC call; their claims lapse after `KEEPER_CLAIM_TTL_S`.
+ * Never rejects; the pass's own error comes back as `error`.
+ */
+export async function settleOnce(
+  keeper: Keeper,
+  options: { timeoutMs: number; signals?: SignalSource; now?: number },
+): Promise<SettleOnceResult> {
+  const signals = options.signals ?? process;
+  let signal: NodeJS.Signals | undefined;
+  let deadline: NodeJS.Timeout | undefined;
+  let resolveTimeout: (value: "timeout") => void = () => undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    resolveTimeout = resolve;
+  });
+  const handlers = (["SIGTERM", "SIGINT"] as const).map((name) => {
+    const handler = (): void => {
+      if (signal) return;
+      signal = name;
+      logger.info({ signal: name, inFlight: keeper.inFlight }, "shutdown signal received during settlement pass");
+      void keeper.stop();
+      deadline = setTimeout(() => resolveTimeout("timeout"), options.timeoutMs);
+    };
+    signals.once(name, handler);
+    return [name, handler] as const;
+  });
+  const pass = keeper.tick(options.now).then(
+    (results) => ({ results }),
+    (error: unknown) => ({ error }),
+  );
+  try {
+    const outcome = await Promise.race([pass, timedOut]);
+    if (outcome === "timeout") {
+      logger.warn(
+        { timeoutMs: options.timeoutMs, inFlight: keeper.inFlight },
+        "in-flight settlements still running at the shutdown deadline; exiting anyway",
+      );
+      return { signal, timedOut: true };
+    }
+    return { ...outcome, signal, timedOut: false };
+  } finally {
+    clearTimeout(deadline);
+    for (const [name, handler] of handlers) signals.off(name, handler);
   }
 }

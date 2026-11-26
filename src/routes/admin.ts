@@ -23,6 +23,12 @@ export interface AdminHooks {
   pruneData?: (daysToKeep?: number) => Promise<unknown>;
   getAuditLogs?: (limit: number) => unknown;
   getPastDueMandates?: () => unknown;
+  vacuumDb?: () => Promise<unknown>;
+  /**
+   * Returns the current raw-event retention policy: how many days events are
+   * kept, when the last automatic prune ran, and how many raw events exist.
+   */
+  getRetentionPolicy?: () => Promise<unknown>;
 }
 
 /** Scoped operation that a token is allowed to perform. */
@@ -231,7 +237,16 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     await respond(req, res, "prune_failed", () => prune(daysToKeep));
   });
 
-  r.get("/audit-logs", queryOnly("limit"), async (req, res) => {
+  r.get("/data/retention", async (req, res) => {
+    const read = hooks.getRetentionPolicy;
+    if (!read) {
+      sendApiError(res, req, 503, "retention_unavailable", undefined, undefined, 30);
+      return;
+    }
+    await respond(req, res, "retention_failed", read);
+  });
+
+  r.get("/audit-logs", async (req, res) => {
     const read = hooks.getAuditLogs;
     if (!read) {
       sendApiError(res, req, 503, "audit_unavailable", undefined, undefined, 30);
@@ -250,6 +265,15 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
       return;
     }
     res.json({ status: "ok", past_due: (await read()) ?? [] });
+  });
+
+  r.post("/db/vacuum", async (req, res) => {
+    const run = hooks.vacuumDb;
+    if (!run) {
+      sendApiError(res, req, 503, "vacuum_unavailable", undefined, undefined, 30);
+      return;
+    }
+    await respond(req, res, "vacuum_failed", run);
   });
 
   return r;

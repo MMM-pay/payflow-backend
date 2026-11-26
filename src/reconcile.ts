@@ -10,7 +10,7 @@ import {
   TransactionBuilder,
 } from "@stellar/stellar-sdk";
 import { big, num } from "./lib/stellar.ts";
-import { logger } from "./lib/logger.ts";
+import { logger, maskAccount } from "./lib/logger.ts";
 import { asStorage } from "./lib/store/index.ts";
 import type { Storage } from "./lib/store/types.ts";
 import { updateActivePlanSubscriber } from "./lib/plan-subscribers.ts";
@@ -218,7 +218,7 @@ export class Reconciler {
           logger.info(
             {
               mandateId: id,
-              merchant: row.merchant,
+              merchant: maskAccount(row.merchant),
               field: d.field,
               projection: d.projection,
               chain: d.chain,

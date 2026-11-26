@@ -201,7 +201,9 @@ export async function seedDatabase(
       : false;
     if (!isSeeded) {
       const tables = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations'",
+        )
         .all() as { name: string }[];
       for (const { name } of tables) {
         const quotedName = `"${name.replaceAll('"', '""')}"`;

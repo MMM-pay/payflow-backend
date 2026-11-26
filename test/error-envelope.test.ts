@@ -10,6 +10,7 @@ import type { DecodedEvent } from "../src/lib/stellar.ts";
 import type { AdminHooks } from "../src/routes/admin.ts";
 import type { WebhookDispatcher } from "../src/lib/webhooks.ts";
 import { Sep10Auth } from "../src/routes/auth.ts";
+import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 import { testAddress } from "./addresses.ts";
 
 /**
@@ -83,6 +84,8 @@ function testAuth(): Sep10Auth {
     networkPassphrase: testnet.networkPassphrase,
     issuer: "https://payflow.test/api/testnet/auth",
     tokenTtlS: 3_600,
+    refreshTtlS: 86_400,
+    db: SqliteStorage.open(":memory:"),
     loadAccount: async () => null,
   });
 }

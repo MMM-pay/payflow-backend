@@ -18,6 +18,7 @@ import {
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp } from "../src/app.ts";
 import { WebhookDispatcher } from "../src/lib/webhooks.ts";
+import { asStorage } from "../src/lib/store/index.ts";
 import { logger, redact } from "../src/lib/logger.ts";
 import { loadConfig, type Config, type NetworkConfig } from "../src/config.ts";
 import { Sep10Auth, sep10For } from "../src/routes/auth.ts";
@@ -104,10 +105,11 @@ describe("SEP-10 sign-in", () => {
     SEP10_HOME_DOMAIN: HOME,
     SEP10_WEB_AUTH_DOMAIN: WEB,
     SEP10_JWT_TTL_S: TTL,
+    SEP10_REFRESH_TTL_S: TTL,
   } as unknown as Config;
 
   const db = openDatabase(":memory:");
-  const auth = sep10For(config, testnet, fakeRpc)!;
+  const auth = sep10For(config, testnet, fakeRpc, asStorage(db))!;
   const issued: string[] = [];
   const logged: string[] = [];
   const stream = (logger as unknown as Record<symbol, { write: (line: string) => unknown }>)[pino.symbols.streamSym]!;
@@ -159,12 +161,18 @@ describe("SEP-10 sign-in", () => {
     });
     const body = (await res.json()) as Record<string, unknown>;
     if (typeof body.token === "string") issued.push(body.token);
+    if (typeof body.refresh_token === "string") issued.push(body.refresh_token);
     return { status: res.status, body };
   };
   const signIn = async (key: Keypair = client): Promise<string> => {
     const res = await exchange(signed(await challenge(key.publicKey()), key));
     assert.equal(res.status, 200);
     return res.body.token as string;
+  };
+  const signInWithRefresh = async (key: Keypair = client): Promise<{ token: string; refresh_token: string }> => {
+    const res = await exchange(signed(await challenge(key.publicKey()), key));
+    assert.equal(res.status, 200);
+    return { token: res.body.token as string, refresh_token: res.body.refresh_token as string };
   };
   const errorMessage = (body: Record<string, unknown>): string => (body.error as { message: string }).message;
 
@@ -283,7 +291,9 @@ describe("SEP-10 sign-in", () => {
       networkPassphrase: Networks.TESTNET,
       issuer: ISSUER,
       tokenTtlS: TTL,
+      refreshTtlS: TTL,
       loadAccount: async () => null,
+      db: asStorage(openDatabase(":memory:")),
     });
     const foreign = signed(otherServer.challenge(client.publicKey()).transaction, client);
     assert.equal((await exchange(foreign)).status, 400);
@@ -439,6 +449,59 @@ describe("SEP-10 sign-in", () => {
     assert.ok(!lines.join("").includes(server.secret()));
     assert.ok(!lines.join("").includes(JWT_SECRET));
   });
+
+  test("sign-in returns a refresh token alongside the short-lived JWT (#282)", async () => {
+    const { token, refresh_token } = await signInWithRefresh(client);
+    assert.ok(typeof token === "string" && token.length > 0, "JWT is issued");
+    assert.ok(typeof refresh_token === "string" && refresh_token.length > 0, "refresh token is issued");
+    const claims = claimsOf(token);
+    assert.equal(claims.sub, client.publicKey());
+    assert.ok(typeof claims.exp === "number" && typeof claims.iat === "number" && claims.exp > claims.iat, "JWT has an expiry");
+  });
+
+  test("rotating a refresh token issues a new JWT and the next refresh token (#282)", async () => {
+    const { refresh_token: first } = await signInWithRefresh(client);
+    const res = await fetch(`${base}/api/auth/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: first }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { token: string; refresh_token: string };
+    assert.ok(typeof body.token === "string" && body.token.length > 0, "new JWT is issued");
+    assert.ok(typeof body.refresh_token === "string" && body.refresh_token.length > 0, "next refresh token is issued");
+    assert.notEqual(body.refresh_token, first, "the new refresh token differs from the consumed one");
+    const claims = claimsOf(body.token);
+    assert.equal(claims.sub, client.publicKey());
+  });
+
+  test("a consumed refresh token cannot be rotated again (#282)", async () => {
+    const { refresh_token: first } = await signInWithRefresh(client);
+    await fetch(`${base}/api/auth/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: first }),
+    });
+    const res = await fetch(`${base}/api/auth/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: first }),
+    });
+    assert.equal(res.status, 401, "replaying a consumed refresh token is refused");
+    const body = (await res.json()) as { error: { code: string } };
+    assert.equal(body.error.code, "unauthorized");
+  });
+
+  test("an unknown refresh token cannot be rotated (#282)", async () => {
+    const res = await fetch(`${base}/api/auth/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: "not-a-refresh-token" }),
+    });
+    assert.equal(res.status, 401, "an unknown refresh token is refused");
+    const body = (await res.json()) as { error: { code: string } };
+    assert.equal(body.error.code, "unauthorized");
+  });
 });
 
 describe("SEP-10 configuration", () => {
@@ -452,7 +515,7 @@ describe("SEP-10 configuration", () => {
 
   test("sign-in is off until a signing key is configured", () => {
     const config = loadConfig({ ...BASE, SEP10_SIGNING_KEY: "", SEP10_JWT_SECRET: "", SEP10_HOME_DOMAIN: "" });
-    assert.equal(sep10For(config, testnet, rpcNever), undefined);
+    assert.equal(sep10For(config, testnet, rpcNever, asStorage(openDatabase(":memory:"))), undefined);
   });
 
   test("a signing key needs a JWT secret and a home domain", () => {
@@ -466,7 +529,7 @@ describe("SEP-10 configuration", () => {
   test("the web auth domain defaults to the home domain and names the issuer", async () => {
     const config = loadConfig({ ...BASE, SEP10_SIGNING_KEY: seed, SEP10_JWT_SECRET: JWT_SECRET, SEP10_HOME_DOMAIN: "localhost:8080" });
     assert.equal(config.SEP10_JWT_TTL_S, 3_600);
-    const auth = sep10For(config, { ...testnet, name: "mainnet", networkPassphrase: Networks.PUBLIC }, { getLedgerEntries: async () => ({ entries: [], latestLedger: 1 }) as never })!;
+    const auth = sep10For(config, { ...testnet, name: "mainnet", networkPassphrase: Networks.PUBLIC }, { getLedgerEntries: async () => ({ entries: [], latestLedger: 1 }) as never }, asStorage(openDatabase(":memory:") as never))!;
     assert.equal(auth.webAuthDomain, "localhost:8080");
     const client = Keypair.random();
     const { transaction, network_passphrase } = auth.challenge(client.publicKey());

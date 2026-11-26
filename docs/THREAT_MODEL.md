@@ -239,13 +239,13 @@ link-local, metadata, reserved and other non-public addresses are refused.
 Existing registrations are checked at delivery time as well. Keep network
 egress restrictions in place as defense in depth.
 
-### 7.4 Webhook response bodies are read and stored without a size cap
+### 7.4 Webhook delivery responses and errors can contain credentials
 
-A delivery reads the receiver's whole response (`res.text()`) and stores it in
-`webhook_deliveries.response_body`. The 15-second timeout bounds the time, not
-the size, so a hostile receiver can return a large body on every attempt and
-grow memory and the database. The body is never returned by the API.
-**Mitigation:** none in configuration; watch the database size.
+A receiver can echo signing secrets or tokens in its response body, and
+transport errors can include credential-bearing URLs. Delivery attempts now
+discard response bodies and store only a fixed error category rather than
+untrusted error text. Startup migration clears response bodies saved by older
+versions. Delivery status, HTTP status, and retry timing remain available.
 
 ### 7.5 `/health` publishes the RPC endpoint URLs
 
@@ -361,12 +361,22 @@ beside the name.
   any `secret` field and `req.headers.authorization` are redacted at the top
   level and one level down (`src/lib/logger.ts`). The SEP-10 keys are kept in
   JavaScript private fields, so serialising the auth object cannot write them.
-- **Security headers.** `helmet` sets its default headers and CSP. `/api/docs`
-  adds only `worker-src 'self' blob:`, and the ReDoc bundle is served by the
-  process, not a CDN.
-- **CORS.** `CORS_ORIGIN` (default `*`) applies to the API; SEP-10 paths are
-  always `*`, as the spec requires. No route reads a cookie, so a permissive
-  origin does not expose an authenticated session.
+- **Security headers.** Every response carries a strict CSP
+  (`default-src 'self'`, `script-src 'self'` with no `unsafe-inline` or
+  `unsafe-eval`, `frame-ancestors 'none'`, `object-src 'none'`),
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, HSTS and the cross-origin isolation headers.
+  `/api/docs` adds only `worker-src 'self' blob:`, and the ReDoc bundle is
+  served by the process, not a CDN.
+- **CORS.** `CORS_ORIGIN` is an exact-origin allowlist and defaults to empty,
+  so only a listed frontend may read the API from a browser; `*` is an
+  explicit opt-in. SEP-10 paths are always `*`, as the spec requires. No route
+  reads a cookie, so even a wildcard origin exposes no authenticated session.
+- **Duplicate events.** The raw `events` table is the delivery ledger: an
+  event already retained is not applied, counted or notified again, so an
+  overlapping window or a replayed range cannot double-count a projection.
+  Webhook deliveries are keyed on `(webhook, event)` with a stable
+  `Idempotency-Key`.
 - **Caching.** Read routes answer `Cache-Control: public, max-age=5`; webhook
   management, notification preferences, SEP-10 answers, the stream,
   `/health` and `/ready` are `no-store`.

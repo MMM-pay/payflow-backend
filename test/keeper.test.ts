@@ -11,7 +11,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { rpc } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
-import { Keeper, type KeeperRpc } from "../src/keeper.ts";
+import { Keeper, classifyFailure, type KeeperRpc } from "../src/keeper.ts";
 import { loadConfig } from "../src/config.ts";
 import { logger } from "../src/lib/logger.ts";
 import type { ChargeStreakEvent } from "../src/lib/webhooks.ts";
@@ -45,6 +45,8 @@ function keeperConfig(
     KEEPER_MAX_FEE: "100000",
     KEEPER_BATCH: false,
     KEEPER_BATCH_SIZE: 10,
+    // Exact retry times: the jitter has its own tests.
+    KEEPER_BACKOFF_JITTER: 0,
     ...fees,
     ...toggles,
     ...secrets,
@@ -1514,22 +1516,26 @@ describe("keeper backoff schedule", () => {
     db.close();
   });
 
-  test("an unusable signing account follows the same schedule, not a tighter retry", async () => {
+  test("an unusable signing account waits the base delay but never grows the mandate's backoff", async () => {
     const db = openDatabase(":memory:");
     insertDue(db, 1, START - 10_000);
-    // No funded account: getAccount fails before simulation, the auth failure
-    // path. It must still back off like any other failed charge.
+    // No funded account: getAccount fails before simulation, the keeper-signer
+    // failure path (#248). Every mandate would fail the same way until the
+    // operator fixes the key, so it is not counted against the mandate: it
+    // still waits the base delay (no tight retry), but the wait never grows.
     const keeper = new Keeper(db, fakeRpc(new Set()), keeperConfig({ KEEPER_SECRET: keyA.secret() }));
 
-    await keeper.tick(START);
-    assert.deepEqual(keeper.backoffList(START), [
-      { mandateId: 1, failures: 1, retryAt: START + 60, retryIn: 60 },
-    ]);
-    assert.deepEqual(await keeper.findDue(START + 59), []);
-    await keeper.tick(START + 60);
-    assert.deepEqual(keeper.backoffList(START + 60), [
-      { mandateId: 1, failures: 2, retryAt: START + 180, retryIn: 120 },
-    ]);
+    let now = START;
+    for (let pass = 0; pass < 4; pass += 1) {
+      await keeper.tick(now);
+      assert.deepEqual(keeper.backoffList(now), [
+        { mandateId: 1, failures: 0, retryAt: now + 60, retryIn: 60 },
+      ]);
+      assert.deepEqual(await keeper.findDue(now + 59), [], "no retry before the base delay");
+      now += 60;
+    }
+    assert.equal(attemptsOf(db).length, 4);
+    assert.ok(attemptsOf(db).every((row) => row.error_code === "SUBMIT_FAILED" && row.failures === 0));
     db.close();
   });
 
@@ -1808,6 +1814,413 @@ describe("keeper RPC client reuse (#347)", () => {
       [2],
       "only the attempt from beyond 30 days is gone when CHARGE_ATTEMPT_RETENTION_DAYS=30",
     );
+    db.close();
+  });
+});
+
+/**
+ * Issue #248: a mandate that keeps failing backs off exponentially, by the
+ * configured schedule and with jitter, and only for failures that are its
+ * own: an RPC outage or a refused keeper signer never pushes it into the
+ * future. The backoff lives in `charge_attempts` and is applied by the due
+ * query, so every keeper sharing the database honours it.
+ */
+describe("keeper per-mandate backoff (#248)", () => {
+  const START = 1_000_000;
+
+  /** How every charge of a pass ends; see `scriptedRpc`. */
+  type Outcome = "settle" | "shortfall" | "network" | "tryAgain" | "badSeq" | "auth" | `contract:${number}`;
+
+  /**
+   * A node whose charges end as `state.outcome` says. `shortfall` answers a
+   * vault balance below the amount, so the keeper skips the charge — the
+   * persistently short vault #248 is about; every other outcome is the
+   * charge's own: settled, refused by the contract or the host, or lost to
+   * the network.
+   */
+  function scriptedRpc(state: { outcome: Outcome }): KeeperRpc {
+    const settles = fakeRpc(new Set([keyA.publicKey()]));
+    return {
+      ...settles,
+      simulateTransaction: async () =>
+        ({
+          result: {
+            retval: nativeToScVal(state.outcome === "shortfall" ? 1n : 1_000_000n, { type: "i128" }),
+          },
+        }) as never,
+      prepareTransaction: async (tx: Transaction) => {
+        if (state.outcome === "auth") throw new Error("HostError: Error(Auth, InvalidAction)");
+        if (state.outcome.startsWith("contract:")) {
+          throw new Error(`HostError: Error(Contract, #${state.outcome.slice("contract:".length)})`);
+        }
+        return tx;
+      },
+      sendTransaction: async (tx: Transaction) => {
+        if (state.outcome === "network") throw new Error("connect ECONNREFUSED 127.0.0.1:8000");
+        if (state.outcome === "tryAgain") return { status: "TRY_AGAIN_LATER" } as never;
+        if (state.outcome === "badSeq") {
+          return { status: "ERROR", errorResult: { result: { type: "txBadSeq" } } } as never;
+        }
+        return settles.sendTransaction(tx);
+      },
+    } as unknown as KeeperRpc;
+  }
+
+  type Settings = Partial<
+    Record<"KEEPER_BACKOFF_BASE_S" | "KEEPER_BACKOFF_MULTIPLIER" | "KEEPER_BACKOFF_MAX_S" | "KEEPER_BACKOFF_JITTER", number>
+  >;
+
+  function backoffConfig(settings: Settings = {}): Config {
+    return { ...keeperConfig({ KEEPER_SECRET: keyA.secret() }), ...settings } as Config;
+  }
+
+  /** A database with one plan (so the vault balance is read) and due mandates. */
+  function dueDb(...ids: number[]): ReturnType<typeof openDatabase> {
+    const db = openDatabase(":memory:");
+    db.prepare(
+      `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
+       VALUES (1, ?, 'p', ?, '10', 60, 1, 1)`,
+    ).run(MERCHANT, CONTRACT);
+    for (const id of ids) insertDue(db, id, START - 10_000 + id);
+    return db;
+  }
+
+  /** Collect the keeper's warn and error log lines, fields and message. */
+  async function captureBackoffLogs(
+    fn: () => Promise<void>,
+  ): Promise<{ level: string; fields: Record<string, unknown>; message: string }[]> {
+    const lines: { level: string; fields: Record<string, unknown>; message: string }[] = [];
+    const originals = { warn: logger.warn, error: logger.error };
+    for (const level of ["warn", "error"] as const) {
+      (logger as unknown as Record<string, unknown>)[level] = function (this: unknown, ...args: unknown[]) {
+        if (typeof args[0] === "object" && typeof args[1] === "string") {
+          lines.push({ level, fields: args[0] as Record<string, unknown>, message: args[1] });
+        }
+        return (originals[level] as (this: unknown, ...a: unknown[]) => void).apply(this, args);
+      };
+    }
+    try {
+      await fn();
+    } finally {
+      (logger as { warn: unknown }).warn = originals.warn;
+      (logger as { error: unknown }).error = originals.error;
+    }
+    return lines;
+  }
+
+  test("repeated vault shortfalls wait base x multiplier^(n-1), capped at the maximum", async () => {
+    const db = dueDb(1);
+    const settings = { KEEPER_BACKOFF_BASE_S: 30, KEEPER_BACKOFF_MULTIPLIER: 3, KEEPER_BACKOFF_MAX_S: 1_000 };
+    const keeper = new Keeper(db, scriptedRpc({ outcome: "shortfall" }), backoffConfig(settings));
+
+    let now = START;
+    for (const [index, wait] of [30, 90, 270, 810, 1_000, 1_000, 1_000].entries()) {
+      assert.deepEqual(await keeper.tick(now), [], "a vault shortfall submits nothing");
+      const failures = index + 1;
+      const row = attemptsOf(db).at(-1)!;
+      assert.deepEqual(
+        { result: row.result, code: row.error_code, failures: row.failures, retryAt: row.retry_at },
+        { result: "skipped", code: "INSUFFICIENT_BALANCE", failures, retryAt: now + wait },
+        `shortfall ${failures} waits ${wait} s`,
+      );
+      assert.deepEqual(await keeper.findDue(now + wait - 1), [], "not retried early");
+      assert.deepEqual((await keeper.findDue(now + wait)).map((m) => m.id), [1], "due at its retry time");
+      now += wait;
+    }
+    db.close();
+  });
+
+  test("a fractional multiplier grows the wait in whole seconds", async () => {
+    const db = dueDb(1);
+    const settings = { KEEPER_BACKOFF_BASE_S: 10, KEEPER_BACKOFF_MULTIPLIER: 1.5, KEEPER_BACKOFF_MAX_S: 30 };
+    const keeper = new Keeper(db, scriptedRpc({ outcome: "shortfall" }), backoffConfig(settings));
+
+    const waits: number[] = [];
+    let now = START;
+    for (let pass = 0; pass < 5; pass += 1) {
+      await keeper.tick(now);
+      waits.push(keeper.retryIn(1, now));
+      now += waits.at(-1)!;
+    }
+    assert.deepEqual(waits, [10, 15, 22, 30, 30]);
+    db.close();
+  });
+
+  test("jitter shortens a wait by at most its share and never exceeds the cap", async () => {
+    const db = dueDb(1);
+    const draws = [0, 0.5, 0.999_999, 0.25, 0.999_999];
+    const keeper = new Keeper(
+      db,
+      scriptedRpc({ outcome: "shortfall" }),
+      backoffConfig({ KEEPER_BACKOFF_BASE_S: 100, KEEPER_BACKOFF_MAX_S: 300, KEEPER_BACKOFF_JITTER: 0.2 }),
+      undefined,
+      { random: () => draws.shift()! },
+    );
+
+    const waits: number[] = [];
+    let now = START;
+    for (let pass = 0; pass < 5; pass += 1) {
+      await keeper.tick(now);
+      waits.push(keeper.retryIn(1, now));
+      now += waits.at(-1)!;
+    }
+    // Unjittered: 100, 200, 300, 300, 300. Each draw takes up to 20% off.
+    assert.deepEqual(waits, [100, 180, 241, 285, 241]);
+    db.close();
+  });
+
+  test("a backed-off mandate is left out of the due query, so it never takes a place in the batch", async () => {
+    const db = dueDb(1, 2);
+    const keeper = new Keeper(db, scriptedRpc({ outcome: "settle" }), backoffConfig());
+    await keeper.ready;
+    // Another keeper sharing the database recorded mandate 1's failure after
+    // this one started: its cache knows nothing, the query still does.
+    db.prepare(
+      `INSERT INTO charge_attempts (mandate_id, attempted_at, result, error_code, failures, retry_at)
+       VALUES (1, ?, 'skipped', 'INSUFFICIENT_BALANCE', 1, ?)`,
+    ).run(START, START + 60);
+    assert.deepEqual(keeper.backoffList(START), []);
+
+    assert.deepEqual((await keeper.findDue(START, 1)).map((m) => m.id), [2], "the oldest-due mandate is skipped");
+    assert.deepEqual((await keeper.findDue(START + 59)).map((m) => m.id), [2]);
+    assert.deepEqual((await keeper.findDue(START + 60)).map((m) => m.id), [1, 2], "back once its wait is over");
+    assert.deepEqual((await keeper.tick(START)).map((r) => [r.mandateId, r.status]), [[2, "settled"]]);
+    db.close();
+  });
+
+  test("keepers sharing a database continue one streak", async () => {
+    const db = dueDb(1);
+    const state = { outcome: "shortfall" as Outcome };
+    const first = new Keeper(db, scriptedRpc(state), backoffConfig());
+    const second = new Keeper(db, scriptedRpc(state), backoffConfig());
+    await Promise.all([first.ready, second.ready]);
+
+    await first.tick(START);
+    await second.tick(START + 60);
+    await first.tick(START + 180);
+    assert.deepEqual(
+      attemptsOf(db).map((row) => [row.failures, row.retry_at]),
+      [[1, START + 60], [2, START + 180], [3, START + 420]],
+      "each keeper picks the streak up from the attempt log, not from its own memory",
+    );
+    db.close();
+  });
+
+  test("a top-up after a run of shortfalls settles, resets the streak, and the next failure starts over", async () => {
+    const db = dueDb(1);
+    const state = { outcome: "shortfall" as Outcome };
+    const keeper = new Keeper(db, scriptedRpc(state), backoffConfig());
+
+    let now = START;
+    for (const wait of [60, 120, 240]) {
+      await keeper.tick(now);
+      now += wait;
+    }
+    assert.equal(attemptsOf(db).at(-1)!.failures, 3);
+
+    state.outcome = "settle"; // the subscriber topped the vault up
+    assert.deepEqual((await keeper.tick(now)).map((r) => r.status), ["settled"]);
+    const settled = attemptsOf(db).at(-1)!;
+    assert.deepEqual([settled.result, settled.failures, settled.retry_at], ["settled", 0, null]);
+    assert.deepEqual(keeper.backoffList(now), []);
+
+    // The indexer advances next_charge; the next period's vault is short again.
+    db.prepare("UPDATE mandates SET next_charge = ? WHERE id = 1").run(now + 1);
+    state.outcome = "shortfall";
+    await keeper.tick(now + 1);
+    assert.deepEqual(keeper.backoffList(now + 1), [
+      { mandateId: 1, failures: 1, retryAt: now + 61, retryIn: 60 },
+    ]);
+    db.close();
+  });
+
+  test("network, congestion and sequence failures retry after the base delay without growing the streak", async () => {
+    const db = dueDb(1);
+    const state = { outcome: "shortfall" as Outcome };
+    const keeper = new Keeper(db, scriptedRpc(state), backoffConfig());
+
+    // Two shortfalls: the streak is 2 and the next wait would be 240 s.
+    await keeper.tick(START);
+    await keeper.tick(START + 60);
+    let now = START + 180;
+
+    // An RPC outage lasting many passes: the mandate keeps coming back every
+    // base delay, its streak untouched, instead of drifting hours away.
+    for (const outcome of ["network", "tryAgain", "badSeq", "network", "network", "network"] as const) {
+      state.outcome = outcome;
+      assert.equal((await keeper.tick(now))[0]!.status, "failed");
+      assert.deepEqual(keeper.backoffList(now), [{ mandateId: 1, failures: 2, retryAt: now + 60, retryIn: 60 }]);
+      now += 60;
+    }
+    assert.deepEqual(
+      attemptsOf(db).slice(2, 5).map((row) => row.error_code),
+      ["SUBMIT_FAILED", "TRY_AGAIN_LATER", "txBadSeq"],
+    );
+
+    // The vault is still short once the network is back: the streak resumes.
+    state.outcome = "shortfall";
+    await keeper.tick(now);
+    assert.deepEqual(keeper.backoffList(now), [{ mandateId: 1, failures: 3, retryAt: now + 240, retryIn: 240 }]);
+    db.close();
+  });
+
+  test("a refused keeper authorization is logged as the keeper's fault and never grows the streak", async () => {
+    const db = dueDb(1, 2);
+    const keeper = new Keeper(db, scriptedRpc({ outcome: "auth" }), backoffConfig());
+
+    const logs = await captureBackoffLogs(async () => {
+      await keeper.tick(START);
+      await keeper.tick(START + 60);
+    });
+
+    assert.deepEqual(
+      attemptsOf(db).map((row) => [row.mandate_id, row.error_code, row.failures, row.retry_at]),
+      [
+        [1, "Error(Auth, InvalidAction)", 0, START + 60],
+        [2, "Error(Auth, InvalidAction)", 0, START + 60],
+        [1, "Error(Auth, InvalidAction)", 0, START + 120],
+        [2, "Error(Auth, InvalidAction)", 0, START + 120],
+      ],
+      "every mandate retries after the base delay, none is penalised",
+    );
+    const refused = logs.filter((line) => line.fields.reason === "keeper");
+    assert.equal(refused.length, 4);
+    assert.ok(refused.every((line) => line.level === "error" && /keeper signer or authorization/.test(line.message)));
+    db.close();
+  });
+
+  test("a permanent contract refusal waits the maximum at once", async () => {
+    for (const code of [2003, 2005, 2009, 2036]) {
+      const db = dueDb(1);
+      const keeper = new Keeper(db, scriptedRpc({ outcome: `contract:${code}` }), backoffConfig());
+      await keeper.tick(START);
+      assert.deepEqual(
+        keeper.backoffList(START),
+        [{ mandateId: 1, failures: 1, retryAt: START + 21_600, retryIn: 21_600 }],
+        `Error(Contract, #${code}) is not retried before the cap`,
+      );
+      db.close();
+    }
+  });
+
+  test("a vault refusal surfaced by the simulation grows like a shortfall", async () => {
+    // 3004 InsufficientBalance and 3009 AllowanceInsufficient, from the vault.
+    for (const code of [3004, 3009]) {
+      const db = dueDb(1);
+      const keeper = new Keeper(db, scriptedRpc({ outcome: `contract:${code}` }), backoffConfig());
+      await keeper.tick(START);
+      await keeper.tick(START + 60);
+      assert.deepEqual(keeper.backoffList(START + 60), [
+        { mandateId: 1, failures: 2, retryAt: START + 180, retryIn: 120 },
+      ]);
+      db.close();
+    }
+  });
+
+  test("each backoff is logged with the mandate, streak, reason and next attempt", async () => {
+    const db = dueDb(1);
+    const state = { outcome: "shortfall" as Outcome };
+    const keeper = new Keeper(db, scriptedRpc(state), backoffConfig());
+
+    const logs = await captureBackoffLogs(async () => {
+      await keeper.tick(START);
+      state.outcome = "network";
+      await keeper.tick(START + 60);
+    });
+
+    const lines = logs.filter((line) => "retryAt" in line.fields);
+    assert.deepEqual(lines.map((line) => [line.level, line.message, line.fields]), [
+      [
+        "warn",
+        "mandate backing off after a failed charge",
+        { mandateId: 1, failures: 1, reason: "mandate", errorCode: "INSUFFICIENT_BALANCE", retryAt: START + 60, retryIn: 60 },
+      ],
+      [
+        "warn",
+        "charge failed on the network, not the mandate; retrying without growing its backoff",
+        { mandateId: 1, failures: 1, reason: "infrastructure", errorCode: "SUBMIT_FAILED", retryAt: START + 120, retryIn: 60 },
+      ],
+    ]);
+    db.close();
+  });
+
+  test("a network blip in a failing streak does not send charge.failing again", async () => {
+    const db = dueDb(1);
+    const state = { outcome: "shortfall" as Outcome };
+    const events: ChargeStreakEvent[] = [];
+    const keeper = new Keeper(db, scriptedRpc(state), backoffConfig(), async (event) => {
+      events.push(event);
+    });
+
+    let now = START;
+    for (const outcome of ["shortfall", "shortfall", "shortfall", "network", "network", "shortfall"] as const) {
+      state.outcome = outcome;
+      await keeper.tick(now);
+      now += keeper.retryIn(1, now);
+    }
+    assert.deepEqual(
+      events.map((event) => [event.kind, event.failures]),
+      [["charge.failing", 3]],
+      "the threshold is crossed once; streak 3 held through the blip is not a new crossing",
+    );
+    db.close();
+  });
+
+  test("failures are classified by who is at fault", () => {
+    const cases: [string | null, string | null, string][] = [
+      ["INSUFFICIENT_BALANCE", null, "mandate"],
+      ["Error(Contract, #3004)", "HostError: Error(Contract, #3004)", "mandate"],
+      ["Error(Contract, #3)", null, "mandate"],
+      ["CHARGE_MANY_SKIPPED", null, "mandate"],
+      ["FAILED", "FAILED", "mandate"],
+      ["SUBMIT_FAILED", "Simulation failed: InsufficientBalance", "mandate"],
+      ["Error(Contract, #2005)", null, "permanent"],
+      ["Error(Contract, #2003)", null, "permanent"],
+      ["Error(Contract, #2039)", null, "infrastructure"],
+      ["Error(Auth, InvalidAction)", null, "keeper"],
+      ["txBadAuth", null, "keeper"],
+      ["txInsufficientBalance", null, "keeper"],
+      ["SUBMIT_FAILED", "The source account [redacted] was not found", "keeper"],
+      ["TRY_AGAIN_LATER", "TRY_AGAIN_LATER", "infrastructure"],
+      ["NOT_FOUND", "NOT_FOUND", "infrastructure"],
+      ["txBadSeq", null, "infrastructure"],
+      ["SUBMIT_FAILED", "tx_bad_seq", "infrastructure"],
+      ["txInsufficientFee", null, "infrastructure"],
+      ["SUBMIT_FAILED", "connect ECONNREFUSED 127.0.0.1:8000", "infrastructure"],
+      ["SUBMIT_FAILED", "request timed out after 30000 ms", "infrastructure"],
+      ["SUBMIT_FAILED", "Request failed with status code 503", "infrastructure"],
+      [null, null, "mandate"],
+    ];
+    for (const [code, message, expected] of cases) {
+      assert.equal(classifyFailure(code, message), expected, `${String(code)} / ${String(message)}`);
+    }
+  });
+
+  test("invalid backoff settings are refused by the keeper, and a refused reload changes nothing", async () => {
+    const invalid: [Settings | Record<string, number>, RegExp][] = [
+      [{ KEEPER_BACKOFF_BASE_S: 0 }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_BASE_S: -5 }, /KEEPER_BACKOFF_BASE_S/],
+      [{ KEEPER_BACKOFF_MULTIPLIER: 0.5 }, /KEEPER_BACKOFF_MULTIPLIER/],
+      [{ KEEPER_BACKOFF_BASE_S: 600, KEEPER_BACKOFF_MAX_S: 300 }, /KEEPER_BACKOFF_MAX_S=300 is below/],
+      [{ KEEPER_BACKOFF_JITTER: 0.9 }, /KEEPER_BACKOFF_JITTER/],
+      [{ KEEPER_BACKOFF_MAX_S: 2 * 86_400, CHARGE_ATTEMPT_RETENTION_DAYS: 1 }, /outlasts/],
+    ];
+    const db = dueDb(1);
+    for (const [settings, message] of invalid) {
+      assert.throws(
+        () => new Keeper(db, scriptedRpc({ outcome: "settle" }), { ...backoffConfig(), ...settings } as Config),
+        message,
+      );
+    }
+
+    const keeper = new Keeper(db, scriptedRpc({ outcome: "shortfall" }), backoffConfig({ KEEPER_BACKOFF_BASE_S: 45 }));
+    assert.throws(() => keeper.reloadFromConfig(backoffConfig({ KEEPER_BACKOFF_MULTIPLIER: 0 })), /MULTIPLIER/);
+    await keeper.tick(START);
+    assert.equal(keeper.retryIn(1, START), 45, "the running keeper kept its settings");
+
+    keeper.reloadFromConfig(backoffConfig({ KEEPER_BACKOFF_BASE_S: 45, KEEPER_BACKOFF_MULTIPLIER: 4 }));
+    await keeper.tick(START + 45);
+    assert.equal(keeper.retryIn(1, START + 45), 180, "a valid reload applies to the next failure");
     db.close();
   });
 });

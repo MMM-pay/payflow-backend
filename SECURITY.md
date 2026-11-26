@@ -50,6 +50,13 @@ and impact. Acknowledgement within 72 hours.
   repeated query parameters, malformed path/body values, and invalid JSON with
   `400 invalid_request` before invoking downstream handlers. Validation errors
   use the shared error envelope and do not echo request bodies or secrets.
+- **SEP-10 JWTs are short-lived** (`SEP10_JWT_TTL_S`, an hour by default), so a
+  leaked JWT's blast radius is small. `POST /api/auth` issues a JWT together
+  with a single-use refresh token; `POST /api/auth/rotate` exchanges a refresh
+  token for a new JWT and the next refresh token, revoking the consumed one. A
+  stolen refresh token can therefore be used only once. Refresh tokens live
+  `SEP10_REFRESH_TTL_S` (seven days by default) and their hashes—not
+  plaintexts—are stored.
 - **Merchant notification preferences are account-scoped.** Reads and writes
   require a fresh signature from the merchant's Stellar key or a SEP-10 JWT
   issued to that same account. The update only accepts the supported webhook
@@ -64,6 +71,17 @@ and impact. Acknowledgement within 72 hours.
   non-public targets. DNS is checked again for each attempt and requests are
   pinned to the checked addresses; redirects are not followed. Update any
   existing webhook whose DNS points to an internal address.
+- **Production serves HTTPS only.** With `NODE_ENV=production` (set by the
+  Docker image) or `REQUIRE_HTTPS=true`, a request that did not arrive over
+  TLS is rejected with `403 forbidden` instead of redirected, since anything it
+  carried has already crossed the wire in clear. The scheme comes from
+  `X-Forwarded-Proto` set by the single trusted proxy hop, so the service must
+  sit behind a TLS-terminating proxy (Fly, Render, a load balancer).
+  `/health`, `/ready` and `/metrics` stay reachable over plaintext for
+  platform probes. Every response carries
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+  (`HSTS_MAX_AGE_S` tunes it). Set `REQUIRE_HTTPS=false` only for a deployment
+  that terminates TLS without forwarding the scheme.
 - **HTTP request framing is strict.** A request carrying both `Content-Length`
   and `Transfer-Encoding`, duplicate or malformed framing headers, a transfer
   coding other than `chunked`, or a connection upgrade
@@ -71,4 +89,43 @@ and impact. Acknowledgement within 72 hours.
   the connection is closed. Clients must send a single, unambiguous framing.
   This is defense in depth against HTTP request smuggling; keep-alive reuse of a
   connection after such a rejection is not allowed.
+- **CORS is an exact-origin allowlist.** `CORS_ORIGIN` lists the browser
+  origins allowed to call the API, comma-separated and exactly as the browser
+  sends them (`https://app.example`, `http://localhost:3000`). The default is
+  empty: a deployment that has not listed its frontend gets no
+  `Access-Control-Allow-Origin` and browsers refuse the cross-origin read.
+  Set `CORS_ORIGIN=*` only for a deliberately public API. Entries are
+  validated at startup: a path, query, credentials, a wildcard host or a
+  `*` beside a list fails the boot rather than silently matching nothing.
+  SEP-10 (`/api/auth`) always answers `*`, as that specification requires.
+- **Security headers are set on every response.** `helmet` sets a strict CSP
+  (`default-src 'self'`, `script-src 'self'` with no `unsafe-inline` or
+  `unsafe-eval`, `frame-ancestors 'none'`, `object-src 'none'`),
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`, HSTS and the cross-origin isolation headers.
+  `/api/docs` widens only `worker-src` to `'self' blob:` for ReDoc's worker;
+  the bundle is served by this process, never a CDN. Framing the API or its
+  documentation is refused by both the header and the CSP, including on error
+  responses.
+- **Duplicate event delivery is collapsed.** An event already present in the
+  raw `events` table is not applied or counted again, so an overlapping RPC
+  window, a replayed ledger range or a rewound cursor cannot inflate the
+  projection's counters, the `payflow_events_applied_total` metric, or the
+  number of webhook deliveries. A webhook receives at most one delivery per
+  `(webhook, event)` pair; a repeated event carries the same
+  `Idempotency-Key`, so a receiver can drop a repeat it has already
+  processed.
+- **Logs never carry a full subscriber or merchant account, or a client IP.**
+  Every line at `info` and above, access lines included, shortens Stellar
+  accounts (`G...`, muxed `M...`) to their first and last four characters
+  (`GABC...WXYZ`) wherever they appear: the request path and query, `Referer`,
+  and the keeper, reconciler and webhook lines. Client IPs (the socket address
+  and `X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`, `True-Client-IP`) are
+  cut to their /24 (IPv4) or /48 (IPv6); `Forwarded`, `Cookie` and
+  `Set-Cookie` are redacted. Webhook failure lines name the endpoint's host,
+  not its full URL. Contract ids, transaction hashes and the keeper's own
+  channel keys are logged as before. **Operator change:** a log search or
+  alert that matched a full account or client IP must instead match the
+  masked form, or correlate by `mandateId`, `webhookId` or the request's
+  `X-Request-Id` and look the account up in the database.
 
