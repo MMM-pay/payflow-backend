@@ -323,12 +323,58 @@ export interface KeeperPassSummary {
     mandateId: number;
     /** The amount the charge needs. */
     required: string;
-    /** The balance the vault holds. */
-    balance: string;
-    /** What is missing. */
-    shortfall: string;
+    /** The balance the vault holds; absent when a charge simulation proved the shortfall. */
+    balance?: string;
+    /** What is missing; absent when a charge simulation proved the shortfall. */
+    shortfall?: string;
+    /** Where the shortfall is known from: the vault view or a charge simulation. */
+    reason?: "balance" | "simulation";
+    /** The simulation's refusal, for a `simulation` skip. */
+    error?: string;
   }[];
   backoff: { mandateId: number; failures: number; retryAt: number; retryIn: number }[];
+}
+
+/** What a due charge would do if the keeper submitted it. */
+export type KeeperDryRunOutcome =
+  /** The simulation accepted the charge. */
+  | "ready"
+  /** The vault cannot cover it: it would be skipped, not submitted. */
+  | "insufficient_balance"
+  /** The simulation refused the charge for some other reason. */
+  | "would_fail"
+  /** The RPC cannot simulate, so the report cannot say; a real pass would try. */
+  | "unverified";
+
+/** One due mandate in a keeper dry-run report (#250). */
+export interface KeeperDryRunRow {
+  mandateId: number;
+  subscriber: string;
+  merchant: string;
+  planId: number;
+  /** The intended charge, in the token's smallest unit. */
+  amount: string;
+  /** When the charge fell due, in unix seconds. */
+  nextCharge: number;
+  /** The vault balance the check read; null when it could not be read. */
+  balance: string | null;
+  /** What the balance is missing when it cannot cover the charge; otherwise null. */
+  shortfall: string | null;
+  outcome: KeeperDryRunOutcome;
+  /** The simulation's refusal, for `insufficient_balance` and `would_fail`. */
+  error?: string;
+}
+
+/** What a keeper dry run would charge right now, without submitting anything (#250). */
+export interface KeeperDryRunReport {
+  /** Unix seconds the report was built for. */
+  now: number;
+  /** The due mandates the pass would consider, in its own order. */
+  due: KeeperDryRunRow[];
+  /** How many the pass would attempt to charge. */
+  chargeable: number;
+  /** How many it would skip before submitting. */
+  skipped: number;
 }
 
 export interface KeeperHistoryResponse {

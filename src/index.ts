@@ -293,6 +293,7 @@ if (keeper && runKeeperPass) {
     passes: keeper.passHistory(),
     lastSuccessfulRunAt: keeper.lastSuccessfulRunAt,
   });
+  adminHooks.keeperDryRun = () => keeper.dryRun();
 }
 
 let http: Server | undefined;

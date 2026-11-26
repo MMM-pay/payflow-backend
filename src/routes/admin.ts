@@ -18,6 +18,8 @@ export interface AdminHooks {
   keeperPass?: () => Promise<unknown>;
   keeperBackoff?: () => unknown;
   keeperHistory?: () => unknown;
+  /** List the due mandates and intended charges without submitting (#250). */
+  keeperDryRun?: () => Promise<unknown>;
   pauseIndexer?: () => unknown;
   resumeIndexer?: () => unknown;
   pruneData?: (daysToKeep?: number) => Promise<unknown>;
@@ -169,6 +171,25 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
       return;
     }
     await respond(req, res, "keeper_pass_failed", run);
+  });
+
+  r.get("/keeper/dry-run", queryOnly(), async (req, res) => {
+    const reqWithToken = req as Request & { adminToken?: AdminToken };
+    if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "keeper")) {
+      sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
+      return;
+    }
+    const run = hooks.keeperDryRun;
+    if (!run) {
+      sendApiError(res, req, 503, "keeper_unavailable", undefined, undefined, 30);
+      return;
+    }
+    try {
+      res.json({ status: "ok", dry_run: (await run()) ?? null });
+    } catch (err) {
+      logger.error({ err }, "keeper dry run failed");
+      sendApiError(res, req, 500, "keeper_pass_failed", err instanceof Error ? err.message : String(err));
+    }
   });
 
   r.get("/keeper/backoff", queryOnly(), (req, res) => {

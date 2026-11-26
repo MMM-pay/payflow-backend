@@ -26,7 +26,7 @@ import type { Storage } from "./lib/store/types.ts";
 import { planTokensByIds } from "./lib/queries.ts";
 import type { KeeperRpc } from "./lib/stellar.ts";
 import type { ChargeStreakEvent } from "./lib/webhooks.ts";
-import type { KeeperPassSummary } from "./routes/types.ts";
+import type { KeeperDryRunReport, KeeperPassSummary } from "./routes/types.ts";
 
 export interface DueMandate {
   id: number;
@@ -102,6 +102,19 @@ function resultCode(errorResult: unknown): string | undefined {
 function hostErrorCode(message: string): string | undefined {
   const match = /Error\((\w+), ?(#\d+|\w+)\)/.exec(message);
   return match ? `Error(${match[1]}, ${match[2]})` : undefined;
+}
+
+/**
+ * Whether a refused simulation means the vault cannot pay the charge: the
+ * vault's `InsufficientBalance` (#3004) or `AllowanceInsufficient` (#3009),
+ * or a host message naming either. Such a mandate is skipped without being
+ * submitted, so no fee is spent on a charge already known to fail (#251).
+ */
+function isVaultShortfall(error: string | undefined): boolean {
+  if (!error) return false;
+  const code = hostErrorCode(error);
+  if (code === "Error(Contract, #3004)" || code === "Error(Contract, #3009)") return true;
+  return /insufficient ?balance|allowance ?insufficient|insufficient ?allowance/i.test(error);
 }
 
 /**
@@ -311,10 +324,19 @@ export interface SkippedMandate {
   mandateId: number;
   /** The amount the charge needs. */
   required: string;
-  /** The balance the vault holds. */
-  balance: string;
-  /** What is missing. */
-  shortfall: string;
+  /** The balance the vault holds; absent when a simulation proved the shortfall. */
+  balance?: string;
+  /** What is missing; absent when a simulation proved the shortfall. */
+  shortfall?: string;
+  /**
+   * Where the shortfall is known from: `balance` is the vault view, the
+   * default and the only reason before #251; `simulation` is a read-only
+   * `charge` simulation, which also catches a short allowance. Absent for a
+   * balance shortfall so existing pass history keeps its shape.
+   */
+  reason?: "balance" | "simulation";
+  /** The simulation's refusal, for a `simulation` skip. */
+  error?: string;
 }
 
 /**
@@ -745,6 +767,72 @@ export class Keeper {
     return this.queryDue(now, limit);
   }
 
+  /**
+   * List what a settlement pass would charge right now without charging it
+   * (#250): the due mandates, the amount each would pull from its vault, the
+   * balance read, and the simulation's verdict. Every charge is built and
+   * simulated read-only — never signed or submitted — so an operator can
+   * rehearse a first run on a new deployment and see the intended charges as
+   * a list instead of reading them out of the pass log.
+   *
+   * Nothing is written: no claim, no `charge_attempts` row, no backoff, no
+   * pass history, no metrics. That also makes it safe to call repeatedly
+   * while a real keeper shares the same database.
+   */
+  async dryRun(
+    now: number = Math.floor(Date.now() / 1000),
+    limit = BATCH,
+  ): Promise<KeeperDryRunReport> {
+    await this.ready;
+    const due = await this.queryDue(now, limit);
+    const { chargeable, skipped, balances } = await this.withoutShortfalls(due);
+    const shortById = new Map(skipped.map((skip) => [skip.mandateId, skip]));
+    const chargeableIds = new Set(chargeable.map((mandate) => mandate.id));
+    const rows: KeeperDryRunReport["due"] = [];
+    for (const mandate of due) {
+      // A mandate neither chargeable nor skipped lost its plan or was claimed
+      // by another pass between the two reads; it is not this report's to
+      // guess at.
+      const short = shortById.get(mandate.id);
+      if (!short && !chargeableIds.has(mandate.id)) continue;
+      const base = {
+        mandateId: mandate.id,
+        subscriber: mandate.subscriber,
+        merchant: mandate.merchant,
+        planId: mandate.plan_id,
+        amount: mandate.amount,
+        nextCharge: mandate.next_charge,
+        balance: short ? (short.balance ?? null) : (balances.get(mandate.id) ?? null),
+        shortfall: short?.shortfall ?? null,
+      };
+      if (short) {
+        rows.push({
+          ...base,
+          outcome: "insufficient_balance",
+          ...(short.error === undefined ? {} : { error: short.error }),
+        });
+        continue;
+      }
+      const simulation = await this.simulateCharge(mandate.id);
+      const outcome: KeeperDryRunReport["due"][number]["outcome"] =
+        typeof this.server.simulateTransaction !== "function"
+          ? "unverified"
+          : simulation.ok
+            ? "ready"
+            : "would_fail";
+      rows.push({
+        ...base,
+        outcome,
+        ...(simulation.error === undefined ? {} : { error: simulation.error }),
+      });
+    }
+    logger.info(
+      { mandates: rows.length, chargeable: chargeable.length, skipped: skipped.length },
+      "keeper dry run: report built; nothing was submitted",
+    );
+    return { now, due: rows, chargeable: chargeable.length, skipped: skipped.length };
+  }
+
   private async queryDue(now: number, limit: number): Promise<DueMandate[]> {
     if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
     return this.queryDueByOldest(now, limit);
@@ -904,9 +992,10 @@ export class Keeper {
           byId.get(skip.mandateId)!,
           {
             result: "skipped",
-            errorCode: "INSUFFICIENT_BALANCE",
+            errorCode:
+              skip.reason === "simulation" ? "SIMULATION_SHORTFALL" : "INSUFFICIENT_BALANCE",
             txHash: null,
-            shortfall: skip.shortfall,
+            shortfall: skip.shortfall ?? null,
             failure: "mandate",
           },
           now,
@@ -1044,17 +1133,22 @@ export class Keeper {
   private async withoutShortfalls(due: DueMandate[]): Promise<{
     chargeable: DueMandate[];
     skipped: SkippedMandate[];
+    /** The vault balance read for each mandate, when one was available. */
+    balances: Map<number, string>;
   }> {
     const chargeable: DueMandate[] = [];
     const skipped: SkippedMandate[] = [];
-    if (due.length === 0) return { chargeable, skipped };
+    const balances = new Map<number, string>();
+    if (due.length === 0) return { chargeable, skipped, balances };
 
     // A mandate carries no token of its own; it inherits its plan's, and the
     // vault balance is per (subscriber, token).
     const tokens = await planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
     // One read per subscriber and token per pass: a subscriber with several
     // mandates on the same plan is one balance, not one read each.
-    const balances = new Map<string, bigint | null>();
+    const vaultBalances = new Map<string, bigint | null>();
+    /** Mandates the vault view could not answer for; a charge simulation decides. */
+    const unverified: DueMandate[] = [];
 
     for (const mandate of due) {
       const token = tokens.get(mandate.plan_id);
@@ -1063,15 +1157,16 @@ export class Keeper {
         continue;
       }
       const key = `${mandate.subscriber}|${token}`;
-      let balance = balances.get(key);
+      let balance = vaultBalances.get(key);
       if (balance === undefined) {
         balance = await this.vaultBalance(mandate.subscriber, token);
-        balances.set(key, balance);
+        vaultBalances.set(key, balance);
       }
       if (balance === null) {
-        chargeable.push(mandate);
+        unverified.push(mandate);
         continue;
       }
+      balances.set(mandate.id, balance.toString());
       const required = BigInt(mandate.amount);
       if (balance >= required) {
         chargeable.push(mandate);
@@ -1085,18 +1180,42 @@ export class Keeper {
       });
     }
 
+    // #251: when `vault.balance` has no answer, simulate the charge itself.
+    // A refusal for the vault's own InsufficientBalance or
+    // AllowanceInsufficient is a mandate known short: skip it before any fee
+    // is spent rather than let the submission decide. Any other refusal (a
+    // transient RPC failure, a missing account) says nothing about the vault,
+    // so the charge is left to decide as before.
+    for (const mandate of unverified) {
+      const simulation = await this.simulateCharge(mandate.id);
+      if (simulation.ok || !isVaultShortfall(simulation.error)) {
+        chargeable.push(mandate);
+        continue;
+      }
+      skipped.push({
+        mandateId: mandate.id,
+        required: mandate.amount,
+        reason: "simulation",
+        ...(simulation.error === undefined ? {} : { error: simulation.error }),
+      });
+    }
+
     for (const skip of skipped) {
       logger.warn(
         {
           mandateId: skip.mandateId,
           required: skip.required,
-          balance: skip.balance,
-          shortfall: skip.shortfall,
+          ...(skip.balance === undefined ? {} : { balance: skip.balance }),
+          ...(skip.shortfall === undefined ? {} : { shortfall: skip.shortfall }),
+          ...(skip.reason === undefined ? {} : { reason: skip.reason }),
+          ...(skip.error === undefined ? {} : { error: skip.error }),
         },
-        "keeper skipped a mandate the vault cannot cover",
+        skip.reason === "simulation"
+          ? "keeper skipped a mandate the charge simulation proved short"
+          : "keeper skipped a mandate the vault cannot cover",
       );
     }
-    return { chargeable, skipped };
+    return { chargeable, skipped, balances };
   }
 
   /**
@@ -1147,6 +1266,40 @@ export class Keeper {
         "vault balance unavailable; settling as before",
       );
       return null;
+    }
+  }
+
+  /**
+   * Simulate one `charge` read-only, without the keeper's account and without
+   * signing or submitting anything; a simulation needs neither funds nor a
+   * signature. Answers `ok: true` when the charge would go through *or* when
+   * the RPC cannot say (no simulation support, a transport failure) — only a
+   * definite refusal is `ok: false`, so an outage never makes the keeper skip
+   * a mandate it could have charged.
+   */
+  private async simulateCharge(mandateId: number): Promise<{ ok: boolean; error?: string }> {
+    if (typeof this.server.simulateTransaction !== "function") return { ok: true };
+    try {
+      const tx = new TransactionBuilder(
+        simulationSource(`keeper-charge:${mandateId}`),
+        { fee: "100", networkPassphrase: this.config.NETWORK_PASSPHRASE },
+      )
+        .addOperation(
+          new Contract(this.config.SUBSCRIPTION_ID).call(
+            "charge",
+            nativeToScVal(mandateId, { type: "u64" }),
+          ),
+        )
+        .setTimeout(0)
+        .build();
+      const res = await this.server.simulateTransaction(tx);
+      if ("error" in res && res.error) {
+        return { ok: false, error: this.scrubError(String(res.error)) };
+      }
+      return { ok: true };
+    } catch (err) {
+      const error = this.scrubError(err instanceof Error ? err.message : String(err));
+      return isVaultShortfall(error) ? { ok: false, error } : { ok: true };
     }
   }
 

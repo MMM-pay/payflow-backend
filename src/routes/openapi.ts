@@ -1774,6 +1774,76 @@ function servicePaths(): Record<string, PathItemObject> {
         },
       },
     },
+    "/admin/keeper/dry-run": {
+      get: {
+        tags: ["admin"],
+        summary: "List what the keeper would charge, without charging it",
+        description:
+          "Builds and simulates every due charge read-only and returns the intended charges as a list. Nothing is signed, submitted or recorded: no claim, no charge attempt, no backoff. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "getKeeperDryRun",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "The dry-run report.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    dry_run: {
+                      type: ["object", "null"],
+                      properties: {
+                        now: { type: "integer", description: "Unix seconds the report was built for." },
+                        chargeable: { type: "integer", description: "How many the pass would attempt to charge." },
+                        skipped: { type: "integer", description: "How many it would skip before submitting." },
+                        due: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              mandateId: { type: "integer" },
+                              subscriber: { type: "string" },
+                              merchant: { type: "string" },
+                              planId: { type: "integer" },
+                              amount: amount(),
+                              nextCharge: { type: "integer", description: "Unix seconds." },
+                              balance: {
+                                ...amount(),
+                                type: ["string", "null"],
+                                description:
+                                  "Vault balance read, in the token's smallest unit; null when unreadable.",
+                              },
+                              shortfall: {
+                                ...amount(),
+                                type: ["string", "null"],
+                                description: "What the balance is missing, if short.",
+                              },
+                              outcome: {
+                                type: "string",
+                                enum: ["ready", "insufficient_balance", "would_fail", "unverified"],
+                              },
+                              error: { type: "string", description: "The simulation's refusal, when there is one." },
+                            },
+                            required: ["mandateId", "subscriber", "merchant", "planId", "amount", "nextCharge", "balance", "shortfall", "outcome"],
+                          },
+                        },
+                      },
+                      required: ["now", "due", "chargeable", "skipped"],
+                    },
+                  },
+                  required: ["status", "dry_run"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "403": errorResponse("The token is scoped to another operation."),
+          "503": transient503("The keeper is not enabled."),
+          "500": errorResponse("The simulation failed unexpectedly; the message is kept for the operator."),
+        },
+      },
+    },
     "/admin/indexer/pause": {
       post: {
         tags: ["admin"],

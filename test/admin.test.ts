@@ -178,6 +178,24 @@ describe("admin routes", () => {
     }
   });
 
+  test("report what the keeper would charge without submitting", async () => {
+    const app = await startApp(testConfig(TOKEN), {
+      reindex: async () => ({}),
+      keeperDryRun: async () => ({ now: 1, due: [], chargeable: 0, skipped: 0 }),
+    });
+    try {
+      const { status, body } = await call(app.base, "GET", "/admin/keeper/dry-run", TOKEN);
+      assert.equal(status, 200);
+      assert.equal(body.status, "ok");
+      assert.deepEqual(body.dry_run, { now: 1, due: [], chargeable: 0, skipped: 0 });
+
+      const unauthorized = await call(app.base, "GET", "/admin/keeper/dry-run");
+      assert.equal(unauthorized.status, 401, "the report is operator-only");
+    } finally {
+      app.stop();
+    }
+  });
+
   test("say the keeper is unavailable when it is not running", async () => {
     const app = await startApp(testConfig(TOKEN), { reindex: async () => ({}) });
     try {
@@ -188,6 +206,10 @@ describe("admin routes", () => {
       const backoff = await call(app.base, "GET", "/admin/keeper/backoff", TOKEN);
       assert.equal(backoff.status, 503);
       assert.equal((backoff.body.error as { code: string }).code, "keeper_unavailable");
+
+      const dryRun = await call(app.base, "GET", "/admin/keeper/dry-run", TOKEN);
+      assert.equal(dryRun.status, 503);
+      assert.equal((dryRun.body.error as { code: string }).code, "keeper_unavailable");
     } finally {
       app.stop();
     }
