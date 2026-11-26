@@ -1,5 +1,6 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { openDatabase } from "../db.ts";
+import { SQLITE_QUERIES } from "./sqlite.queries.ts";
 import type { SqlParameters, Storage } from "./types.ts";
 
 function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
@@ -92,12 +93,12 @@ export class SqliteStorage implements Storage {
     });
     await previous;
     try {
-      this.database.exec("BEGIN");
+      this.database.exec(SQLITE_QUERIES.beginTransaction);
       const result = await work(new SqliteTransaction(this.database));
-      this.database.exec("COMMIT");
+      this.database.exec(SQLITE_QUERIES.commitTransaction);
       return result;
     } catch (err) {
-      this.database.exec("ROLLBACK");
+      this.database.exec(SQLITE_QUERIES.rollbackTransaction);
       throw err;
     } finally {
       release();
