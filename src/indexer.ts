@@ -514,15 +514,17 @@ export class Indexer {
   }
 
   /**
-   * Fetch every page of one ledger window. Cursor pages cannot carry
-   * `endLedger`, so events at or past `end` are dropped here; a short page does
-   * not prove the range is exhausted, only an empty page or the range end does.
+   * Fetch every page of one ledger window from RPC and return all events.
+   * Cursor pages cannot carry `endLedger`, so events at or past `end` are
+   * dropped here; a short page does not prove the range is exhausted, only an
+   * empty page or the range end does.
    */
   private async fetchWindow(
     start: number,
     end: number,
     filters: rpc.Api.EventFilter[],
-  ): Promise<void> {
+  ): Promise<rpc.Api.EventResponse[]> {
+    const collected: rpc.Api.EventResponse[] = [];
     let page = await this.server.getEvents({
       startLedger: start,
       endLedger: end,
@@ -532,88 +534,17 @@ export class Indexer {
 
     for (;;) {
       let pastEnd = false;
-      const rawEvents = page.events ?? [];
-      await this.db.transaction(async (storage) => {
-        for (const raw of rawEvents) {
-          if (raw.ledger >= end) {
-            pastEnd = true;
-            break;
-          }
-          await this.retain(raw, storage);
+      for (const raw of page.events ?? []) {
+        if (raw.ledger >= end) {
+          pastEnd = true;
+          break;
         }
-      });
-      if (pastEnd || rawEvents.length === 0 || !page.cursor) break;
+        collected.push(raw);
+      }
+      if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
       page = await this.server.getEvents({ cursor: page.cursor, filters, limit: PAGE_LIMIT });
     }
-  }
-
-  /** Apply staged raw events in bounded pages, advancing only after the window completes. */
-  private async applyWindow(start: number, end: number): Promise<{
-    applied: number;
-    mismatched: number;
-    lastSeenCloseTime: number | null;
-  }> {
-    let applied = 0;
-    let mismatched = 0;
-    let lastSeenCloseTime: number | null = null;
-    let lastLedger = start - 1;
-    let lastEventId = "";
-
-    for (;;) {
-      const page = await this.db.transaction(async (storage) => {
-        const rows = await storage.all<{
-          event_id: string;
-          contract_id: string;
-          ledger: number;
-          tx_hash: string;
-          topics: string;
-          data: string;
-          close_time: number | null;
-        }>(
-          `SELECT event_id, contract_id, ledger, tx_hash, topics, data, close_time
-           FROM events
-           WHERE ledger >= ? AND ledger < ?
-             AND (ledger > ? OR (ledger = ? AND event_id > ?))
-           ORDER BY ledger, event_id LIMIT ?`,
-          [start, end, lastLedger, lastLedger, lastEventId, PAGE_LIMIT],
-        );
-        const notifications: DecodedEvent[] = [];
-        let pageApplied = 0;
-        let pageMismatched = 0;
-        for (const row of rows) {
-          lastLedger = row.ledger;
-          lastEventId = row.event_id;
-          const raw = {
-            contractId: row.contract_id,
-            ledger: row.ledger,
-            txHash: row.tx_hash,
-            topic: (JSON.parse(row.topics) as string[]).map((topic) => xdr.ScVal.fromXDR(topic, "base64")),
-            value: xdr.ScVal.fromXDR(row.data, "base64"),
-            ledgerClosedAt: row.close_time === null
-              ? undefined
-              : new Date(row.close_time * 1000).toISOString(),
-          } as unknown as rpc.Api.EventResponse;
-          if (row.close_time !== null) lastSeenCloseTime = row.close_time;
-          const decoded = decodeEvent(raw);
-          if (!decoded) continue;
-          if ((await this.apply(decoded, storage, notifications)) !== "mismatched") pageApplied += 1;
-          else pageMismatched += 1;
-        }
-        return { count: rows.length, applied: pageApplied, mismatched: pageMismatched, notifications };
-      });
-
-      applied += page.applied;
-      mismatched += page.mismatched;
-      for (const notification of page.notifications) this.events.emit("applied", notification);
-      if (page.count < PAGE_LIMIT) break;
-    }
-
-    await this.db.run(
-      `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
-       ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
-      [end],
-    );
-    return { applied, mismatched, lastSeenCloseTime };
+    return collected;
   }
 
   /**
@@ -729,11 +660,40 @@ export class Indexer {
         failure = result.reason;
         break;
       }
+      const rpcEvents = result.value;
       const nextCursor = windows[i]!.end;
-      const windowResult = await this.applyWindow(windows[i]!.start, nextCursor);
+
+      const windowResult = await this.db.transaction(async (storage) => {
+        let wApplied = 0;
+        let wMismatched = 0;
+        let wLastSeenCloseTime: number | null = null;
+        const notifications: DecodedEvent[] = [];
+
+        for (const ledgerEvents of groupByLedger(rpcEvents)) {
+          const firstDeliveries = await this.retainAll(ledgerEvents, storage);
+          for (const raw of ledgerEvents) {
+            if (!firstDeliveries.has(eventIdOf(raw))) continue;
+            const closeTime = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
+            if (closeTime !== null) wLastSeenCloseTime = closeTime;
+            const decoded = decodeEvent(raw);
+            if (!decoded) continue;
+            if ((await this.apply(decoded, storage, notifications)) !== "mismatched") wApplied += 1;
+            else wMismatched += 1;
+          }
+        }
+
+        await storage.run(
+          `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
+          [nextCursor],
+        );
+        return { applied: wApplied, mismatched: wMismatched, lastSeenCloseTime: wLastSeenCloseTime, notifications };
+      });
+
       applied += windowResult.applied;
       mismatched += windowResult.mismatched;
       if (windowResult.lastSeenCloseTime !== null) lastSeenCloseTime = windowResult.lastSeenCloseTime;
+      for (const n of windowResult.notifications) this.events.emit("applied", n);
       cursor = nextCursor;
     }
 

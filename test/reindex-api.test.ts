@@ -179,6 +179,7 @@ function projectionSnapshot(db: ReturnType<typeof openDatabase>): Record<string,
     "merchant_profiles",
   ];
   return Object.fromEntries(tables.map((table) => {
+    // eslint-disable-next-line no-restricted-syntax -- table is a vetted static name from the closed list above
     const rows = db.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
     rows.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
     return [table, rows];

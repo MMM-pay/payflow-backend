@@ -19,7 +19,7 @@ import { testAddress } from "./addresses.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
-const UNKNOWN_ADDRESS = testAddress(42);
+const _UNKNOWN_ADDRESS = testAddress(42);
 
 const testnet: NetworkConfig = {
   name: "testnet",
@@ -435,7 +435,7 @@ describe("contract: error shape conformance", () => {
     // The rate-limit endpoint on the admin path returns 503 without an admin
     // token only when ADMIN_TOKEN is set, so we use an artificial 404 that
     // returns the Error envelope through sendApiError.
-    const spec = await getSpec();
+    const _spec = await getSpec();
     const res = await fetch(`${base}/no-such-route-definitely-404`);
     // Express returns its own body for unmatched routes; we just verify
     // that documented error codes are strings when it is our envelope.
