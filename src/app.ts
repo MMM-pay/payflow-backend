@@ -506,7 +506,12 @@ export function createApp(
       if (res.statusCode >= 500) {
         metrics.increment("http_errors");
       }
-      const route = (_req.route as { path?: string } | undefined)?.path ?? "unknown";
+      const rawRoutePath = (_req.route as { path?: unknown } | undefined)?.path;
+      const route = typeof rawRoutePath === "string"
+        ? rawRoutePath
+        : Array.isArray(rawRoutePath)
+        ? String(rawRoutePath[0] ?? "unknown")
+        : "unknown";
       metrics.observe("http_request_duration_seconds", (performance.now() - start) / 1000, {
         method: _req.method,
         route,

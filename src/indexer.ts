@@ -730,42 +730,11 @@ export class Indexer {
         break;
       }
       const nextCursor = windows[i]!.end;
-      // Every write for this batch — the raw events, every projection row and
-      // the cursor — lands in one transaction, so the pass pays one commit and
-      // a failure anywhere rolls the whole batch back (#247). Ledger by ledger
-      // inside it, so a ledger's rows are written together and its raw events
-      // are retained in one statement instead of one round trip each.
-      const windowResult = await this.db.transaction(async (storage) => {
-        let windowApplied = 0;
-        let windowMismatched = 0;
-        const notifications: DecodedEvent[] = [];
-        for (const ledgerEvents of groupByLedger(result.value)) {
-          const firstDeliveries = await this.retainAll(ledgerEvents, storage);
-          for (const raw of ledgerEvents) {
-            const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
-            if (ct !== null) lastSeenCloseTime = ct;
-            const decoded = decodeEvent(raw);
-            if (!decoded) continue;
-            // The event was already retained — and projected, in the transaction
-            // that stored it — so this is a redelivery from an overlapping
-            // window or a rewound cursor. Applying it again would inflate the
-            // applied metric and could notify a webhook twice, so it is dropped.
-            if (!firstDeliveries.has(eventIdOf(raw))) continue;
-            if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
-            else windowMismatched += 1;
-          }
-        }
-        await storage.run(
-          `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
-           ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
-          [nextCursor],
-        );
-        return { applied: windowApplied, mismatched: windowMismatched, notifications };
-      });
+      const windowResult = await this.applyWindow(windows[i]!.start, nextCursor);
       applied += windowResult.applied;
       mismatched += windowResult.mismatched;
+      if (windowResult.lastSeenCloseTime !== null) lastSeenCloseTime = windowResult.lastSeenCloseTime;
       cursor = nextCursor;
-      for (const notification of windowResult.notifications) this.events.emit("applied", notification);
     }
 
     this.status.cursor = cursor;

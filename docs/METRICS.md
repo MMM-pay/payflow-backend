@@ -155,6 +155,86 @@ labels).
 
 ---
 
+### `payflow_keeper_backoffs_total` · counter
+
+Charges the keeper scheduled a retry for since the process started. Labelled by
+`reason`:
+
+| `reason` | Meaning |
+|---|---|
+| `mandate` | The mandate's own backoff schedule is to blame (e.g. insufficient balance). |
+| `permanent` | The charge cannot be retried (e.g. the mandate was cancelled). |
+| `keeper` | A transient keeper-side error (e.g. RPC outage); the mandate's backoff is not extended. |
+| `infrastructure` | An unrecoverable infrastructure error; the mandate's backoff is not extended. |
+
+**Suggested alert:**
+```
+rate(payflow_keeper_backoffs_total{reason="permanent"}[1h]) > 0
+```
+Any permanent failure warrants investigation.
+
+---
+
+### `payflow_keeper_in_flight` · gauge
+
+Settlement transactions the keeper currently has in flight. Never exceeds
+`KEEPER_CONCURRENCY`. No labels.
+
+**Suggested alert:** Stuck near `KEEPER_CONCURRENCY` for more than a few minutes
+may indicate the RPC node is hanging on submission.
+
+---
+
+### `payflow_keeper_low_fee_balance_total` · counter
+
+Times a keeper signing account XLM balance was observed below the configured
+minimum threshold (`KEEPER_MIN_FEE_BALANCE`). Labelled by `channel` (the
+signing account's public key).
+
+**Suggested alert:**
+```
+increase(payflow_keeper_low_fee_balance_total[5m]) > 0
+```
+Any observation means the keeper may start failing to submit transactions.
+
+---
+
+### `payflow_http_request_duration_seconds` · histogram
+
+HTTP request latency in seconds. Labelled by `method` (HTTP verb), `route`
+(path pattern, e.g. `/api/plans/:id`), and `status_class` (`2xx`, `4xx`,
+`5xx`).
+
+Buckets: 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 2.5 s, 5 s,
+10 s.
+
+**Suggested alert:**
+```
+histogram_quantile(0.99,
+  rate(payflow_http_request_duration_seconds_bucket[5m])
+) > 2
+```
+99th-percentile latency above 2 s suggests a slow query or an overloaded DB.
+
+---
+
+### `payflow_db_query_duration_seconds` · histogram
+
+Database query latency in seconds. Labelled by `operation` (`all`, `get`, `run`)
+and `dialect` (`sqlite` or `postgres`).
+
+Buckets: 1 ms, 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 2.5 s.
+
+**Suggested alert:**
+```
+histogram_quantile(0.95,
+  rate(payflow_db_query_duration_seconds_bucket{operation="run"}[5m])
+) > 0.5
+```
+Write latency above 500 ms indicates DB contention or a slow disk.
+
+---
+
 ## Cardinality guarantee
 
 The registry enforces a per-metric cap (`maxSeries`, default 1 000 distinct
@@ -167,6 +247,8 @@ Metrics with tighter caps are:
 | Metric | `maxSeries` |
 |---|---|
 | `payflow_build_info` | 1 |
+| `payflow_http_request_duration_seconds` | default (1 000) |
+| `payflow_db_query_duration_seconds` | default (1 000) |
 
 ## Prometheus rules
 

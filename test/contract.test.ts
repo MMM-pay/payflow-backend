@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+﻿import assert from "node:assert/strict";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
 import { openDatabase } from "../src/lib/db.ts";
@@ -476,4 +476,83 @@ describe("contract: documented status codes are the ones returned", () => {
       );
     }
   });
+});
+
+describe("contract: admin routes — auth contract (issue #293)", () => {
+  const ADMIN_TOKEN = "contract-test-admin-secret";
+  let adminServer: import("node:http").Server;
+  let adminBase = "";
+
+  before(async () => {
+    const adminConfig = {
+      CORS_ORIGIN: "*",
+      ADMIN_TOKEN,
+    } as unknown as import("../src/config.ts").Config;
+    const adminDb = openDatabase(":memory:");
+    const app = createApp(
+      [
+        {
+          config: {
+            name: "testnet",
+            rpcUrl: "https://rpc.invalid",
+            networkPassphrase: "Test SDF Network ; September 2015",
+            planRegistryId: "C".repeat(56),
+            vaultId: "C".repeat(56),
+            subscriptionId: "C".repeat(56),
+            startLedger: 0,
+            databasePath: ":memory:",
+          },
+          db: adminDb,
+        },
+      ],
+      adminConfig,
+      {
+        reindex: async () => ({}),
+        keeperPass: async () => ({}),
+        keeperBackoff: () => ({ mandates: [] }),
+        pauseIndexer: () => undefined,
+        resumeIndexer: () => undefined,
+        vacuumDb: async () => undefined,
+      },
+    );
+    await new Promise<void>((resolve) => {
+      adminServer = app.listen(0, () => {
+        const addr = adminServer.address();
+        adminBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    adminServer.close();
+  });
+
+  const adminPaths: [string, string][] = [
+    ["POST", "/admin/reindex"],
+    ["POST", "/admin/keeper/run"],
+    ["GET", "/admin/keeper/backoff"],
+    ["POST", "/admin/indexer/pause"],
+    ["POST", "/admin/indexer/resume"],
+    ["POST", "/admin/db/vacuum"],
+  ];
+
+  for (const [method, path] of adminPaths) {
+    test(`${method} ${path} → 401 without Authorization header`, async () => {
+      const res = await fetch(`${adminBase}${path}`, { method });
+      assert.equal(res.status, 401, `${method} ${path} must return 401 without a token`);
+      const body = await res.json() as Record<string, unknown>;
+      const err = body.error as Record<string, unknown> | undefined;
+      assert.ok(typeof err?.code === "string", "error envelope has a string code");
+      assert.ok(typeof err?.message === "string", "error envelope has a string message");
+    });
+
+    test(`${method} ${path} → 401 with wrong bearer token`, async () => {
+      const res = await fetch(`${adminBase}${path}`, {
+        method,
+        headers: { Authorization: "Bearer wrong-token" },
+      });
+      assert.equal(res.status, 401, `${method} ${path} must return 401 for a wrong token`);
+    });
+  }
 });
