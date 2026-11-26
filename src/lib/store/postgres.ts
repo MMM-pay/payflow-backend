@@ -213,6 +213,15 @@ CREATE TABLE IF NOT EXISTS merchant_notification_preferences (
   events TEXT NOT NULL,
   updated_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+  token_hash TEXT PRIMARY KEY,
+  account TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  created_at BIGINT NOT NULL,
+  revoked_at BIGINT
+);
+CREATE INDEX IF NOT EXISTS refresh_tokens_account ON refresh_tokens(account);
+CREATE INDEX IF NOT EXISTS refresh_tokens_expires ON refresh_tokens(expires_at);
 CREATE TABLE IF NOT EXISTS contract_upgrades (
   contract_id TEXT NOT NULL,
   tx_hash TEXT NOT NULL,
