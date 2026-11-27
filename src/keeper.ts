@@ -1107,8 +1107,13 @@ export class Keeper {
     this.lastSuccessfulRunAt = now;
     metrics.increment("keeper_passes");
     for (const result of results) {
-      if (result.status === "settled") metrics.increment("charges_settled");
-      else if (result.status === "failed") metrics.increment("charges_failed");
+      if (result.status === "settled") {
+        metrics.increment("charges_attempted");
+        metrics.increment("charges_settled");
+      } else if (result.status === "failed") {
+        metrics.increment("charges_attempted");
+        metrics.increment("charges_failed");
+      }
     }
     return results;
   }

@@ -101,6 +101,13 @@ growing — the indexer is running but the contract is emitting no events.
 
 ---
 
+### `payflow_charges_attempted_total` · counter
+
+Charges the keeper attempted to settle on-chain since the process started
+(settled plus failed, excluding dry runs and pre-submission balance skips).
+
+---
+
 ### `payflow_charges_settled_total` · counter
 
 Charges the keeper settled on-chain since the process started. This counter only
