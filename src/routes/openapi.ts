@@ -30,6 +30,12 @@ export interface SchemaObject {
   examples?: unknown[];
   enum?: unknown[];
   items?: SchemaObject;
+  /** The fewest entries an array must have. */
+  minItems?: number;
+  /** The most entries an array may have. */
+  maxItems?: number;
+  /** Whether an array's entries must all differ. */
+  uniqueItems?: boolean;
   properties?: Record<string, SchemaObject>;
   required?: string[];
   additionalProperties?: boolean | SchemaObject;
@@ -637,7 +643,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["webhooks"],
         summary: "Register a webhook for charge events",
         description:
-          "Registers a URL to receive signed POSTs when one of the merchant's mandates charges. The caller proves control of the merchant's Stellar address with an ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`; the returned secret is used to verify the `Payflow-Signature` header on deliveries. Compute HMAC-SHA256 over the exact raw request body bytes and compare it with each `sha256=<hex>` value in the comma-separated header using a constant-time comparison. During secret rotation, accept a matching signature under either active secret.",
+          "Registers a URL to receive signed POSTs when one of the merchant's mandates charges. The caller proves control of the merchant's Stellar address with an ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`; the returned secret is used to verify the `Payflow-Signature` header on deliveries. `events` selects the event types this webhook receives; omitted, it receives every supported event. A `charge.failing` or `charge.recovered` event is only enqueued for a webhook that lists it, so a filtered webhook never sees it, not even in its delivery history. Compute HMAC-SHA256 over the exact raw request body bytes and compare it with each `sha256=<hex>` value in the comma-separated header using a constant-time comparison. During secret rotation, accept a matching signature under either active secret.",
         operationId: `registerWebhook${operationSuffix(root)}`,
         requestBody: {
           required: true,
@@ -2331,6 +2337,15 @@ function componentSchemas(): Record<string, SchemaObject> {
           description:
             "HMAC key used to sign deliveries. When absent the service generates one and returns it once.",
         },
+        events: {
+          type: "array",
+          minItems: 1,
+          maxItems: 3,
+          uniqueItems: true,
+          items: { $ref: "#/components/schemas/NotificationEvent" },
+          description:
+            "Event types this webhook receives. Omit it to receive every supported event; an empty list, an unknown name or a duplicate is rejected.",
+        },
         signature: {
           type: "string",
           description:
@@ -2354,9 +2369,14 @@ function componentSchemas(): Record<string, SchemaObject> {
           type: "string",
           description: "HMAC key used to sign delivery requests; treat it as a secret.",
         },
+        events: {
+          type: "array",
+          items: { $ref: "#/components/schemas/NotificationEvent" },
+          description: "Event types this webhook receives.",
+        },
         active: { type: "boolean", description: "Whether deliveries are currently enabled." },
       },
-      required: ["id", "merchant", "url", "secret", "active"],
+      required: ["id", "merchant", "url", "secret", "events", "active"],
     },
     WebhookSummary: {
       type: "object",
@@ -2368,13 +2388,18 @@ function componentSchemas(): Record<string, SchemaObject> {
           type: "string",
           description: "The signing secret's last four characters; the secret itself is never returned again.",
         },
+        events: {
+          type: "array",
+          items: { $ref: "#/components/schemas/NotificationEvent" },
+          description: "Event types this webhook receives.",
+        },
         failed: { type: "boolean", description: "Deliveries gave up after repeated failures." },
         failures: { type: "integer" },
         lastAttempt: { type: ["integer", "null"], description: "Unix seconds of the last failed attempt." },
         lastStatus: { type: ["integer", "null"], description: "HTTP status of the last failed attempt." },
         createdAt: { type: "integer", description: "Unix seconds." },
       },
-      required: ["id", "merchant", "url", "secretLast4", "failed", "failures", "lastAttempt", "lastStatus", "createdAt"],
+      required: ["id", "merchant", "url", "secretLast4", "events", "failed", "failures", "lastAttempt", "lastStatus", "createdAt"],
     },
     WebhookDeleteRequest: {
       type: "object",

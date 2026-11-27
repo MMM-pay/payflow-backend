@@ -83,6 +83,12 @@ export type {
   VaultBalancePage,
   VaultEventPage,
   VaultEventRow,
+  WebhookDelivery,
+  WebhookDeliveriesResponse,
+  WebhookListResponse,
+  WebhookRegistration,
+  WebhookRotation,
+  WebhookSummary,
 } from "../routes/types.ts";
 
 /**

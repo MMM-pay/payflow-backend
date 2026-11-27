@@ -1175,3 +1175,159 @@ describe("merchant profiles", () => {
     ]);
   });
 });
+
+/**
+ * Issue #242: RPC windows can overlap, an archive backfill can replay an
+ * earlier range, and a cursor restored from a backup can deliver events out of
+ * ledger order. Whatever the arrival order, the projection must end in the
+ * same final state the chain's own order produces.
+ */
+describe("out-of-order event delivery", () => {
+  /** An event at a named ledger, with a transaction hash unique to it. */
+  function at(
+    ledger: number,
+    name: string,
+    topics: unknown[],
+    data: Record<string, unknown>,
+  ): DecodedEvent {
+    return { name, contractId: "C", ledger, txHash: `tx-${ledger}-${name}`, topics, data };
+  }
+
+  /** `charged` for mandate 1 at `ledger`, carrying `chargesMade`. */
+  function chargeAt(ledger: number, chargesMade: number, nextCharge: number): DecodedEvent {
+    return at(ledger, "charged", [1n, SUBSCRIBER, MERCHANT], {
+      amount: 9_900_000n,
+      fee: 100_000n,
+      charges_made: BigInt(chargesMade),
+      next_charge: BigInt(nextCharge),
+    });
+  }
+
+  function subscription(ledger: number): DecodedEvent {
+    return at(ledger, "subscribed", [1n, SUBSCRIBER, MERCHANT], {
+      plan_id: 1n,
+      amount: 10_000_000n,
+      period: 2_592_000n,
+      next_charge: 1_700_000_000n,
+      max_charges: 0,
+      fee_bps: 100,
+    });
+  }
+
+  function pause(ledger: number, paused: boolean): DecodedEvent {
+    return at(ledger, "pause_changed", [1n, SUBSCRIBER], { paused });
+  }
+
+  function mandateOf(database: ReturnType<typeof db>): Record<string, unknown> {
+    const row = database
+      .prepare(
+        `SELECT charges_made, next_charge, last_charge, status, ended_by, status_ledger
+           FROM mandates WHERE id = 1`,
+      )
+      .get() as Record<string, unknown> | undefined;
+    assert.ok(row, "the mandate is projected");
+    return row;
+  }
+
+  async function settle(events: DecodedEvent[]): Promise<{
+    database: ReturnType<typeof db>;
+    mandate: Record<string, unknown>;
+  }> {
+    const database = db();
+    const ix = indexer(database);
+    for (const event of events) await ix.apply(event);
+    return { database, mandate: mandateOf(database) };
+  }
+
+  test("a reversed stream ends at the same state as ledger order", async () => {
+    const events = [
+      subscription(100),
+      chargeAt(101, 1, 1_700_100_000),
+      pause(102, true),
+      chargeAt(103, 2, 1_700_200_000),
+      at(104, "cancelled", [1n, SUBSCRIBER], {}),
+    ];
+    const ordered = await settle(events);
+    const reversed = await settle([...events].reverse());
+
+    assert.deepEqual(reversed.mandate, ordered.mandate);
+    assert.deepEqual(
+      { ...ordered.mandate },
+      {
+        charges_made: 2,
+        next_charge: 1_700_200_000,
+        last_charge: 1_700_200_000 - 2_592_000,
+        status: "Cancelled",
+        ended_by: "subscriber",
+        status_ledger: 104,
+      },
+      "the final state is the chain's, not whichever event arrived last",
+    );
+    ordered.database.close();
+    reversed.database.close();
+  });
+
+  test("a subscription delivered after its charges and cancellation catches up", async () => {
+    const { database, mandate } = await settle([
+      at(104, "cancelled", [1n, SUBSCRIBER], {}),
+      chargeAt(103, 2, 1_700_200_000),
+      chargeAt(101, 1, 1_700_100_000),
+      subscription(100),
+    ]);
+    assert.equal(mandate.charges_made, 2, "the projected charges are the newest, not the subscription's zero");
+    assert.equal(mandate.next_charge, 1_700_200_000);
+    assert.equal(mandate.status, "Cancelled");
+    assert.equal(mandate.ended_by, "subscriber");
+    database.close();
+  });
+
+  test("a stale pause cannot move a mandate backwards", async () => {
+    const { database, mandate } = await settle([
+      subscription(100),
+      pause(110, true),
+      pause(105, false), // an older unpause replayed late
+    ]);
+    assert.equal(mandate.status, "Paused");
+    assert.equal(mandate.status_ledger, 110);
+    database.close();
+  });
+
+  test("a stale cancellation cannot reopen a completed mandate", async () => {
+    const { database, mandate } = await settle([
+      subscription(100),
+      at(110, "mandate_completed", [1n, SUBSCRIBER], { charges_made: 2n }),
+      at(105, "cancelled", [1n, SUBSCRIBER], {}),
+    ]);
+    assert.equal(mandate.status, "Completed");
+    assert.equal(mandate.ended_by, null);
+    database.close();
+  });
+
+  test("replaying the same out-of-order events changes nothing", async () => {
+    const events = [
+      subscription(100),
+      chargeAt(101, 1, 1_700_100_000),
+      at(104, "cancelled", [1n, SUBSCRIBER], {}),
+    ];
+    const { database, mandate } = await settle(events);
+    const ix = indexer(database);
+    for (const event of events) await ix.apply(event);
+    assert.deepEqual(mandateOf(database), mandate);
+    database.close();
+  });
+
+  test("an event that fails the contract spec is not applied out of order either", async () => {
+    const database = db();
+    const ix = indexer(database);
+    await ix.apply(subscription(100));
+    const bad = {
+      ...chargeAt(101, 2, 1_700_200_000),
+      data: { amount: 9_900_000n }, // missing fee, charges_made and next_charge
+    };
+    assert.equal(await ix.apply(bad), "mismatched");
+    const mandate = mandateOf(database);
+    assert.equal(mandate.charges_made, 0, "the rejected event left the projection untouched");
+    assert.equal(mandate.next_charge, 1_700_000_000);
+    database.close();
+  });
+});

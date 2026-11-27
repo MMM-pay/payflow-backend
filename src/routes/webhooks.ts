@@ -2,6 +2,10 @@ import { Router, type Request, type Response } from "express";
 import { Keypair } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import { WebhookDispatcher } from "../lib/webhooks.ts";
+import {
+  DEFAULT_NOTIFICATION_EVENTS,
+  NOTIFICATION_EVENTS,
+} from "../lib/notification-preferences.ts";
 import type { Storage } from "../lib/store/types.ts";
 import type { WebhookDeliveriesResponse, WebhookListResponse } from "./types.ts";
 import { sessionOf, type Sep10Auth } from "./auth.ts";
@@ -37,6 +41,18 @@ const timestampSchema = z
   .transform(Number)
   .refine((value) => Number.isSafeInteger(value), "must be a unix timestamp in seconds");
 
+/**
+ * The event types a webhook may subscribe to (#271): one or more of the
+ * notification event names, without duplicates. Omitting the list subscribes
+ * to every event, the behaviour before filtering existed; an explicit list is
+ * validated so a typo cannot silently stop a merchant's deliveries.
+ */
+const eventsSchema = z
+  .array(z.enum(NOTIFICATION_EVENTS))
+  .min(1, "must subscribe to at least one event type")
+  .max(NOTIFICATION_EVENTS.length)
+  .refine((events) => new Set(events).size === events.length, "event types must not contain duplicates");
+
 /** What a registration asks for, whichever way the caller proves who it is. */
 const registrationSchema = z.object({
   url: z
@@ -55,6 +71,8 @@ const registrationSchema = z.object({
     ),
   /** HMAC key used to sign deliveries; generated when absent. */
   secret: z.string().min(1).max(1_000).optional(),
+  /** Event types to receive; every supported one when absent (#271). */
+  events: eventsSchema.optional(),
 });
 
 const registerSchema = registrationSchema.extend({
@@ -190,7 +208,7 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
     if (session.value !== null) {
       const parsed = validate(req, res, "body", sessionRegisterSchema, req.body ?? {});
       if (!parsed.ok) return;
-      const { merchant, url, secret } = parsed.value;
+      const { merchant, url, secret, events } = parsed.value;
       if (merchant !== undefined && merchant !== session.value) {
         sendWrongAccount(req, res);
         return;
@@ -201,13 +219,16 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
         ]);
         return;
       }
-      res.json({ ...(await dispatcher.register(session.value, url, secret)), active: true });
+      res.json({
+        ...(await dispatcher.register(session.value, url, secret, events ?? [...DEFAULT_NOTIFICATION_EVENTS])),
+        active: true,
+      });
       return;
     }
 
     const parsed = validate(req, res, "body", registerSchema, req.body);
     if (!parsed.ok) return;
-    const { merchant, url, secret, signature, timestamp } = parsed.value;
+    const { merchant, url, secret, signature, timestamp, events } = parsed.value;
 
     if (!fresh(timestamp)) {
       sendApiError(res, req, 400, "invalid_request", undefined, [
@@ -238,7 +259,12 @@ export function webhooksRouter(db: Storage, dispatcher: WebhookDispatcher, auth?
       return;
     }
 
-    const registration = await dispatcher.register(merchant, url, secret);
+    const registration = await dispatcher.register(
+      merchant,
+      url,
+      secret,
+      events ?? [...DEFAULT_NOTIFICATION_EVENTS],
+    );
     res.json({ ...registration, active: true });
   });
 

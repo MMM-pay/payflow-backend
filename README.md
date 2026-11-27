@@ -896,6 +896,16 @@ ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`
 HMAC-SHA256 secret used to sign deliveries; treat it as a secret and never
 log it.
 
+A registration may also carry `events`, an array of the event types that
+webhook should receive: `charged`, `charge.failing` and/or `charge.recovered`.
+Omitting it subscribes the webhook to all three, the behaviour before
+filtering existed. An empty list, an unknown name or a duplicate is a `400
+invalid_request`. A webhook that does not list an event is never enqueued for
+it, so the filtered event never appears in its delivery history either; an
+explicit `POST /api/webhooks/:id/test` ping is always delivered regardless of
+the filter. `GET /api/webhooks` reports each webhook's `events`, and the
+registration response echoes them.
+
 Webhook targets must resolve only to public IP addresses. Registration checks
 all resolved addresses, and each delivery checks DNS again and connects to the
 checked address. Loopback, private, link-local, cloud metadata and other
@@ -1196,6 +1206,7 @@ examined without API downtime.
 | `KEEPER_MAX_FEE` | `100000` | Maximum inclusion fee in stroops; congestion retries cannot exceed this cap |
 | `KEEPER_BATCH` | `true` | Settle due mandates through the contract's `charge_many` in groups, falling back to single `charge` transactions when the contract does not support it |
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
+| `KEEPER_MAX_CHARGES_PER_RUN` | `25` | Most mandates one keeper pass settles, across every channel and batch (1–1000). A large backlog is spread over later passes |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_PROGRESS_LEDGERS` | `10000` | Ledgers between two `indexer progress` log lines (cursor, lag, events, ledgers per second); `0` turns them off |

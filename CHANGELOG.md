@@ -7,6 +7,30 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **A configurable per-pass keeper charge cap (#254).**
+  `KEEPER_MAX_CHARGES_PER_RUN` (default 25, allowed 1–1000) is the most
+  mandates one keeper pass settles across every channel and batch. A large
+  backlog is worked off over several passes instead of one long burst; with
+  batching enabled the cap bounds the grouped `charge_many` transactions too.
+  Invalid values fail startup, and a SIGHUP reload with an invalid value is
+  refused without changing the running cap. The HTTP API is unchanged.
+- **Per-event-type webhook subscriptions (#271).**
+  `POST /api/webhooks` accepts an optional `events` array of `charged`,
+  `charge.failing` and `charge.recovered`; omitted, the webhook receives every
+  event as before. A filtered webhook is never enqueued for an event it did
+  not subscribe to, so the event never appears in its delivery queue or
+  history, while an explicit `/test` ping is still always delivered. The
+  filter is stored on the webhook row (`webhooks.events`), returned at
+  registration and reported by `GET /api/webhooks`, and documented in the
+  OpenAPI spec.
+- **Out-of-order event delivery keeps projections correct (#242).**
+  Status and pause changes now record their ledger in
+  `mandates.status_ledger`, so a lifecycle event replayed after a newer one
+  can no longer reopen a cancelled mandate, unpause a paused one or roll a
+  completion back. A `subscribed` event delivered after its mandate's charges
+  and cancellations catches the row up from `charges` and `mandate_timeline`
+  instead of resetting it to its opening state. New tests feed reversed and
+  replayed streams and assert the final projection matches ledger order.
 - **Concurrent settlement with a bounded worker pool (#249).**
   `KEEPER_CONCURRENCY` caps the settlement transactions a keeper pass keeps in
   flight (default: one per channel account; a cap above the number of channels

@@ -7,7 +7,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
 import { asStorage } from "./store/index.ts";
 import type { Storage } from "./store/types.ts";
-import { notificationEnabled } from "./notification-preferences.ts";
+import {
+  DEFAULT_NOTIFICATION_EVENTS,
+  NOTIFICATION_EVENTS,
+  notificationEnabled,
+  type NotificationEvent,
+} from "./notification-preferences.ts";
 import { big, num, str } from "./stellar.ts";
 import type { DecodedEvent } from "./stellar.ts";
 import type {
@@ -167,6 +172,8 @@ export interface Webhook {
   secret: string;
   previous_secret: string | null;
   previous_secret_expires_at: number | null;
+  /** Event types this webhook is subscribed to (#271). */
+  events: NotificationEvent[];
   active: number;
   failed: number;
   failures: number;
@@ -202,11 +209,32 @@ interface WebhookRow {
   secret: string;
   previous_secret: string | null;
   previous_secret_expires_at: number | null;
+  /** JSON array of the event types this webhook receives (#271). */
+  events: string;
   active: number;
   failed: number;
   failures: number;
   last_attempt: number | null;
   last_status: number | null;
+}
+
+/**
+ * The event types a stored `webhooks.events` value names. Unknown names left
+ * by an older or newer build are dropped, and a value that is not readable as
+ * an array falls back to every event so an upgrade never silently stops a
+ * merchant's deliveries. An empty array is kept: it is a webhook that receives
+ * no standard events (explicit test pings still work).
+ */
+function parseWebhookEvents(value: string): NotificationEvent[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return NOTIFICATION_EVENTS.filter((event) => parsed.includes(event));
+    }
+  } catch {
+    // A malformed stored value is handled below like a missing one.
+  }
+  return [...DEFAULT_NOTIFICATION_EVENTS];
 }
 
 /** How one delivery attempt went. */
@@ -325,13 +353,22 @@ export class WebhookDispatcher {
    * sign deliveries; when omitted a server-generated secret is returned
    * to the caller exactly once.
    */
-  async register(merchant: string, url: string, secret?: string): Promise<WebhookRegistration> {
+  async register(
+    merchant: string,
+    url: string,
+    secret?: string,
+    events: NotificationEvent[] = [...DEFAULT_NOTIFICATION_EVENTS],
+  ): Promise<WebhookRegistration> {
     const value = secret ?? randomUUID();
     const now = Math.floor(Date.now() / 1000);
+    // Stored and echoed in the canonical order, the same order a later
+    // `listForMerchant` reports, so the registration response and the listing
+    // never disagree about the filter.
+    const selected = NOTIFICATION_EVENTS.filter((event) => events.includes(event));
     const row = await this.db.get<{ id: number }>(
-      `INSERT INTO webhooks (merchant, url, secret, active, failed, failures, created_at)
-       VALUES (?, ?, ?, 1, 0, 0, ?) RETURNING id`,
-      [merchant, url, value, now],
+      `INSERT INTO webhooks (merchant, url, secret, events, active, failed, failures, created_at)
+       VALUES (?, ?, ?, ?, 1, 0, 0, ?) RETURNING id`,
+      [merchant, url, value, JSON.stringify(selected), now],
     );
     if (!row) throw new Error("webhook registration insert returned no id");
     return {
@@ -339,20 +376,22 @@ export class WebhookDispatcher {
       merchant,
       url,
       secret: value,
+      events: [...selected],
       active: true,
     };
   }
 
   /** The active, non-failed webhooks for a merchant, newest first. */
-  listWebhooks(merchant: string): Promise<Webhook[]> {
-    return this.db.all<Webhook>(
+  async listWebhooks(merchant: string): Promise<Webhook[]> {
+    const rows = await this.db.all<WebhookRow>(
       `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
-              active, failed, failures, last_attempt, last_status
+              events, active, failed, failures, last_attempt, last_status
          FROM webhooks
         WHERE merchant = ? AND active = 1 AND failed = 0
         ORDER BY id DESC`,
       [merchant],
     );
+    return rows.map((row) => ({ ...row, events: parseWebhookEvents(row.events) }));
   }
 
   /**
@@ -366,13 +405,14 @@ export class WebhookDispatcher {
       id: number;
       url: string;
       secret: string;
+      events: string;
       failed: number;
       failures: number;
       last_attempt: number | null;
       last_status: number | null;
       created_at: number;
     }>(
-        `SELECT id, url, secret, failed, failures, last_attempt, last_status, created_at
+        `SELECT id, url, secret, events, failed, failures, last_attempt, last_status, created_at
            FROM webhooks
           WHERE merchant = ? AND active = 1
           ORDER BY id DESC`,
@@ -383,6 +423,7 @@ export class WebhookDispatcher {
       merchant,
       url: row.url,
       secretLast4: row.secret.slice(-4),
+      events: parseWebhookEvents(row.events),
       failed: row.failed === 1,
       failures: row.failures,
       lastAttempt: row.last_attempt,
@@ -446,7 +487,7 @@ export class WebhookDispatcher {
   async ping(merchant: string, id: number): Promise<WebhookTestResult | null> {
     const webhook = await this.db.get<WebhookRow>(
         `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
-                active, failed, failures, last_attempt, last_status
+                events, active, failed, failures, last_attempt, last_status
            FROM webhooks
           WHERE id = ? AND merchant = ? AND active = 1 AND failed = 0`,
       [id, merchant],
@@ -521,10 +562,11 @@ export class WebhookDispatcher {
       secret: string;
       previous_secret: string | null;
       previous_secret_expires_at: number | null;
+      events: string;
     }>(
         `SELECT d.id, d.webhook_id, d.event_id, d.idempotency_key, d.attempt, d.status,
                 d.http_status, d.response_body, d.error, d.payload, d.retry_at, d.created_at,
-                w.merchant, w.url, w.secret, w.previous_secret, w.previous_secret_expires_at
+                w.merchant, w.url, w.secret, w.previous_secret, w.previous_secret_expires_at, w.events
            FROM webhook_deliveries d
            JOIN webhooks w ON w.id = d.webhook_id
           WHERE d.status = 'pending' AND d.retry_at <= ? AND w.active = 1 AND w.failed = 0
@@ -554,6 +596,7 @@ export class WebhookDispatcher {
         secret: row.secret,
         previous_secret: row.previous_secret,
         previous_secret_expires_at: row.previous_secret_expires_at,
+        events: parseWebhookEvents(row.events),
         active: 1,
         failed: 0,
         failures: 0,
@@ -614,7 +657,7 @@ export class WebhookDispatcher {
       ledger: e.ledger,
     } as Record<string, unknown>);
 
-    await this.broadcast(webhooks, eventId, payload);
+    await this.broadcast(webhooks, eventId, payload, e.name);
   }
 
   /**
@@ -642,12 +685,23 @@ export class WebhookDispatcher {
         : { ...common, tx_hash: e.txHash },
     );
 
-    await this.broadcast(webhooks, `${e.kind}:${e.mandateId}:${e.attemptId}`, payload);
+    await this.broadcast(webhooks, `${e.kind}:${e.mandateId}:${e.attemptId}`, payload, e.kind);
   }
 
-  /** One pending delivery and a first attempt per webhook, under one idempotency key. */
-  private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
+  /**
+   * One pending delivery and a first attempt per webhook subscribed to
+   * `event`, under one idempotency key. A webhook registered only for some
+   * event types (#271) is skipped here, before anything is queued, so it never
+   * sees a delivery it did not ask for — not even in its history.
+   */
+  private async broadcast(
+    webhooks: Webhook[],
+    eventId: string,
+    payload: string,
+    event: NotificationEvent,
+  ): Promise<void> {
     for (const webhook of webhooks) {
+      if (!webhook.events.includes(event)) continue;
       const delivery = await this.enqueue(webhook.id, eventId, randomUUID(), payload);
       if (delivery) await this.attempt(delivery, webhook);
     }
@@ -830,7 +884,7 @@ export class WebhookDispatcher {
   private async webhookOf(webhookId: number): Promise<WebhookRow> {
     const row = await this.db.get<WebhookRow>(
       `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
-              active, failed, failures, last_attempt, last_status
+              events, active, failed, failures, last_attempt, last_status
          FROM webhooks WHERE id = ?`,
       [webhookId],
     );

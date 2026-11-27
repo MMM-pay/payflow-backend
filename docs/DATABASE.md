@@ -62,7 +62,11 @@ reindex replays history from the start. Every write is therefore idempotent:
   `(mandate_id, tx_hash, kind)`).
 - **Guards against going backwards.** A `charged` event only advances a
   mandate whose `charges_made` is lower than the event's. A status change only
-  applies if the row is still in the status it was read in.
+  applies when its ledger is at least the mandate's `status_ledger`, so a
+  lifecycle event replayed out of order cannot reopen a cancelled mandate or
+  unpause a paused one. A `subscribed` event delivered after its mandate's
+  charges or cancellations catches up from `charges` and `mandate_timeline`
+  rather than resetting the row to its opening state.
 
 ### Time is the chain's clock
 
@@ -143,6 +147,7 @@ for a plan), from `subscribed`, updated by every later lifecycle event.
 | `status` | `Active`, `Paused`, `Cancelled` or `Completed` |
 | `ended_by` | `subscriber` or `merchant` once cancelled; null otherwise |
 | `ledger` | Ledger of the `subscribed` event |
+| `status_ledger` | Ledger of the newest status or pause change; an older lifecycle event cannot move the status backwards |
 
 `(status, next_charge)` is indexed for the keeper. Several covering indexes
 serve the merchant and subscriber summaries without touching the table.
@@ -252,7 +257,9 @@ None of these come from the chain. A rebuild leaves them alone.
 ### `webhooks`
 
 Merchant webhook registrations: `merchant`, `url`, signing `secret`,
-`active`, and delivery health (`failed`, `failures`, `last_attempt`,
+`events` (a JSON array of the event types it receives — `charged`,
+`charge.failing`, `charge.recovered`; every event when registered without a
+filter), `active`, and delivery health (`failed`, `failures`, `last_attempt`,
 `last_status`). During a secret rotation, `previous_secret` keeps signing
 beside the new one until `previous_secret_expires_at` (unix seconds; see
 `WEBHOOK_SECRET_OVERLAP_S`).

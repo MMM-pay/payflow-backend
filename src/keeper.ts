@@ -50,8 +50,8 @@ const DEFAULT_BACKOFF_MULTIPLIER = 2;
 const DEFAULT_BACKOFF_MAX_S = 6 * 60 * 60;
 /** Share of a retry delay shaved off at random when `KEEPER_BACKOFF_JITTER` is not set. */
 const DEFAULT_BACKOFF_JITTER = 0.1;
-/** Most charges submitted in one pass. */
-const BATCH = 25;
+/** Most charges submitted in one pass when `KEEPER_MAX_CHARGES_PER_RUN` is not set (#254). */
+const DEFAULT_MAX_CHARGES_PER_RUN = 25;
 /** Mandates per `charge_many` call when `KEEPER_BATCH_SIZE` is not set. */
 const DEFAULT_BATCH_SIZE = 10;
 /** Per-mandate failure text when `charge_many` answers `false` for an id. */
@@ -464,6 +464,8 @@ export class Keeper {
   private readonly backoff = new Map<number, { failures: number; retryAt: number }>();
   /** Backoff settings from the config, validated; replaced on reload. */
   private backoffPolicy: BackoffPolicy;
+  /** Most mandates one pass settles (`KEEPER_MAX_CHARGES_PER_RUN`, #254). */
+  private maxCharges: number;
   /** Uniform in [0, 1); drives the jitter. Injectable so tests are deterministic. */
   private readonly random: () => number;
   /** Told when a mandate starts or ends a failing streak; see the class notes. */
@@ -520,6 +522,7 @@ export class Keeper {
     }
     this.channels = Keeper.checkedChannels(config);
     this.backoffPolicy = Keeper.checkedBackoff(config);
+    this.maxCharges = Keeper.checkedMaxCharges(config);
     // The backoff a previous process left behind is read once per start; the
     // pass methods await `ready` so a first pass never runs ahead of it.
     this.ready = this.restoreBackoff();
@@ -609,8 +612,10 @@ export class Keeper {
     // running keeper exactly as it was.
     const channels = Keeper.checkedChannels(config);
     const backoffPolicy = Keeper.checkedBackoff(config);
+    const maxCharges = Keeper.checkedMaxCharges(config);
     this.config = config;
     this.backoffPolicy = backoffPolicy;
+    this.maxCharges = maxCharges;
     // The reloaded config may point at a contract that does support
     // `charge_many`; support is re-detected on the next batch attempt.
     this.batchEntryMissing = false;
@@ -710,14 +715,43 @@ export class Keeper {
   }
 
   /**
+   * The per-pass charge cap `config` describes (#254), after the same checks
+   * `loadConfig` makes; this covers a hand-built config and a SIGHUP reload,
+   * which is refused without touching the running keeper.
+   */
+  private static checkedMaxCharges(config: Config): number {
+    const cap = config.KEEPER_MAX_CHARGES_PER_RUN ?? DEFAULT_MAX_CHARGES_PER_RUN;
+    if (!Number.isInteger(cap) || cap < 1) {
+      throw new Error(
+        `KEEPER_MAX_CHARGES_PER_RUN must be a whole number of at least 1, got ${String(cap)}`,
+      );
+    }
+    return cap;
+  }
+
+  /**
+   * The per-pass charge cap: `KEEPER_MAX_CHARGES_PER_RUN`, or the historical
+   * 25 when it is not set (#254). Applied when a caller does not name its own
+   * limit — the keeper's own pass always does, so one run can never settle
+   * more than this many mandates however large the backlog is.
+   */
+  get maxChargesPerRun(): number {
+    return this.maxCharges;
+  }
+
+  /**
    * Mandates the indexer believes are chargeable right now, in the order set
    * by `KEEPER_ORDER` (`oldest` = oldest-due first, the default; `largest` =
    * largest amount first), skipping any that are backing off after a failed
    * charge — in the query itself, so they never take a place in the batch.
    * With `KEEPER_MERCHANTS` set, only those merchants' mandates are
-   * returned; empty means every merchant.
+   * returned; empty means every merchant. `limit` defaults to the configured
+   * per-pass cap so a pass can never be handed more work than it may settle.
    */
-  async findDue(now: number = Math.floor(Date.now() / 1000), limit = BATCH): Promise<DueMandate[]> {
+  async findDue(
+    now: number = Math.floor(Date.now() / 1000),
+    limit: number = this.maxCharges,
+  ): Promise<DueMandate[]> {
     // The backoff cache is restored before the first pass, and a database
     // that failed to load it fails the pass instead of running beside it.
     await this.ready;
@@ -839,7 +873,9 @@ export class Keeper {
   private async tickInner(now: number): Promise<SettleResult[]> {
     // A stopping keeper starts nothing new, not even a fresh pass.
     if (this.stopping) return [];
-    const due = await this.findDue(now);
+    // One pass settles at most `KEEPER_MAX_CHARGES_PER_RUN` mandates (#254),
+    // so a backlog is spread over several passes instead of one long burst.
+    const due = await this.findDue(now, this.maxCharges);
     const { chargeable, skipped } = await this.withoutShortfalls(due);
     const fee = chargeable.length > 0 ? await this.inclusionFee() : undefined;
     const channels = chargeable.length > 0 ? await this.distributableChannels() : [];

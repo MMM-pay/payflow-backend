@@ -533,6 +533,8 @@ export interface WebhookRegistration {
   url: string;
   /** HMAC-SHA256 key used to sign delivery requests. */
   secret: string;
+  /** Event types this webhook receives (#271); every type when omitted. */
+  events: NotificationEvent[];
   active: boolean;
 }
 
@@ -543,6 +545,8 @@ export interface WebhookSummary {
   url: string;
   /** The signing secret's last four characters, to tell secrets apart. */
   secretLast4: string;
+  /** Event types this webhook receives (#271). */
+  events: NotificationEvent[];
   /** True once deliveries gave up after repeated failures. */
   failed: boolean;
   failures: number;

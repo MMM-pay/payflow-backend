@@ -284,6 +284,114 @@ describe("webhooks", () => {
     assert.equal(call.headers["payflow-signature"], `sha256=${expected}`);
   });
 
+  test("a webhook receives only the event types it subscribed to (#271)", async () => {
+    const key = Keypair.random();
+    const filteredMerchant = key.publicKey();
+    const filteredSeed = key.secret();
+    const filteredUrl = "https://payflow.example/only-failing";
+    const timestamp = nowSec();
+    const registration = await post("/api/webhooks", {
+      merchant: filteredMerchant,
+      url: filteredUrl,
+      secret: "filtered-secret",
+      events: ["charge.failing"],
+      timestamp,
+      signature: sign(filteredMerchant, filteredUrl, timestamp, filteredSeed),
+    });
+    assert.equal(registration.status, 200);
+    const body = registration.body as { id: number; events: string[] };
+    assert.deepEqual(body.events, ["charge.failing"], "the registration echoes the filter");
+    const row = db.prepare("SELECT events FROM webhooks WHERE id = ?").get(body.id) as {
+      events: string;
+    };
+    assert.deepEqual(JSON.parse(row.events), ["charge.failing"], "the filter is stored with the webhook");
+
+    calls.length = 0;
+    await ix.apply(ev("charged", [31n, SUBSCRIBER, filteredMerchant], {
+      amount: 5_000_000n, fee: 0n, charges_made: 1n, next_charge: 1_700_000_000n,
+    }, "tx-filtered-charge"));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 0, "an unsubscribed event is never delivered");
+    const pending = db
+      .prepare("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id = ?")
+      .get(body.id) as { n: number };
+    assert.equal(pending.n, 0, "nor queued: it does not appear in the delivery history");
+
+    await dispatcher.onChargeStreak({
+      kind: "charge.failing",
+      mandateId: 31,
+      subscriber: SUBSCRIBER,
+      merchant: filteredMerchant,
+      failures: 3,
+      attemptId: 1,
+      shortfall: "100",
+      nextRetryAt: 10_500,
+      errorCode: "INSUFFICIENT_BALANCE",
+    });
+    await waitFor(() => calls.length >= 1);
+    assert.equal(calls.length, 1, "the subscribed event is delivered");
+    assert.equal(calls[0]!.url, filteredUrl);
+    assert.equal((JSON.parse(calls[0]!.body) as { event: string }).event, "charge.failing");
+  });
+
+  test("a webhook with no filter keeps receiving every event type", async () => {
+    const key = Keypair.random();
+    const merchantAll = key.publicKey();
+    const urlAll = "https://payflow.example/all-events";
+    const hook = await dispatcher.register(merchantAll, urlAll, "all-secret");
+    assert.deepEqual(hook.events, ["charged", "charge.failing", "charge.recovered"]);
+
+    calls.length = 0;
+    await ix.apply(ev("charged", [32n, SUBSCRIBER, merchantAll], {
+      amount: 1_000n, fee: 0n, charges_made: 1n, next_charge: 1n,
+    }, "tx-all-charge"));
+    await waitFor(() => calls.length >= 1);
+    await dispatcher.onChargeStreak({
+      kind: "charge.recovered",
+      mandateId: 32,
+      subscriber: SUBSCRIBER,
+      merchant: merchantAll,
+      failures: 3,
+      attemptId: 2,
+      txHash: "ab".repeat(32),
+    });
+    await waitFor(() => calls.length >= 2);
+    assert.deepEqual(
+      calls.slice(0, 2).map((call) => (JSON.parse(call.body) as { event: string }).event),
+      ["charged", "charge.recovered"],
+    );
+  });
+
+  test("registration rejects an empty, unknown or duplicated event filter (#271)", async () => {
+    for (const [events, target] of [
+      [[], "https://payflow.example/no-events"],
+      [["unknown"], "https://payflow.example/unknown-event"],
+      [["charged", "charged"], "https://payflow.example/duplicate-events"],
+    ] as const) {
+      const timestamp = nowSec();
+      const res = await post("/api/webhooks", {
+        merchant,
+        url: target,
+        secret,
+        events,
+        timestamp,
+        signature: sign(merchant, target, timestamp, seed),
+      });
+      assert.equal(res.status, 400, JSON.stringify(events));
+      assert.equal(
+        (res.body as { error: { code: string } }).error.code,
+        "invalid_request",
+        JSON.stringify(events),
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) AS n FROM webhooks WHERE url = ?").get(target) as { n: number }).n,
+        0,
+        "the invalid registration stored nothing",
+      );
+    }
+  });
+
   test("delivery retries with backoff and gives up after five attempts", async () => {
     const failing = Keypair.random().publicKey();
     await dispatcher.register(failing, "https://payflow.example/failing", "another-secret");
@@ -410,6 +518,11 @@ describe("webhooks", () => {
       assert.deepEqual(body.webhooks.map((w) => w.id), [second.id, first.id], "newest first, own only");
       assert.equal(body.webhooks[1]!.secretLast4, "1234");
       assert.equal(body.webhooks[1]!.url, "https://owner.example/a");
+      assert.deepEqual(
+        body.webhooks[1]!.events,
+        ["charged", "charge.failing", "charge.recovered"],
+        "the listing says which events the webhook receives",
+      );
       assert.equal(body.webhooks[1]!.failed, false);
       assert.equal("secret" in body.webhooks[1]!, false);
     });
