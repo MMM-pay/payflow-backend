@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
-import { nativeToScVal, type rpc } from "@stellar/stellar-sdk";
+import { Account, Keypair, nativeToScVal, rpc, type Transaction } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { asStorage } from "../src/lib/store/index.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
+import { Keeper, type KeeperRpc } from "../src/keeper.ts";
 import { metrics, MetricsRegistry, publishBuildInfo, publishBusinessMetrics, DEFAULT_MAX_SERIES } from "../src/lib/metrics.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 
@@ -185,6 +186,7 @@ describe("GET /metrics", () => {
       "payflow_active_merchants",
       "payflow_mrr",
       "payflow_events_applied_total",
+      "payflow_charges_attempted_total",
       "payflow_charges_settled_total",
       "payflow_charges_failed_total",
       "payflow_keeper_passes_total",
@@ -221,6 +223,119 @@ describe("the metrics the loops publish", () => {
     assert.equal(metrics.value("indexer_lag", { network: "testnet" }), 11_999);
     assert.equal(metrics.value("events_applied", { network: "testnet" }), 1);
     metrics.reset();
+  });
+
+  test("a keeper pass increments charges_attempted, charges_settled and charges_failed", async () => {
+    metrics.reset();
+    const keeperDb = openDatabase(":memory:");
+    const keeperKey = Keypair.random();
+    const contract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+    for (const id of [1, 2]) {
+      keeperDb
+        .prepare(
+          `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
+           VALUES (?, ?, ?, 1, '10', 60, ?, 'Active', 1)`,
+        )
+        .run(id, SUBSCRIBER, MERCHANT, 999 + id);
+    }
+    let sends = 0;
+    const keeperRpc: KeeperRpc = {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
+      getAccount: async (address: string) => new Account(address, "1") as never,
+      prepareTransaction: async (tx) => tx as Transaction,
+      sendTransaction: async (tx) => {
+        sends += 1;
+        if (sends === 2) {
+          return { status: "ERROR", errorResult: "tx rejected" } as never;
+        }
+        const hash = Buffer.from((tx as Transaction).hash()).toString("hex");
+        return { status: "PENDING", hash } as never;
+      },
+      getTransaction: async () =>
+        ({ status: rpc.Api.GetTransactionStatus.SUCCESS }) as never,
+    };
+    const keeper = new Keeper(keeperDb, keeperRpc, {
+      PLAN_REGISTRY_ID: contract,
+      VAULT_ID: contract,
+      SUBSCRIPTION_ID: contract,
+      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+      KEEPER_SECRET: keeperKey.secret(),
+      KEEPER_FEE_PERCENTILE: "90",
+      KEEPER_MAX_FEE: "100000",
+      KEEPER_BATCH: false,
+      KEEPER_BATCH_SIZE: 10,
+      KEEPER_BACKOFF_JITTER: 0,
+    } as unknown as Config);
+
+    try {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(
+        results.map((r) => r.status),
+        ["settled", "failed"],
+      );
+      assert.equal(metrics.value("keeper_passes"), 1);
+      assert.equal(metrics.value("charges_attempted"), 2);
+      assert.equal(metrics.value("charges_settled"), 1);
+      assert.equal(metrics.value("charges_failed"), 1);
+      const rendered = metrics.render();
+      assert.match(rendered, /^payflow_charges_attempted_total 2$/m);
+      assert.match(rendered, /^payflow_charges_settled_total 1$/m);
+      assert.match(rendered, /^payflow_charges_failed_total 1$/m);
+    } finally {
+      keeperDb.close();
+      metrics.reset();
+    }
+  });
+
+  test("a keeper dry run does not increment charge outcome counters", async () => {
+    metrics.reset();
+    const keeperDb = openDatabase(":memory:");
+    const keeperKey = Keypair.random();
+    const contract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+    keeperDb
+      .prepare(
+        `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
+         VALUES (1, ?, ?, 1, '10', 60, 1000, 'Active', 1)`,
+      )
+      .run(SUBSCRIBER, MERCHANT);
+    const keeperRpc: KeeperRpc = {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
+      getAccount: async (address: string) => new Account(address, "1") as never,
+      prepareTransaction: async (tx) => tx as Transaction,
+      sendTransaction: async () => {
+        throw new Error("sendTransaction must not run in dry-run mode");
+      },
+      getTransaction: async () =>
+        ({ status: rpc.Api.GetTransactionStatus.SUCCESS }) as never,
+    };
+    const keeper = new Keeper(keeperDb, keeperRpc, {
+      PLAN_REGISTRY_ID: contract,
+      VAULT_ID: contract,
+      SUBSCRIPTION_ID: contract,
+      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+      KEEPER_SECRET: keeperKey.secret(),
+      KEEPER_FEE_PERCENTILE: "90",
+      KEEPER_MAX_FEE: "100000",
+      KEEPER_DRY_RUN: true,
+      KEEPER_BATCH: false,
+      KEEPER_BATCH_SIZE: 10,
+      KEEPER_BACKOFF_JITTER: 0,
+    } as unknown as Config);
+
+    try {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(
+        results.map((r) => r.status),
+        ["simulated"],
+      );
+      assert.equal(metrics.value("keeper_passes"), undefined);
+      assert.equal(metrics.value("charges_attempted"), undefined);
+      assert.equal(metrics.value("charges_settled"), undefined);
+      assert.equal(metrics.value("charges_failed"), undefined);
+    } finally {
+      keeperDb.close();
+      metrics.reset();
+    }
   });
 });
 

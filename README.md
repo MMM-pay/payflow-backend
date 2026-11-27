@@ -705,6 +705,7 @@ deployment that does not scrape them should not expose them.
 | `payflow_active_merchants` | gauge | Merchants with at least one active mandate |
 | `payflow_mrr` | gauge | Monthly recurring revenue of the active mandates, normalised to a 30-day month |
 | `payflow_events_applied_total` | counter | Contract events applied to the projection |
+| `payflow_charges_attempted_total` | counter | Charges the keeper attempted to settle on-chain |
 | `payflow_charges_settled_total` | counter | Charges the keeper settled |
 | `payflow_charges_failed_total` | counter | Charges the keeper could not settle |
 | `payflow_keeper_passes_total` | counter | Keeper passes run |

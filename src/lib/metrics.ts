@@ -137,6 +137,12 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     type: "counter",
   },
   {
+    key: "charges_attempted",
+    name: "payflow_charges_attempted_total",
+    help: "Charges the keeper attempted to settle on-chain since the process started.",
+    type: "counter",
+  },
+  {
     key: "charges_settled",
     name: "payflow_charges_settled_total",
     help: "Charges the keeper settled on-chain since the process started.",
