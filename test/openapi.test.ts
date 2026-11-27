@@ -266,6 +266,7 @@ describe("the OpenAPI document", () => {
       "/admin/reindex",
       "/admin/keeper/run",
       "/admin/keeper/backoff",
+      "/admin/keeper/dry-run",
       "/admin/indexer/pause",
       "/admin/indexer/resume",
       "/admin/db/vacuum",

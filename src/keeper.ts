@@ -13,7 +13,7 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import { keeperBackoffProblem, type Config } from "./config.ts";
-import { childLogger } from "./lib/logger.ts";
+import { childLogger, maskAccount } from "./lib/logger.ts";
 import { withSpan } from "./lib/telemetry.ts";
 
 const logger = childLogger("keeper");
@@ -26,7 +26,7 @@ import type { Storage } from "./lib/store/types.ts";
 import { planTokensByIds } from "./lib/queries.ts";
 import type { KeeperRpc } from "./lib/stellar.ts";
 import type { ChargeStreakEvent } from "./lib/webhooks.ts";
-import type { KeeperPassSummary } from "./routes/types.ts";
+import type { KeeperDryRunReport, KeeperPassSummary } from "./routes/types.ts";
 
 export interface DueMandate {
   id: number;
@@ -102,6 +102,19 @@ function resultCode(errorResult: unknown): string | undefined {
 function hostErrorCode(message: string): string | undefined {
   const match = /Error\((\w+), ?(#\d+|\w+)\)/.exec(message);
   return match ? `Error(${match[1]}, ${match[2]})` : undefined;
+}
+
+/**
+ * Whether a refused simulation means the vault cannot pay the charge: the
+ * vault's `InsufficientBalance` (#3004) or `AllowanceInsufficient` (#3009),
+ * or a host message naming either. Such a mandate is skipped without being
+ * submitted, so no fee is spent on a charge already known to fail (#251).
+ */
+function isVaultShortfall(error: string | undefined): boolean {
+  if (!error) return false;
+  const code = hostErrorCode(error);
+  if (code === "Error(Contract, #3004)" || code === "Error(Contract, #3009)") return true;
+  return /insufficient ?balance|allowance ?insufficient|insufficient ?allowance/i.test(error);
 }
 
 /**
@@ -311,10 +324,19 @@ export interface SkippedMandate {
   mandateId: number;
   /** The amount the charge needs. */
   required: string;
-  /** The balance the vault holds. */
-  balance: string;
-  /** What is missing. */
-  shortfall: string;
+  /** The balance the vault holds; absent when a simulation proved the shortfall. */
+  balance?: string;
+  /** What is missing; absent when a simulation proved the shortfall. */
+  shortfall?: string;
+  /**
+   * Where the shortfall is known from: `balance` is the vault view, the
+   * default and the only reason before #251; `simulation` is a read-only
+   * `charge` simulation, which also catches a short allowance. Absent for a
+   * balance shortfall so existing pass history keeps its shape.
+   */
+  reason?: "balance" | "simulation";
+  /** The simulation's refusal, for a `simulation` skip. */
+  error?: string;
 }
 
 /**
@@ -493,6 +515,14 @@ export class Keeper {
   private batchEntryMissing = false;
   private readonly passes: KeeperPassSummary[] = [];
   /**
+   * Unix timestamp (seconds) when the keeper last completed a pass without
+   * throwing — i.e. the settlement loop finished, regardless of whether any
+   * mandates were actually settled. Null until the first successful pass.
+   * Exposed via `passHistory()` and `/health` so a watchdog can alert when
+   * the keeper has been silent for too long (#258).
+   */
+  lastSuccessfulRunAt: number | null = null;
+  /**
    * Names this keeper instance in `keeper_claims`: host, PID and a random
    * suffix, so two keepers on one host (or a restarted one) never mistake
    * each other's claims for their own. Never derived from a secret.
@@ -502,6 +532,8 @@ export class Keeper {
   private stopping = false;
   /** Settlement transactions in flight right now, across every worker. */
   private inFlightCount = 0;
+  /** Passes running right now; {@link stop} waits for them to finish (#255). */
+  private readonly activePasses = new Set<Promise<unknown>>();
   /** Resolves when the persisted backoff has been loaded into memory. */
   readonly ready: Promise<void>;
 
@@ -588,18 +620,29 @@ export class Keeper {
     return this.inFlightCount;
   }
 
+  /** True once {@link stop} has been called: no new mandate will be picked up. */
+  get isStopping(): boolean {
+    return this.stopping;
+  }
+
   /**
    * Begin a graceful shutdown: workers take no new mandates, while the
    * transactions already in flight finish (or time out) and are recorded.
    * The pass in progress resolves once they have; later passes do nothing.
+   *
+   * Resolves once every pass that was running has finished, so a caller
+   * (SIGTERM handler) can wait for in-flight charges before closing the
+   * database (#255). Never rejects: a pass's own error is its caller's.
    */
-  stop(): void {
-    if (this.stopping) return;
-    this.stopping = true;
-    logger.info(
-      { inFlight: this.inFlightCount },
-      "keeper stopping: in-flight settlements will finish, no new ones start",
-    );
+  stop(): Promise<void> {
+    if (!this.stopping) {
+      this.stopping = true;
+      logger.info(
+        { inFlight: this.inFlightCount, passes: this.activePasses.size },
+        "keeper stopping: in-flight settlements will finish, no new ones start",
+      );
+    }
+    return Promise.allSettled([...this.activePasses]).then(() => undefined);
   }
 
   /**
@@ -758,6 +801,72 @@ export class Keeper {
     return this.queryDue(now, limit);
   }
 
+  /**
+   * List what a settlement pass would charge right now without charging it
+   * (#250): the due mandates, the amount each would pull from its vault, the
+   * balance read, and the simulation's verdict. Every charge is built and
+   * simulated read-only — never signed or submitted — so an operator can
+   * rehearse a first run on a new deployment and see the intended charges as
+   * a list instead of reading them out of the pass log.
+   *
+   * Nothing is written: no claim, no `charge_attempts` row, no backoff, no
+   * pass history, no metrics. That also makes it safe to call repeatedly
+   * while a real keeper shares the same database.
+   */
+  async dryRun(
+    now: number = Math.floor(Date.now() / 1000),
+    limit = BATCH,
+  ): Promise<KeeperDryRunReport> {
+    await this.ready;
+    const due = await this.queryDue(now, limit);
+    const { chargeable, skipped, balances } = await this.withoutShortfalls(due);
+    const shortById = new Map(skipped.map((skip) => [skip.mandateId, skip]));
+    const chargeableIds = new Set(chargeable.map((mandate) => mandate.id));
+    const rows: KeeperDryRunReport["due"] = [];
+    for (const mandate of due) {
+      // A mandate neither chargeable nor skipped lost its plan or was claimed
+      // by another pass between the two reads; it is not this report's to
+      // guess at.
+      const short = shortById.get(mandate.id);
+      if (!short && !chargeableIds.has(mandate.id)) continue;
+      const base = {
+        mandateId: mandate.id,
+        subscriber: mandate.subscriber,
+        merchant: mandate.merchant,
+        planId: mandate.plan_id,
+        amount: mandate.amount,
+        nextCharge: mandate.next_charge,
+        balance: short ? (short.balance ?? null) : (balances.get(mandate.id) ?? null),
+        shortfall: short?.shortfall ?? null,
+      };
+      if (short) {
+        rows.push({
+          ...base,
+          outcome: "insufficient_balance",
+          ...(short.error === undefined ? {} : { error: short.error }),
+        });
+        continue;
+      }
+      const simulation = await this.simulateCharge(mandate.id);
+      const outcome: KeeperDryRunReport["due"][number]["outcome"] =
+        typeof this.server.simulateTransaction !== "function"
+          ? "unverified"
+          : simulation.ok
+            ? "ready"
+            : "would_fail";
+      rows.push({
+        ...base,
+        outcome,
+        ...(simulation.error === undefined ? {} : { error: simulation.error }),
+      });
+    }
+    logger.info(
+      { mandates: rows.length, chargeable: chargeable.length, skipped: skipped.length },
+      "keeper dry run: report built; nothing was submitted",
+    );
+    return { now, due: rows, chargeable: chargeable.length, skipped: skipped.length };
+  }
+
   private async queryDue(now: number, limit: number): Promise<DueMandate[]> {
     if (this.config.KEEPER_ORDER === "largest") return this.queryDueLargest(now, limit);
     return this.queryDueByOldest(now, limit);
@@ -833,6 +942,26 @@ export class Keeper {
     return this.config.KEEPER_CLAIM_TTL_S ?? DEFAULT_CLAIM_TTL_S;
   }
 
+  /**
+   * Give back claims this instance took but never submitted, by expiring
+   * them now; another keeper (or this one after a restart) may claim the
+   * charge on its next pass.
+   */
+  private async releaseClaims(group: DueMandate[], now: number): Promise<void> {
+    for (const mandate of group) {
+      await holdClaim(this.db, {
+        mandateId: mandate.id,
+        dueAt: mandate.next_charge,
+        owner: this.instanceId,
+        until: now,
+      });
+    }
+    logger.info(
+      { mandateIds: group.map((mandate) => mandate.id) },
+      "keeper stopping: released claims on charges that were never submitted",
+    );
+  }
+
   /** Track the in-flight count and publish it as the `keeper_in_flight` gauge. */
   private adjustInFlight(delta: number): void {
     this.inFlightCount += delta;
@@ -867,7 +996,13 @@ export class Keeper {
   }
 
   async tick(now: number = Math.floor(Date.now() / 1000)): Promise<SettleResult[]> {
-    return withSpan("keeper.tick", () => this.tickInner(now));
+    const pass = withSpan("keeper.tick", () => this.tickInner(now));
+    this.activePasses.add(pass);
+    try {
+      return await pass;
+    } finally {
+      this.activePasses.delete(pass);
+    }
   }
 
   private async tickInner(now: number): Promise<SettleResult[]> {
@@ -893,9 +1028,10 @@ export class Keeper {
           byId.get(skip.mandateId)!,
           {
             result: "skipped",
-            errorCode: "INSUFFICIENT_BALANCE",
+            errorCode:
+              skip.reason === "simulation" ? "SIMULATION_SHORTFALL" : "INSUFFICIENT_BALANCE",
             txHash: null,
-            shortfall: skip.shortfall,
+            shortfall: skip.shortfall ?? null,
             failure: "mandate",
           },
           now,
@@ -947,6 +1083,13 @@ export class Keeper {
           // A dry run submits nothing, so it has nothing to claim.
           const claimed = dryRun ? group : await this.claimGroup(group, clock());
           if (claimed.length === 0) continue;
+          // Stop landed while the claims were being taken: nothing has been
+          // submitted for them, so hand them back at once rather than make
+          // another keeper wait out the claim TTL (#255).
+          if (this.stopping) {
+            if (!dryRun) await this.releaseClaims(claimed, clock());
+            return;
+          }
           const channel = await pool.acquire();
           this.adjustInFlight(1);
           let results: SettleResult[];
@@ -997,10 +1140,16 @@ export class Keeper {
       );
     }
     await pruneClaims(this.db, now);
+    this.lastSuccessfulRunAt = now;
     metrics.increment("keeper_passes");
     for (const result of results) {
-      if (result.status === "settled") metrics.increment("charges_settled");
-      else if (result.status === "failed") metrics.increment("charges_failed");
+      if (result.status === "settled") {
+        metrics.increment("charges_attempted");
+        metrics.increment("charges_settled");
+      } else if (result.status === "failed") {
+        metrics.increment("charges_attempted");
+        metrics.increment("charges_failed");
+      }
     }
     return results;
   }
@@ -1025,17 +1174,22 @@ export class Keeper {
   private async withoutShortfalls(due: DueMandate[]): Promise<{
     chargeable: DueMandate[];
     skipped: SkippedMandate[];
+    /** The vault balance read for each mandate, when one was available. */
+    balances: Map<number, string>;
   }> {
     const chargeable: DueMandate[] = [];
     const skipped: SkippedMandate[] = [];
-    if (due.length === 0) return { chargeable, skipped };
+    const balances = new Map<number, string>();
+    if (due.length === 0) return { chargeable, skipped, balances };
 
     // A mandate carries no token of its own; it inherits its plan's, and the
     // vault balance is per (subscriber, token).
     const tokens = await planTokensByIds(this.db, due.map((mandate) => mandate.plan_id));
     // One read per subscriber and token per pass: a subscriber with several
     // mandates on the same plan is one balance, not one read each.
-    const balances = new Map<string, bigint | null>();
+    const vaultBalances = new Map<string, bigint | null>();
+    /** Mandates the vault view could not answer for; a charge simulation decides. */
+    const unverified: DueMandate[] = [];
 
     for (const mandate of due) {
       const token = tokens.get(mandate.plan_id);
@@ -1044,15 +1198,16 @@ export class Keeper {
         continue;
       }
       const key = `${mandate.subscriber}|${token}`;
-      let balance = balances.get(key);
+      let balance = vaultBalances.get(key);
       if (balance === undefined) {
         balance = await this.vaultBalance(mandate.subscriber, token);
-        balances.set(key, balance);
+        vaultBalances.set(key, balance);
       }
       if (balance === null) {
-        chargeable.push(mandate);
+        unverified.push(mandate);
         continue;
       }
+      balances.set(mandate.id, balance.toString());
       const required = BigInt(mandate.amount);
       if (balance >= required) {
         chargeable.push(mandate);
@@ -1066,18 +1221,42 @@ export class Keeper {
       });
     }
 
+    // #251: when `vault.balance` has no answer, simulate the charge itself.
+    // A refusal for the vault's own InsufficientBalance or
+    // AllowanceInsufficient is a mandate known short: skip it before any fee
+    // is spent rather than let the submission decide. Any other refusal (a
+    // transient RPC failure, a missing account) says nothing about the vault,
+    // so the charge is left to decide as before.
+    for (const mandate of unverified) {
+      const simulation = await this.simulateCharge(mandate.id);
+      if (simulation.ok || !isVaultShortfall(simulation.error)) {
+        chargeable.push(mandate);
+        continue;
+      }
+      skipped.push({
+        mandateId: mandate.id,
+        required: mandate.amount,
+        reason: "simulation",
+        ...(simulation.error === undefined ? {} : { error: simulation.error }),
+      });
+    }
+
     for (const skip of skipped) {
       logger.warn(
         {
           mandateId: skip.mandateId,
           required: skip.required,
-          balance: skip.balance,
-          shortfall: skip.shortfall,
+          ...(skip.balance === undefined ? {} : { balance: skip.balance }),
+          ...(skip.shortfall === undefined ? {} : { shortfall: skip.shortfall }),
+          ...(skip.reason === undefined ? {} : { reason: skip.reason }),
+          ...(skip.error === undefined ? {} : { error: skip.error }),
         },
-        "keeper skipped a mandate the vault cannot cover",
+        skip.reason === "simulation"
+          ? "keeper skipped a mandate the charge simulation proved short"
+          : "keeper skipped a mandate the vault cannot cover",
       );
     }
-    return { chargeable, skipped };
+    return { chargeable, skipped, balances };
   }
 
   /**
@@ -1110,7 +1289,7 @@ export class Keeper {
       const res = await this.server.simulateTransaction(tx);
       if ("error" in res && res.error) {
         logger.warn(
-          { subscriber, token, reason: res.error.slice(0, 200).replace(/\s+/g, " ") },
+          { subscriber: maskAccount(subscriber), token, reason: maskAccount(res.error.slice(0, 200).replace(/\s+/g, " ")) },
           "vault balance unavailable; settling as before",
         );
         return null;
@@ -1124,10 +1303,44 @@ export class Keeper {
       return null;
     } catch (err) {
       logger.warn(
-        { subscriber, token, err: err instanceof Error ? err.message : String(err) },
+        { subscriber: maskAccount(subscriber), token, err: maskAccount(err instanceof Error ? err.message : String(err)) },
         "vault balance unavailable; settling as before",
       );
       return null;
+    }
+  }
+
+  /**
+   * Simulate one `charge` read-only, without the keeper's account and without
+   * signing or submitting anything; a simulation needs neither funds nor a
+   * signature. Answers `ok: true` when the charge would go through *or* when
+   * the RPC cannot say (no simulation support, a transport failure) — only a
+   * definite refusal is `ok: false`, so an outage never makes the keeper skip
+   * a mandate it could have charged.
+   */
+  private async simulateCharge(mandateId: number): Promise<{ ok: boolean; error?: string }> {
+    if (typeof this.server.simulateTransaction !== "function") return { ok: true };
+    try {
+      const tx = new TransactionBuilder(
+        simulationSource(`keeper-charge:${mandateId}`),
+        { fee: "100", networkPassphrase: this.config.NETWORK_PASSPHRASE },
+      )
+        .addOperation(
+          new Contract(this.config.SUBSCRIPTION_ID).call(
+            "charge",
+            nativeToScVal(mandateId, { type: "u64" }),
+          ),
+        )
+        .setTimeout(0)
+        .build();
+      const res = await this.server.simulateTransaction(tx);
+      if ("error" in res && res.error) {
+        return { ok: false, error: this.scrubError(String(res.error)) };
+      }
+      return { ok: true };
+    } catch (err) {
+      const error = this.scrubError(err instanceof Error ? err.message : String(err));
+      return isVaultShortfall(error) ? { ok: false, error } : { ok: true };
     }
   }
 
@@ -1182,6 +1395,7 @@ export class Keeper {
           return "unusable";
         }
         if (balance?.kind === "available" && balance.stroops < minimum) {
+          metrics.increment("keeper_low_fee_balance", 1, { channel: key.publicKey() });
           logger.warn(
             {
               channel: key.publicKey(),
@@ -1806,5 +2020,74 @@ export class Keeper {
       latest = await this.server.getTransaction(hash);
     }
     return latest;
+  }
+}
+
+/** What {@link settleOnce} listens to for shutdown signals; `process` in production. */
+export interface SignalSource {
+  once(signal: NodeJS.Signals, listener: () => void): unknown;
+  off(signal: NodeJS.Signals, listener: () => void): unknown;
+}
+
+export interface SettleOnceResult {
+  /** The pass's results, or undefined when it failed or was abandoned. */
+  results?: SettleResult[];
+  /** The pass's error, when it threw. */
+  error?: unknown;
+  /** The signal that stopped the pass early, if one arrived. */
+  signal?: NodeJS.Signals | undefined;
+  /** True when in-flight charges were still running at the shutdown deadline. */
+  timedOut: boolean;
+}
+
+/**
+ * Run one settlement pass the way the standalone keeper command does (#255).
+ *
+ * A SIGTERM or SIGINT while the pass runs stops it gracefully: no new mandate
+ * is picked up, and the transactions already in flight finish and are
+ * recorded before this resolves. If they are still running `timeoutMs` after
+ * the signal, it resolves with `timedOut` so the caller can exit instead of
+ * hanging on a stuck RPC call; their claims lapse after `KEEPER_CLAIM_TTL_S`.
+ * Never rejects; the pass's own error comes back as `error`.
+ */
+export async function settleOnce(
+  keeper: Keeper,
+  options: { timeoutMs: number; signals?: SignalSource; now?: number },
+): Promise<SettleOnceResult> {
+  const signals = options.signals ?? process;
+  let signal: NodeJS.Signals | undefined;
+  let deadline: NodeJS.Timeout | undefined;
+  let resolveTimeout: (value: "timeout") => void = () => undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    resolveTimeout = resolve;
+  });
+  const handlers = (["SIGTERM", "SIGINT"] as const).map((name) => {
+    const handler = (): void => {
+      if (signal) return;
+      signal = name;
+      logger.info({ signal: name, inFlight: keeper.inFlight }, "shutdown signal received during settlement pass");
+      void keeper.stop();
+      deadline = setTimeout(() => resolveTimeout("timeout"), options.timeoutMs);
+    };
+    signals.once(name, handler);
+    return [name, handler] as const;
+  });
+  const pass = keeper.tick(options.now).then(
+    (results) => ({ results }),
+    (error: unknown) => ({ error }),
+  );
+  try {
+    const outcome = await Promise.race([pass, timedOut]);
+    if (outcome === "timeout") {
+      logger.warn(
+        { timeoutMs: options.timeoutMs, inFlight: keeper.inFlight },
+        "in-flight settlements still running at the shutdown deadline; exiting anyway",
+      );
+      return { signal, timedOut: true };
+    }
+    return { ...outcome, signal, timedOut: false };
+  } finally {
+    clearTimeout(deadline);
+    for (const [name, handler] of handlers) signals.off(name, handler);
   }
 }

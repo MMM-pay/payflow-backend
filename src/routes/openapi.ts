@@ -670,7 +670,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["webhooks"],
         summary: "List a merchant's webhooks",
         description:
-          "The merchant's registered webhooks, newest first, including ones that gave up after failed deliveries. Secrets are never returned, only their last four characters. The caller proves control of the merchant address with an ed25519 signature over `payflow-webhook-list:v1:<merchant>:<timestamp>`.",
+          "The merchant's registered webhooks, newest first, including paused endpoints. Secrets are never returned, only their last four characters. Repeated delivery failures open a per-endpoint circuit for a cooldown; `pausedUntil` identifies the pause and `circuitState` reports open, half-open or closed. The caller proves control of the merchant address with an ed25519 signature over `payflow-webhook-list:v1:<merchant>:<timestamp>`.",
         operationId: `listWebhooks${operationSuffix(root)}`,
         parameters: [
           {
@@ -864,6 +864,37 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             content: { "application/json": { schema: { $ref: "#/components/schemas/AuthToken" } } },
           },
           "400": errorResponse('The challenge is malformed, expired, already used, not this server\'s, or not signed with enough weight (error.code = "invalid_request").'),
+        },
+      },
+    },
+    [p("/auth/rotate")]: {
+      post: {
+        tags: ["auth"],
+        summary: "Rotate a refresh token for a new JWT",
+        description:
+          "Exchanges a refresh token for a new short-lived JWT and the next refresh token. The consumed refresh token is revoked, so a stolen refresh token can be used only once; its second use fails because its hash is already revoked. Only served when SEP10_SIGNING_KEY is set.",
+        operationId: `rotateAuthToken${operationSuffix(root)}`,
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  refresh_token: { type: "string", description: "The refresh token returned at sign-in or at the last rotation." },
+                },
+                required: ["refresh_token"],
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "The new JWT and the next refresh token.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AuthToken" } } },
+          },
+          "400": invalidRequest(),
+          "401": errorResponse('The refresh token is unknown, revoked or expired (error.code = "unauthorized").'),
         },
       },
     },
@@ -1749,6 +1780,76 @@ function servicePaths(): Record<string, PathItemObject> {
         },
       },
     },
+    "/admin/keeper/dry-run": {
+      get: {
+        tags: ["admin"],
+        summary: "List what the keeper would charge, without charging it",
+        description:
+          "Builds and simulates every due charge read-only and returns the intended charges as a list. Nothing is signed, submitted or recorded: no claim, no charge attempt, no backoff. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "getKeeperDryRun",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "The dry-run report.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    dry_run: {
+                      type: ["object", "null"],
+                      properties: {
+                        now: { type: "integer", description: "Unix seconds the report was built for." },
+                        chargeable: { type: "integer", description: "How many the pass would attempt to charge." },
+                        skipped: { type: "integer", description: "How many it would skip before submitting." },
+                        due: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              mandateId: { type: "integer" },
+                              subscriber: { type: "string" },
+                              merchant: { type: "string" },
+                              planId: { type: "integer" },
+                              amount: amount(),
+                              nextCharge: { type: "integer", description: "Unix seconds." },
+                              balance: {
+                                ...amount(),
+                                type: ["string", "null"],
+                                description:
+                                  "Vault balance read, in the token's smallest unit; null when unreadable.",
+                              },
+                              shortfall: {
+                                ...amount(),
+                                type: ["string", "null"],
+                                description: "What the balance is missing, if short.",
+                              },
+                              outcome: {
+                                type: "string",
+                                enum: ["ready", "insufficient_balance", "would_fail", "unverified"],
+                              },
+                              error: { type: "string", description: "The simulation's refusal, when there is one." },
+                            },
+                            required: ["mandateId", "subscriber", "merchant", "planId", "amount", "nextCharge", "balance", "shortfall", "outcome"],
+                          },
+                        },
+                      },
+                      required: ["now", "due", "chargeable", "skipped"],
+                    },
+                  },
+                  required: ["status", "dry_run"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "403": errorResponse("The token is scoped to another operation."),
+          "503": transient503("The keeper is not enabled."),
+          "500": errorResponse("The simulation failed unexpectedly; the message is kept for the operator."),
+        },
+      },
+    },
     "/admin/indexer/pause": {
       post: {
         tags: ["admin"],
@@ -1843,6 +1944,108 @@ function servicePaths(): Record<string, PathItemObject> {
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
           "503": transient503("Database maintenance is not available on this instance (e.g. PostgreSQL backend)."),
           "500": errorResponse("The maintenance operation threw; the message is kept for the operator."),
+        },
+      },
+    },
+    "/admin/data/prune": {
+      post: {
+        tags: ["admin"],
+        summary: "Prune old raw events and charge attempts",
+        description:
+          "Deletes raw contract events older than the configured retention window (`RAW_EVENT_RETENTION_DAYS`, falling back to `DATA_RETENTION_DAYS`, default 30 days) and charge-attempt logs older than `CHARGE_ATTEMPT_RETENTION_DAYS` (default 90 days). Pass `?days=N` to override the raw-event window for this call only; `days=0` keeps everything. Events not yet consumed by the projection are always kept, regardless of age. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "postDataPrune",
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "days",
+            in: "query",
+            required: false,
+            description: "Override the raw-event retention window for this call only, in days. 0 keeps everything.",
+            schema: { type: "integer", minimum: 0 },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "The prune ran; the body reports how many rows were deleted.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    result: {
+                      type: "object",
+                      properties: {
+                        deleted: {
+                          type: "object",
+                          properties: {
+                            events: { type: "integer", description: "Raw contract events deleted." },
+                            chargeAttempts: { type: "integer", description: "Charge-attempt log rows deleted." },
+                          },
+                          required: ["events", "chargeAttempts"],
+                        },
+                      },
+                      required: ["deleted"],
+                    },
+                  },
+                  required: ["status", "result"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "503": transient503("The prune operation is not available on this instance."),
+          "500": errorResponse("The prune threw; the message is kept for the operator."),
+        },
+      },
+    },
+    "/admin/data/retention": {
+      get: {
+        tags: ["admin"],
+        summary: "Current raw-event retention policy",
+        description:
+          "Returns the configured retention windows (`rawEventRetentionDays`, `chargeAttemptRetentionDays`), when the last automatic prune ran, and the current count of raw events in the `events` table. Zero means indefinite retention. Needs a bearer token, and is only present when ADMIN_TOKEN is set.",
+        operationId: "getDataRetention",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "The retention policy.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    status: { type: "string", enum: ["ok"] },
+                    result: {
+                      type: "object",
+                      properties: {
+                        rawEventRetentionDays: {
+                          type: "integer",
+                          description: "Days raw contract events are kept. 0 means indefinite.",
+                        },
+                        chargeAttemptRetentionDays: {
+                          type: "integer",
+                          description: "Days keeper charge-attempt rows are kept. 0 means indefinite.",
+                        },
+                        lastPrunedAt: {
+                          type: ["integer", "null"],
+                          description: "Unix seconds when the last automatic prune completed; null until the first prune.",
+                        },
+                        rawEventCount: {
+                          type: "integer",
+                          description: "Current number of raw events in the events table.",
+                        },
+                      },
+                      required: ["rawEventRetentionDays", "chargeAttemptRetentionDays", "lastPrunedAt", "rawEventCount"],
+                    },
+                  },
+                  required: ["status", "result"],
+                },
+              },
+            },
+          },
+          "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
+          "503": transient503("The retention policy is not available on this instance."),
         },
       },
     },
@@ -2388,18 +2591,16 @@ function componentSchemas(): Record<string, SchemaObject> {
           type: "string",
           description: "The signing secret's last four characters; the secret itself is never returned again.",
         },
-        events: {
-          type: "array",
-          items: { $ref: "#/components/schemas/NotificationEvent" },
-          description: "Event types this webhook receives.",
-        },
-        failed: { type: "boolean", description: "Deliveries gave up after repeated failures." },
+        failed: { type: "boolean", description: "The per-endpoint circuit is open or in its half-open cooldown state." },
         failures: { type: "integer" },
         lastAttempt: { type: ["integer", "null"], description: "Unix seconds of the last failed attempt." },
         lastStatus: { type: ["integer", "null"], description: "HTTP status of the last failed attempt." },
+        paused: { type: "boolean", description: "True while repeated failures have opened the endpoint circuit." },
+        pausedUntil: { type: ["integer", "null"], description: "Unix seconds when the cooldown ends; null outside the open state." },
+        circuitState: { type: "string", enum: ["open", "half-open", "closed"], description: "Current per-endpoint circuit state." },
         createdAt: { type: "integer", description: "Unix seconds." },
       },
-      required: ["id", "merchant", "url", "secretLast4", "events", "failed", "failures", "lastAttempt", "lastStatus", "createdAt"],
+      required: ["id", "merchant", "url", "secretLast4", "failed", "failures", "lastAttempt", "lastStatus", "paused", "pausedUntil", "circuitState", "createdAt"],
     },
     WebhookDeleteRequest: {
       type: "object",
@@ -2435,7 +2636,10 @@ function componentSchemas(): Record<string, SchemaObject> {
         status: { type: "string", enum: ["delivered", "pending", "failed"] },
         statusCode: { type: ["integer", "null"], description: "The endpoint's HTTP status; null when no response arrived." },
         latencyMs: { type: "integer" },
-        error: { type: ["string", "null"] },
+        error: {
+          type: ["string", "null"],
+          description: "Sanitized failure category; never includes receiver response or transport text.",
+        },
         nextRetryAt: { type: ["integer", "null"], description: "Unix seconds of the scheduled retry, when `pending`." },
       },
       required: ["deliveryId", "status", "statusCode", "latencyMs", "error", "nextRetryAt"],
@@ -2453,7 +2657,10 @@ function componentSchemas(): Record<string, SchemaObject> {
           description: "The delivery's state after this attempt; `pending` means a retry is scheduled.",
         },
         statusCode: { type: ["integer", "null"] },
-        error: { type: ["string", "null"] },
+        error: {
+          type: ["string", "null"],
+          description: "Sanitized failure category; never includes receiver response or transport text.",
+        },
         nextRetryAt: { type: ["integer", "null"], description: "Unix seconds." },
         attemptedAt: { type: "integer", description: "Unix seconds." },
       },
@@ -2471,8 +2678,12 @@ function componentSchemas(): Record<string, SchemaObject> {
       type: "object",
       properties: {
         token: { type: "string", description: "A JWT to send as `Authorization: Bearer <token>` to merchant-only routes." },
+        refresh_token: {
+          type: "string",
+          description: "A refresh token, returned once: rotate it at `POST /api/auth/rotate` for a new JWT and the next refresh token.",
+        },
       },
-      required: ["token"],
+      required: ["token", "refresh_token"],
     },
     UpcomingCharges: {
       type: "object",
@@ -2673,8 +2884,15 @@ function componentSchemas(): Record<string, SchemaObject> {
       type: "object",
       properties: {
         passes: { type: "array", items: { $ref: "#/components/schemas/KeeperPass" } },
+        lastSuccessfulRunAt: {
+          type: ["integer", "null"],
+          description:
+            "Unix timestamp (seconds) when the keeper last completed a pass without throwing. " +
+            "Null until the first successful pass or when the keeper is not running. " +
+            "A watchdog can alert when this is null or further in the past than the configured interval (#258).",
+        },
       },
-      required: ["passes"],
+      required: ["passes", "lastSuccessfulRunAt"],
     },
     Health: {
       type: "object",
@@ -2720,6 +2938,21 @@ function componentSchemas(): Record<string, SchemaObject> {
           type: "object",
           description: "The state of every network, when the instance serves more than one.",
           additionalProperties: { $ref: "#/components/schemas/Health" },
+        },
+        keeper: {
+          type: ["object", "null"],
+          description:
+            "Keeper staleness information. Present when the keeper is running in this process; " +
+            "null when the keeper is disabled or not attached (#258).",
+          properties: {
+            lastSuccessfulRunAt: {
+              type: ["integer", "null"],
+              description:
+                "Unix timestamp (seconds) when the keeper last completed a pass without throwing. " +
+                "Null until the first successful pass.",
+            },
+          },
+          required: ["lastSuccessfulRunAt"],
         },
       },
       required: ["status", "network", "contracts"],

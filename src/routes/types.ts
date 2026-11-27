@@ -56,6 +56,8 @@ export interface PlanRow extends TokenFields {
    * null when the merchant has not set a profile. Not verified by anyone.
    */
   merchantName?: string | null;
+  /** The plan's self-declared payout address. */
+  payoutAddress?: string | null;
 }
 
 /**
@@ -109,6 +111,8 @@ export interface ChargeRow {
   amount: string;
   /** String protocol fee in the same unit. */
   fee: string;
+  /** Token contract id (e.g. "native" or SAC id). */
+  token: string;
   charges_made: number;
   next_charge: number;
   ledger: number;
@@ -319,16 +323,69 @@ export interface KeeperPassSummary {
     mandateId: number;
     /** The amount the charge needs. */
     required: string;
-    /** The balance the vault holds. */
-    balance: string;
-    /** What is missing. */
-    shortfall: string;
+    /** The balance the vault holds; absent when a charge simulation proved the shortfall. */
+    balance?: string;
+    /** What is missing; absent when a charge simulation proved the shortfall. */
+    shortfall?: string;
+    /** Where the shortfall is known from: the vault view or a charge simulation. */
+    reason?: "balance" | "simulation";
+    /** The simulation's refusal, for a `simulation` skip. */
+    error?: string;
   }[];
   backoff: { mandateId: number; failures: number; retryAt: number; retryIn: number }[];
 }
 
+/** What a due charge would do if the keeper submitted it. */
+export type KeeperDryRunOutcome =
+  /** The simulation accepted the charge. */
+  | "ready"
+  /** The vault cannot cover it: it would be skipped, not submitted. */
+  | "insufficient_balance"
+  /** The simulation refused the charge for some other reason. */
+  | "would_fail"
+  /** The RPC cannot simulate, so the report cannot say; a real pass would try. */
+  | "unverified";
+
+/** One due mandate in a keeper dry-run report (#250). */
+export interface KeeperDryRunRow {
+  mandateId: number;
+  subscriber: string;
+  merchant: string;
+  planId: number;
+  /** The intended charge, in the token's smallest unit. */
+  amount: string;
+  /** When the charge fell due, in unix seconds. */
+  nextCharge: number;
+  /** The vault balance the check read; null when it could not be read. */
+  balance: string | null;
+  /** What the balance is missing when it cannot cover the charge; otherwise null. */
+  shortfall: string | null;
+  outcome: KeeperDryRunOutcome;
+  /** The simulation's refusal, for `insufficient_balance` and `would_fail`. */
+  error?: string;
+}
+
+/** What a keeper dry run would charge right now, without submitting anything (#250). */
+export interface KeeperDryRunReport {
+  /** Unix seconds the report was built for. */
+  now: number;
+  /** The due mandates the pass would consider, in its own order. */
+  due: KeeperDryRunRow[];
+  /** How many the pass would attempt to charge. */
+  chargeable: number;
+  /** How many it would skip before submitting. */
+  skipped: number;
+}
+
 export interface KeeperHistoryResponse {
   passes: KeeperPassSummary[];
+  /**
+   * Unix timestamp (seconds) when the keeper last completed a pass without
+   * throwing. Null until the first successful pass, or when the keeper is
+   * not running. A watchdog can alert when this is null or too far in the
+   * past relative to `KEEPER_INTERVAL_MS` (#258).
+   */
+  lastSuccessfulRunAt: number | null;
 }
 
 export interface DuePage {
@@ -553,6 +610,12 @@ export interface WebhookSummary {
   /** Unix seconds of the last failed delivery attempt, if any. */
   lastAttempt: number | null;
   lastStatus: number | null;
+  /** True while this endpoint's circuit is open and deliveries are paused. */
+  paused: boolean;
+  /** Unix seconds when the cooldown ends; null while closed or in half-open state. */
+  pausedUntil: number | null;
+  /** The endpoint circuit: open, half-open after cooldown, or closed. */
+  circuitState: "open" | "half-open" | "closed";
   /** Unix seconds. */
   createdAt: number;
 }
@@ -582,6 +645,7 @@ export interface WebhookTestResult {
   /** The endpoint's HTTP status; null when no response arrived. */
   statusCode: number | null;
   latencyMs: number;
+  /** Sanitized failure category; never contains receiver or transport text. */
   error: string | null;
   nextRetryAt: number | null;
 }
@@ -596,6 +660,7 @@ export interface WebhookDelivery {
   attempt: number;
   status: WebhookDeliveryStatus;
   statusCode: number | null;
+  /** Sanitized failure category; never contains receiver or transport text. */
   error: string | null;
   /** Unix seconds of the retry this attempt scheduled; null unless `pending`. */
   nextRetryAt: number | null;
@@ -617,7 +682,10 @@ export interface AuthChallengeResponse {
 
 /** `POST /api/auth`: a SEP-10 JWT, sent as `Authorization: Bearer <token>`. */
 export interface AuthTokenResponse {
+  /** A JWT to send as `Authorization: Bearer <token>` to merchant-only routes. */
   token: string;
+  /** A refresh token, returned once: rotate it at `POST /api/auth/rotate` for a new JWT and the next refresh token. */
+  refresh_token: string;
 }
 
 export interface StatsResponse {
@@ -660,6 +728,13 @@ export interface HealthResponse {
     eventsLedger: number;
     /** Ledgers the projection trails the raw event stream by. */
     eventsLag: number;
+    /**
+     * Days raw events are kept before they are pruned. Zero means indefinite.
+     * Null when the indexer has not reported the policy yet.
+     */
+    rawEventRetentionDays: number | null;
+    /** Unix seconds when the last automatic prune completed; null until the first prune. */
+    lastPrunedAt: number | null;
   } | null;
   rpc?: {
     active: string;
@@ -670,6 +745,17 @@ export interface HealthResponse {
     vault: string;
     subscription: string;
   };
+  /**
+   * Keeper staleness information. Present when the keeper is running in this
+   * process; null when the keeper is disabled or not attached (#258).
+   */
+  keeper?: {
+    /**
+     * Unix timestamp (seconds) when the keeper last completed a pass without
+     * throwing. Null until the first successful pass.
+     */
+    lastSuccessfulRunAt: number | null;
+  } | null;
   networks?: Record<string, HealthResponse>;
 }
 

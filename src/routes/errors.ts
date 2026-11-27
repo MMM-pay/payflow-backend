@@ -17,6 +17,7 @@ export type ApiErrorCode =
   | "invalid_ids"
   | "too_many_ids"
   | "invalid_request"
+  | "payload_too_large"
   | "invalid_token_id"
   | "token_metadata_unavailable"
   | "unauthorized"
@@ -33,6 +34,8 @@ export type ApiErrorCode =
   | "audit_unavailable"
   | "vacuum_unavailable"
   | "vacuum_failed"
+  | "retention_unavailable"
+  | "retention_failed"
   | "internal_error";
 
 /**
@@ -87,6 +90,7 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   invalid_ids: "The `ids` parameter must be a comma-separated list of positive integers.",
   too_many_ids: "The `ids` parameter accepts at most 100 mandate ids.",
   invalid_request: "The request parameters are not valid.",
+  payload_too_large: "The request body exceeds the allowed size.",
   invalid_token_id: "The token id must be `native` or a contract address.",
   token_metadata_unavailable: "The token contract's metadata could not be read; try again.",
   unauthorized: "A valid bearer token is required for this endpoint.",
@@ -97,6 +101,8 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   audit_unavailable: "The audit log is not available on this instance.",
   vacuum_unavailable: "Database maintenance is not available on this instance.",
   vacuum_failed: "The database maintenance operation failed.",
+  retention_unavailable: "The retention policy endpoint is not available on this instance.",
+  retention_failed: "The retention policy query failed.",
   keeper_unavailable: "The keeper is not available on this instance.",
   indexer_unavailable: "Runtime indexer control is not available on this instance.",
   reindex_failed: "The reindex action failed.",

@@ -3,14 +3,14 @@ import type { Storage } from "../lib/store/types.ts";
 import { churnBucketSize } from "../lib/churn.ts";
 import { getProtocolFeeHistory, getProtocolFees } from "../lib/queries.ts";
 import { DEFAULT_REVENUE_BUCKETS, MAX_REVENUE_BUCKETS } from "./helpers.ts";
-import { bucketSchema, limitSchema, present, validate } from "./validate.ts";
+import { bucketSchema, limitSchema, present, queryOnly, validate } from "./validate.ts";
 import type { ProtocolFeesResponse, ProtocolResponse } from "./types.ts";
 
 /** `GET /protocol`: latest indexed fee and its change history. */
 export function protocolRouter(db: Storage): Router {
   const r = Router();
 
-  r.get("/protocol", async (_req, res) => {
+  r.get("/protocol", queryOnly(), async (_req, res) => {
     const body: ProtocolResponse = await getProtocolFeeHistory(db);
     res.json(body);
   });
@@ -22,7 +22,7 @@ export function protocolRouter(db: Storage): Router {
    * `bucket` defaults to `month`, and `limit` is how many of the most recent
    * buckets to report, capped like the merchant revenue report's.
    */
-  r.get("/protocol/fees", async (req, res) => {
+  r.get("/protocol/fees", queryOnly("bucket", "limit"), async (req, res) => {
     const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
     if (!bucket.ok) return;
     const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));

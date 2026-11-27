@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { after, describe, test } from "node:test";
 import { nativeToScVal, rpc } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "../src/config.ts";
-import type { IndexerRpc } from "../src/indexer.ts";
 import { openDatabase, readCursor, writeCursor } from "../src/lib/db.ts";
 import { acquireLock, DatabaseLockedError, lockHolder, lockPathFor } from "../src/lib/lock.ts";
 import { backupPathFor, reindex } from "../src/lib/reindex.ts";
+import { Indexer, type IndexerRpc } from "../src/indexer.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const CONTRACT = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
@@ -170,5 +170,49 @@ describe("reindex", () => {
     const result = await reindex(net(path), fakeRpc([planCreated(150, 1)], 200));
     assert.equal(result.backup, null);
     assert.equal(result.events, 1);
+  });
+
+  test("full reindex reproduces incremental projection parity", async () => {
+    const path = dbPath();
+    const events = [planCreated(150, 1), planCreated(160, 2)];
+
+    const incremental = openDatabase(":memory:");
+    const incrementalIndexer = new Indexer(incremental, fakeRpc(events, 200), net(":memory:", 100));
+    await incrementalIndexer.catchUp();
+
+    const tables = [
+      "plans",
+      "mandates",
+      "plan_active_subscribers",
+      "plan_subscriber_counts",
+      "charges",
+      "vault_events",
+      "fee_history",
+      "mandate_events",
+      "mandate_timeline",
+      "contract_upgrades",
+      "merchant_profiles",
+    ];
+    const snapshot = (database: ReturnType<typeof openDatabase>) => Object.fromEntries(
+      tables.map((table) => [
+        table,
+        (database.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[])
+          .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+      ]),
+    );
+
+    const expected = snapshot(incremental);
+    incremental.close();
+
+    await reindex(net(path, 100), fakeRpc(events, 200));
+    const rebuilt = openDatabase(path);
+    assert.deepEqual(snapshot(rebuilt), expected);
+
+    await reindex(net(path, 100), fakeRpc(events, 200));
+    const rebuiltAgain = openDatabase(path);
+    assert.deepEqual(snapshot(rebuiltAgain), expected, "repeated full reindex remains deterministic");
+
+    rebuiltAgain.close();
+    rebuilt.close();
   });
 });

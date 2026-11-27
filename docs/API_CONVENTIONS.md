@@ -109,6 +109,12 @@ N buckets.
 
 ## Error responses
 
+Routes validate path parameters, supported query parameters and request bodies
+before doing downstream work. Query parameters not listed for an endpoint,
+repeated query values, malformed JSON, and unexpected body fields are rejected
+with `400 invalid_request`. Numeric query values must use their documented
+decimal form; the API does not parse exponent or hexadecimal notation.
+
 All errors share the same envelope:
 
 ```json
@@ -117,14 +123,14 @@ All errors share the same envelope:
     "code": "invalid_request",
     "message": "Human-readable description",
     "requestId": "uuid",
-    "fields": [
+    "details": [
       { "path": "limit", "message": "must be a positive integer" }
     ]
   }
 }
 ```
 
-`fields` is present only on `400 invalid_request` responses and lists each
+`details` is present only on `400 invalid_request` responses and lists each
 invalid parameter. Common codes:
 
 | HTTP status | `code` | Meaning |

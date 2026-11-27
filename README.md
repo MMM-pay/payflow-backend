@@ -1,8 +1,11 @@
 <h1 align="center">Payflow â€” Backend</h1>
 
+
 <p align="center">
   <strong>Event indexer, settlement keeper, and read API for the Payflow protocol.</strong>
 </p>
+
+
 
 <p align="center">
   <a href="https://github.com/MMM-pay/payflow-backend/actions/workflows/ci.yml">
@@ -18,9 +21,11 @@
 > **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 > **Database schema:** [docs/DATABASE.md](docs/DATABASE.md) ·
 > **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md) ·
+> **Keeper operations:** [docs/KEEPER_RUNBOOK.md](docs/KEEPER_RUNBOOK.md) ·
 > **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) ·
 > **API conventions:** [docs/API_CONVENTIONS.md](docs/API_CONVENTIONS.md) ·
 > **API changelog:** [API_CHANGELOG.md](API_CHANGELOG.md)
+
 
 ---
 
@@ -41,6 +46,8 @@ what this service is for. It does three jobs:
 Merchant summaries and token metadata are cached to reduce repeated projection and RPC work. Without `REDIS_URL`, the service uses a bounded in-memory cache per process. When `REDIS_URL` is set, it uses Redis so multiple API instances can share cache entries. Indexer event application and reconcile repairs invalidate affected merchant summary keys.
 
 ### The keeper is not a trust dependency
+
+
 
 `charge` is permissionless on-chain. This keeper holds no user funds and has no
 privileged role â€” it only pays the transaction fee to trigger settlement. If it
@@ -158,6 +165,8 @@ Run one settlement pass and exit (needs `KEEPER_SECRET`):
 npm run keeper
 ```
 
+
+
 Answer the questions an incident asks, without writing SQL (see
 [the operator CLI](#the-operator-cli)):
 
@@ -263,12 +272,19 @@ in the builder, production dependencies only in the final image.
   (the ledger the contracts were deployed at); with neither, the oldest ledger
   the RPC node still serves. A cursor older than the node's retention window is
   moved forward with a warning, since RPC rejects ranges that start before it.
-- **Exact ranges.** Each pass reads `[cursor, cursor + 8000)` windows and
-  never a ledger the RPC node is still closing. Up to
-  `INDEXER_FETCH_CONCURRENCY` windows are fetched at once, but they are
-  applied in ledger order and the cursor advances only after a window is
+- **Exact ranges.** Each pass reads `[cursor, cursor + INDEXER_BATCH_SIZE)`
+  batches and never a ledger the RPC node is still closing. Up to
+  `INDEXER_FETCH_CONCURRENCY` batches are fetched at once, but they are
+  applied in ledger order and the cursor advances only after a batch is
   applied. Paging continues until a page is empty or passes the range end: a
   short page does not mean the range is exhausted.
+- **One transaction per batch.** A batch's raw events, its projection rows and
+  its cursor are written in one transaction, and within it each ledger is
+  written together: one multi-row `INSERT OR IGNORE` carries a ledger's raw
+  events instead of one round trip per event. Batching the whole pass into one
+  transaction was rejected on purpose: a fetch failure after some batches have
+  been applied must leave their cursor in place, so the next pass resumes at the
+  failed one instead of re-reading everything.
 - **Catch-up progress is logged at a steady cadence.** Each time the cursor
   moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000) the indexer logs
   one `indexer progress` line with `network`, `cursor`, `latest`, `behind`,
@@ -497,7 +513,13 @@ flight. Unset, it is one per channel — the behaviour before the cap existed.
   in a loop.
 - **Shutdown.** On `SIGTERM`/`SIGINT` the keeper takes no new mandates; the
   transactions in flight finish and are recorded before the process exits
-  (bounded by `SHUTDOWN_TIMEOUT_MS`).
+  (bounded by `SHUTDOWN_TIMEOUT_MS`). This holds for the long-running process
+  (including a pass triggered from `/admin`) and for the one-shot
+  `npm run keeper` command. Charges claimed but not yet submitted when the
+  signal lands are released at once, so another keeper can settle them
+  without waiting out `KEEPER_CLAIM_TTL_S`; a charge still stuck at the
+  deadline is abandoned, the one-shot command exits non-zero, and its claim
+  lapses after the TTL.
 
 `payflow_keeper_in_flight` reports the transactions in flight right now, and
 each `mandate settled` log line names the channel (public key) that signed it.
@@ -683,6 +705,7 @@ deployment that does not scrape them should not expose them.
 | `payflow_active_merchants` | gauge | Merchants with at least one active mandate |
 | `payflow_mrr` | gauge | Monthly recurring revenue of the active mandates, normalised to a 30-day month |
 | `payflow_events_applied_total` | counter | Contract events applied to the projection |
+| `payflow_charges_attempted_total` | counter | Charges the keeper attempted to settle on-chain |
 | `payflow_charges_settled_total` | counter | Charges the keeper settled |
 | `payflow_charges_failed_total` | counter | Charges the keeper could not settle |
 | `payflow_keeper_passes_total` | counter | Keeper passes run |
@@ -962,8 +985,11 @@ verification fails; do not parse or process it first. The same delivery keeps
 its `Idempotency-Key` across retries, so handlers should deduplicate that key.
 
 Failing deliveries retry with exponential backoff (1 minute, doubling, up to
-six hours) for at most five attempts. A webhook that gives up is marked
-failed and stops receiving deliveries until re-registered. Undelivered
+six hours) for repeated failures. After `WEBHOOK_CIRCUIT_FAILURE_THRESHOLD`
+consecutive failures (five by default), the endpoint circuit opens for
+`WEBHOOK_CIRCUIT_COOLDOWN_S` seconds (15 minutes by default). It then allows
+one half-open probe; success resumes delivery and failure reopens the circuit.
+Undelivered
 deliveries are retried on a short cadence, so a silent indexer still makes
 delivery progress.
 
@@ -1025,6 +1051,7 @@ the server's public key as `SIGNING_KEY` and the endpoint as
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
 | `too_many_ids` | 400 | `?ids=` lists more than 100 ids |
 | `invalid_request` | 400 | A query or path parameter is not valid; `error.details` says which |
+| `payload_too_large` | 413 | A JSON or SEP-10 form request body exceeds the 64 KB limit |
 | `invalid_token_id` | 400 | `GET /api/tokens/:id` with a malformed contract id |
 | `token_metadata_unavailable` | 502 | `GET /api/tokens/:id` while the token contract cannot be read |
 | `rate_limited` | 429 | API request exceeded the configured per-IP limit; includes `Retry-After` |
@@ -1208,7 +1235,8 @@ examined without API downtime.
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `KEEPER_MAX_CHARGES_PER_RUN` | `25` | Most mandates one keeper pass settles, across every channel and batch (1–1000). A large backlog is spread over later passes |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
-| `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
+| `INDEXER_BATCH_SIZE` | `8000` | Ledgers one batch reads and applies before the cursor moves (1–8000, the RPC's getEvents window) |
+| `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger batches one pass may fetch at once (max 16). Applied in order; `1` is sequential |
 | `INDEXER_PROGRESS_LEDGERS` | `10000` | Ledgers between two `indexer progress` log lines (cursor, lag, events, ledgers per second); `0` turns them off |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
@@ -1216,19 +1244,24 @@ examined without API downtime.
 | `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
 | `DATABASE_URL` | — | `postgres://` or `postgresql://` connection string; when set, PostgreSQL is used instead of SQLite |
+| `DATABASE_POOL_MAX` | `10` | PostgreSQL connections per process (1–100); every API, indexer and keeper process holds its own pool |
+| `DATABASE_ACQUIRE_TIMEOUT_MS` | `10000` | How long a query waits for a free connection before failing with a `DATABASE_ACQUIRE_TIMEOUT_MS` error |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `30000` | `statement_timeout` sent to PostgreSQL with every connection, so a runaway query is cancelled server-side |
 | `REDIS_URL` | — | Optional `redis://`/`rediss://` shared cache for merchant summaries and token metadata; defaults to in-memory cache |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
 | `API_RATE_LIMIT_MAX` | `120` | Maximum requests per IP in each API rate-limit window |
 | `METRICS_ENABLED` | `false` | Serve the Prometheus metrics at `/metrics` |
-| `CORS_ORIGIN` | `*` | Comma-separated allowed origins |
+| `CORS_ORIGIN` | *(empty)* | Comma-separated exact browser origins allowed to call the API (`https://app.example`). Empty refuses cross-origin reads; `*` allows every origin. SEP-10 always answers `*` |
 | `REQUIRE_HTTPS` | on when `NODE_ENV=production` | Reject plaintext requests with `403 forbidden`, judged by the proxy's `X-Forwarded-Proto`. `/health`, `/ready` and `/metrics` are exempt for platform probes |
 | `HSTS_MAX_AGE_S` | `31536000` | `Strict-Transport-Security` max-age (with `includeSubDomains`); `0` drops the header |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP/HTTP collector base URL. Unset disables tracing at no cost |
 | `SHUTDOWN_TIMEOUT_MS` | `15000` | How long shutdown waits for in-flight passes |
 | `ADMIN_TOKEN` | — | Bearer token for `/admin`. Unset keeps those routes disabled |
 | `WEBHOOK_SECRET_OVERLAP_S` | `86400` | Seconds a rotated webhook secret keeps signing beside the new one (0–604800) |
+| `WEBHOOK_CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures that pause deliveries to one webhook endpoint (1–100) |
+| `WEBHOOK_CIRCUIT_COOLDOWN_S` | `900` | Seconds an open webhook circuit is paused before a half-open retry (1–604800) |
 | `SEP10_SIGNING_KEY` | — | Secret seed of the SEP-10 server account. Unset keeps `/api/auth` disabled |
 | `SEP10_JWT_SECRET` | — | HMAC key for SEP-10 JWTs, at least 32 characters; required with `SEP10_SIGNING_KEY` |
 | `SEP10_HOME_DOMAIN` | — | Home domain of the challenge (`<home domain> auth`); required with `SEP10_SIGNING_KEY` |
@@ -1283,7 +1316,10 @@ MAINNET_SUBSCRIPTION_ID=C...
 MAINNET_INDEXER_START_LEDGER=5110418
 ```
 
-Each network runs its own indexer with its own cursor and projection. With
+Each network runs its own indexer with its own cursor, projection and poll
+cadence: `<NAME>_INDEXER_INTERVAL_MS` and `<NAME>_INDEXER_BATCH_SIZE` override
+the defaults for that network only, so a busy mainnet indexer can keep the
+8,000-ledger batches while a quiet testnet polls less often. With
 `DATABASE_URL`, each network is isolated in its own PostgreSQL schema; otherwise
 it uses a SQLite file derived from `DATABASE_PATH` (`./payflow.db` becomes
 `./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise. Ledger

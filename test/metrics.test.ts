@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
-import { nativeToScVal, type rpc } from "@stellar/stellar-sdk";
+import { Account, Keypair, nativeToScVal, rpc, type Transaction } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { asStorage } from "../src/lib/store/index.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
-import { metrics, MetricsRegistry, publishBusinessMetrics } from "../src/lib/metrics.ts";
+import { Keeper, type KeeperRpc } from "../src/keeper.ts";
+import { metrics, MetricsRegistry, publishBuildInfo, publishBusinessMetrics, DEFAULT_MAX_SERIES } from "../src/lib/metrics.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 
 /**
@@ -185,6 +186,7 @@ describe("GET /metrics", () => {
       "payflow_active_merchants",
       "payflow_mrr",
       "payflow_events_applied_total",
+      "payflow_charges_attempted_total",
       "payflow_charges_settled_total",
       "payflow_charges_failed_total",
       "payflow_keeper_passes_total",
@@ -221,6 +223,119 @@ describe("the metrics the loops publish", () => {
     assert.equal(metrics.value("indexer_lag", { network: "testnet" }), 11_999);
     assert.equal(metrics.value("events_applied", { network: "testnet" }), 1);
     metrics.reset();
+  });
+
+  test("a keeper pass increments charges_attempted, charges_settled and charges_failed", async () => {
+    metrics.reset();
+    const keeperDb = openDatabase(":memory:");
+    const keeperKey = Keypair.random();
+    const contract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+    for (const id of [1, 2]) {
+      keeperDb
+        .prepare(
+          `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
+           VALUES (?, ?, ?, 1, '10', 60, ?, 'Active', 1)`,
+        )
+        .run(id, SUBSCRIBER, MERCHANT, 999 + id);
+    }
+    let sends = 0;
+    const keeperRpc: KeeperRpc = {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
+      getAccount: async (address: string) => new Account(address, "1") as never,
+      prepareTransaction: async (tx) => tx as Transaction,
+      sendTransaction: async (tx) => {
+        sends += 1;
+        if (sends === 2) {
+          return { status: "ERROR", errorResult: "tx rejected" } as never;
+        }
+        const hash = Buffer.from((tx as Transaction).hash()).toString("hex");
+        return { status: "PENDING", hash } as never;
+      },
+      getTransaction: async () =>
+        ({ status: rpc.Api.GetTransactionStatus.SUCCESS }) as never,
+    };
+    const keeper = new Keeper(keeperDb, keeperRpc, {
+      PLAN_REGISTRY_ID: contract,
+      VAULT_ID: contract,
+      SUBSCRIPTION_ID: contract,
+      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+      KEEPER_SECRET: keeperKey.secret(),
+      KEEPER_FEE_PERCENTILE: "90",
+      KEEPER_MAX_FEE: "100000",
+      KEEPER_BATCH: false,
+      KEEPER_BATCH_SIZE: 10,
+      KEEPER_BACKOFF_JITTER: 0,
+    } as unknown as Config);
+
+    try {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(
+        results.map((r) => r.status),
+        ["settled", "failed"],
+      );
+      assert.equal(metrics.value("keeper_passes"), 1);
+      assert.equal(metrics.value("charges_attempted"), 2);
+      assert.equal(metrics.value("charges_settled"), 1);
+      assert.equal(metrics.value("charges_failed"), 1);
+      const rendered = metrics.render();
+      assert.match(rendered, /^payflow_charges_attempted_total 2$/m);
+      assert.match(rendered, /^payflow_charges_settled_total 1$/m);
+      assert.match(rendered, /^payflow_charges_failed_total 1$/m);
+    } finally {
+      keeperDb.close();
+      metrics.reset();
+    }
+  });
+
+  test("a keeper dry run does not increment charge outcome counters", async () => {
+    metrics.reset();
+    const keeperDb = openDatabase(":memory:");
+    const keeperKey = Keypair.random();
+    const contract = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+    keeperDb
+      .prepare(
+        `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
+         VALUES (1, ?, ?, 1, '10', 60, 1000, 'Active', 1)`,
+      )
+      .run(SUBSCRIBER, MERCHANT);
+    const keeperRpc: KeeperRpc = {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "1000" } }) as never,
+      getAccount: async (address: string) => new Account(address, "1") as never,
+      prepareTransaction: async (tx) => tx as Transaction,
+      sendTransaction: async () => {
+        throw new Error("sendTransaction must not run in dry-run mode");
+      },
+      getTransaction: async () =>
+        ({ status: rpc.Api.GetTransactionStatus.SUCCESS }) as never,
+    };
+    const keeper = new Keeper(keeperDb, keeperRpc, {
+      PLAN_REGISTRY_ID: contract,
+      VAULT_ID: contract,
+      SUBSCRIPTION_ID: contract,
+      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+      KEEPER_SECRET: keeperKey.secret(),
+      KEEPER_FEE_PERCENTILE: "90",
+      KEEPER_MAX_FEE: "100000",
+      KEEPER_DRY_RUN: true,
+      KEEPER_BATCH: false,
+      KEEPER_BATCH_SIZE: 10,
+      KEEPER_BACKOFF_JITTER: 0,
+    } as unknown as Config);
+
+    try {
+      const results = await keeper.tick(10_000);
+      assert.deepEqual(
+        results.map((r) => r.status),
+        ["simulated"],
+      );
+      assert.equal(metrics.value("keeper_passes"), undefined);
+      assert.equal(metrics.value("charges_attempted"), undefined);
+      assert.equal(metrics.value("charges_settled"), undefined);
+      assert.equal(metrics.value("charges_failed"), undefined);
+    } finally {
+      keeperDb.close();
+      metrics.reset();
+    }
   });
 });
 
@@ -412,5 +527,112 @@ describe("HTTP request metrics", () => {
     ]);
     const twoxx = metrics.value("http_requests", { method: "GET", status_class: "2xx" }) as number;
     assert.ok(typeof twoxx === "number" && twoxx >= 3, `expected >= 3 GET 2xx, got ${twoxx}`);
+  });
+});
+
+describe("the build-info gauge (issue #290)", () => {
+  test("publishBuildInfo sets build_info to 1 with version, commit and node_version labels", () => {
+    const registry = new MetricsRegistry();
+    registry.set("build_info", 1, { version: "0.2.0", commit: "abc1234", node_version: "v22.5.0" });
+    assert.equal(registry.value("build_info", { version: "0.2.0", commit: "abc1234", node_version: "v22.5.0" }), 1);
+    const rendered = registry.render();
+    assert.match(rendered, /payflow_build_info\{/);
+    assert.match(rendered, /commit="abc1234"/);
+    assert.match(rendered, /version="0\.2\.0"/);
+    assert.match(rendered, /node_version="v22\.5\.0"/);
+    assert.match(rendered, /\} 1$/m);
+  });
+
+  test("publishBuildInfo is idempotent: a second call does not add a second series", () => {
+    metrics.reset();
+    publishBuildInfo({ version: "0.1.0", commit: "aaa", nodeVersion: "v22.0.0" });
+    publishBuildInfo({ version: "0.2.0", commit: "bbb", nodeVersion: "v22.5.0" });
+    // maxSeries:1 means only the first call registers; the second is dropped.
+    const rendered = metrics.render();
+    const lines = rendered.split("\n").filter((l) => l.startsWith("payflow_build_info{"));
+    assert.equal(lines.length, 1, "only one build_info series");
+    metrics.reset();
+  });
+
+  test("the /metrics endpoint includes payflow_build_info", async () => {
+    const app = createApp(
+      [{ config: testnet, db }],
+      { ...config, METRICS_ENABLED: true } as Config,
+    );
+    const local = await new Promise<Server>((resolve) => {
+      const s = app.listen(0, () => resolve(s));
+    });
+    try {
+      const addr = local.address();
+      const url = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+      const body = await (await fetch(`${url}/metrics`)).text();
+      assert.match(body, /# HELP payflow_build_info/);
+      assert.match(body, /# TYPE payflow_build_info gauge/);
+      assert.match(body, /payflow_build_info\{/);
+    } finally {
+      local.close();
+    }
+  });
+});
+
+describe("cardinality cap (issue #291)", () => {
+  test("DEFAULT_MAX_SERIES is a positive integer", () => {
+    assert.ok(typeof DEFAULT_MAX_SERIES === "number" && DEFAULT_MAX_SERIES > 0);
+  });
+
+  test("a metric accepts up to its maxSeries cap and silently drops additional series", () => {
+    const registry = new MetricsRegistry([
+      { key: "my_counter", name: "my_counter_total", help: "test", type: "counter", maxSeries: 3 },
+    ]);
+    registry.increment("my_counter", 1, { id: "1" });
+    registry.increment("my_counter", 1, { id: "2" });
+    registry.increment("my_counter", 1, { id: "3" });
+    // This one is over the cap and must be dropped.
+    registry.increment("my_counter", 1, { id: "4" });
+
+    assert.equal(registry.value("my_counter", { id: "1" }), 1);
+    assert.equal(registry.value("my_counter", { id: "2" }), 1);
+    assert.equal(registry.value("my_counter", { id: "3" }), 1);
+    assert.equal(registry.value("my_counter", { id: "4" }), undefined, "over-cap series must be absent");
+    const rendered = registry.render();
+    const dataLines = rendered.split("\n").filter((l) => l.startsWith("my_counter_total{"));
+    assert.equal(dataLines.length, 3, "exactly cap many series in the render");
+  });
+
+  test("incrementing an existing series always works, even after the cap is reached", () => {
+    const registry = new MetricsRegistry([
+      { key: "c", name: "c_total", help: "test", type: "counter", maxSeries: 1 },
+    ]);
+    registry.increment("c", 1, { x: "a" });
+    // Cap is now full.
+    registry.increment("c", 1, { x: "b" }); // dropped
+    // But the existing series must still accumulate.
+    registry.increment("c", 5, { x: "a" });
+    assert.equal(registry.value("c", { x: "a" }), 6);
+    assert.equal(registry.value("c", { x: "b" }), undefined);
+  });
+
+  test("set respects the cardinality cap", () => {
+    const registry = new MetricsRegistry([
+      { key: "g", name: "g", help: "test", type: "gauge", maxSeries: 2 },
+    ]);
+    registry.set("g", 1, { n: "a" });
+    registry.set("g", 2, { n: "b" });
+    registry.set("g", 3, { n: "c" }); // dropped
+    assert.equal(registry.value("g", { n: "a" }), 1);
+    assert.equal(registry.value("g", { n: "b" }), 2);
+    assert.equal(registry.value("g", { n: "c" }), undefined);
+  });
+
+  test("reset clears the series count so the metric accepts new series again", () => {
+    const registry = new MetricsRegistry([
+      { key: "c2", name: "c2_total", help: "test", type: "counter", maxSeries: 1 },
+    ]);
+    registry.increment("c2", 1, { x: "a" });
+    registry.increment("c2", 1, { x: "b" }); // dropped
+    assert.equal(registry.value("c2", { x: "b" }), undefined);
+    registry.reset();
+    registry.increment("c2", 7, { x: "b" });
+    assert.equal(registry.value("c2", { x: "b" }), 7, "after reset the cap slot is free again");
   });
 });

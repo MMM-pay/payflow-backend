@@ -1,18 +1,20 @@
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { openDatabase } from "../db.ts";
+import { SQLITE_QUERIES } from "./sqlite.queries.ts";
 import type { SqlParameters, Storage } from "./types.ts";
 
 function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
-  for (const [key, value] of Object.entries(row)) {
+  const normalized = { ...row };
+  for (const [key, value] of Object.entries(normalized)) {
     if (
       typeof value === "bigint" &&
       value <= BigInt(Number.MAX_SAFE_INTEGER) &&
       value >= BigInt(Number.MIN_SAFE_INTEGER)
     ) {
-      row[key] = Number(value);
+      normalized[key] = Number(value);
     }
   }
-  return row;
+  return normalized;
 }
 
 class SqliteTransaction implements Storage {
@@ -91,12 +93,12 @@ export class SqliteStorage implements Storage {
     });
     await previous;
     try {
-      this.database.exec("BEGIN");
+      this.database.exec(SQLITE_QUERIES.beginTransaction);
       const result = await work(new SqliteTransaction(this.database));
-      this.database.exec("COMMIT");
+      this.database.exec(SQLITE_QUERIES.commitTransaction);
       return result;
     } catch (err) {
-      this.database.exec("ROLLBACK");
+      this.database.exec(SQLITE_QUERIES.rollbackTransaction);
       throw err;
     } finally {
       release();

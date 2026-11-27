@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test, describe, before, after } from "node:test";
-import type { Server } from "node:http";
+import { request as httpRequest, type Server } from "node:http";
 import { Keypair } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp } from "../src/app.ts";
@@ -10,6 +10,7 @@ import type { DecodedEvent } from "../src/lib/stellar.ts";
 import type { AdminHooks } from "../src/routes/admin.ts";
 import type { WebhookDispatcher } from "../src/lib/webhooks.ts";
 import { Sep10Auth } from "../src/routes/auth.ts";
+import { SqliteStorage } from "../src/lib/store/sqlite.ts";
 import { testAddress } from "./addresses.ts";
 
 /**
@@ -39,7 +40,7 @@ const MERCHANT = testAddress(101);
 const SUBSCRIBER = testAddress(102);
 const UNKNOWN_MERCHANT = testAddress(103);
 /** A well-formed contract id whose metadata cannot be read without an RPC. */
-const UNREADABLE_TOKEN = "C".repeat(56);
+const UNREADABLE_TOKEN = "CDQ5EJTVXXX2CBMHWP3BGGUDHSK6D4I25IF5XXH3QGL2TNTBMJUOFKDB";
 const ADMIN_TOKEN = "error-envelope-operator-token";
 const NOW = Math.floor(Date.now() / 1000);
 /** 64 bytes of base64: the right shape, the wrong signer. */
@@ -83,6 +84,8 @@ function testAuth(): Sep10Auth {
     networkPassphrase: testnet.networkPassphrase,
     issuer: "https://payflow.test/api/testnet/auth",
     tokenTtlS: 3_600,
+    refreshTtlS: 86_400,
+    db: SqliteStorage.open(":memory:"),
     loadAccount: async () => null,
   });
 }
@@ -269,6 +272,11 @@ const CASES: ErrorCase[] = [
   { method: "GET", path: "/api/v1/plans?limit=0", status: 400, code: "invalid_request", detailPath: "limit" },
   { method: "GET", path: "/api/v1/plans?sort=alphabetical", status: 400, code: "invalid_request", detailPath: "sort" },
   { method: "GET", path: "/api/v1/plans?cursor=not-a-cursor", status: 400, code: "invalid_request", detailPath: "cursor" },
+  { method: "GET", path: "/api/v1/plans?limit=1&limit=2", status: 400, code: "invalid_request", detailPath: "query" },
+  { method: "GET", path: "/api/v1/plans?sort=subscribers&offset=0", status: 400, code: "invalid_request", detailPath: "query" },
+  { method: "GET", path: `/api/v1/plans?q=${"x".repeat(257)}`, status: 400, code: "invalid_request", detailPath: "q" },
+  { method: "GET", path: "/api/v1/stats?limit=10", status: 400, code: "invalid_request", detailPath: "query" },
+  { method: "GET", path: "/health?debug=true", status: 400, code: "invalid_request", detailPath: "query" },
   { method: "GET", path: "/api/v1/plans/not-an-id", status: 400, code: "invalid_request", detailPath: "id" },
   { method: "GET", path: "/api/plans/not-an-id", status: 400, code: "invalid_request", detailPath: "id" },
   { method: "GET", path: "/api/v1/plans/999999", status: 404, code: "plan_not_found" },
@@ -351,6 +359,7 @@ const CASES: ErrorCase[] = [
   { method: "GET", path: `/api/v1/auth?account=${MERCHANT}&home_domain=evil.example`, status: 400, code: "invalid_request", detailPath: "home_domain" },
   { method: "POST", path: "/api/v1/auth", status: 400, code: "invalid_request", body: {} },
   { method: "POST", path: "/api/v1/auth", status: 400, code: "invalid_request", detailPath: "transaction", body: { transaction: "not-an-xdr" } },
+  { method: "POST", path: "/api/v1/auth", status: 400, code: "invalid_request", detailPath: "body", body: { transaction: "not-an-xdr", unexpected: true } },
 
   // Webhooks: registration, listing, deletion, rotation, test and deliveries.
   { method: "POST", path: "/api/v1/webhooks", status: 400, code: "invalid_request", detailPath: "body" },
@@ -419,6 +428,20 @@ describe("route error responses", () => {
       await assertErrorEnvelope(res, row, `${row.method} ${row.path}`);
     });
   }
+
+  test("malformed JSON returns a safe 400 error envelope", async () => {
+    const res = await fetch(`${base}/api/v1/auth`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{",
+    });
+    const body = await assertErrorEnvelope(
+      res,
+      { status: 400, code: "invalid_request" },
+      "malformed JSON",
+    );
+    assert.doesNotMatch(body.error.message, /transaction|syntax|unexpected/i);
+  });
 
   test("the alias and versioned prefixes answer with the same envelope", async () => {
     const bodies: ErrorEnvelope[] = [];
@@ -556,17 +579,53 @@ describe("rate-limited requests", () => {
   });
 });
 
-/** An unhandled failure is still the same envelope, with fixed copy. */
-describe("unhandled failures", () => {
-  test("answer 500 internal_error without echoing the failure", async () => {
+/** Parser failures use the request-validation envelope and fixed copy. */
+describe("request parser failures", () => {
+  test("read routes reject bodies even when the content type is not parsed", async () => {
+    const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const request = httpRequest(`${base}/api/v1/plans`, {
+        method: "GET",
+        headers: { "content-type": "text/plain", "content-length": "10" },
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+        }));
+      });
+      request.on("error", reject);
+      request.end("unexpected");
+    });
+    assert.equal(result.status, 400);
+    assert.equal(JSON.parse(result.body).error.code, "invalid_request");
+  });
+
+  test("answer 400 invalid_request without echoing the body", async () => {
     const res = await fetch(`${base}/api/v1/plans`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: '{"merchant":"GB343X',
     });
-    const body = await assertErrorEnvelope(res, { status: 500, code: "internal_error" }, "truncated JSON body");
-    assert.equal(body.error.message, "An internal error occurred.");
+    const body = await assertErrorEnvelope(res, { status: 400, code: "invalid_request" }, "truncated JSON body");
+    assert.equal(body.error.message, "The request parameters are not valid.");
     assert.ok(!JSON.stringify(body).includes("GB343X"), "the caller's payload reached the error body");
+  });
+
+  test("reject oversized JSON bodies with 413 without echoing the payload", async () => {
+    const payload = "x".repeat(65_536);
+    const res = await fetch(`${base}/api/v1/auth/rotate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: payload }),
+    });
+    const body = await assertErrorEnvelope(
+      res,
+      { status: 413, code: "payload_too_large" },
+      "oversized JSON body",
+    );
+    assert.equal(body.error.message, "The request body exceeds the allowed size.");
+    assert.ok(!JSON.stringify(body).includes(payload), "the caller's payload reached the error body");
   });
 
   test("the readiness probe is the one documented non-envelope 503", async () => {

@@ -287,7 +287,7 @@ describe("webhook management", () => {
       script.set("https://m.example/ping-down", ["throw"]);
       const unreachable = (await (await ping(hook.id)).json()) as WebhookTestResult;
       assert.equal(unreachable.statusCode, null);
-      assert.equal(unreachable.error, "connect ECONNREFUSED");
+      assert.equal(unreachable.error, "delivery request failed");
     });
 
     test("does not send to a stored URL that now resolves to a private address", async () => {
@@ -297,7 +297,7 @@ describe("webhook management", () => {
       const result = await dispatcher.ping(merchant, hook.id);
 
       assert.equal(result?.status, "pending");
-      assert.match(result?.error ?? "", /public addresses/);
+      assert.equal(result?.error, "delivery request failed");
       assert.equal(calls.length, 0, "the transport was never called");
     });
 

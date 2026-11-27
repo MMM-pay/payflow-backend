@@ -16,6 +16,7 @@ import {
   idSchema,
   limitSchema,
   present,
+  queryOnly,
   validate,
 } from "./validate.ts";
 import { z } from "zod";
@@ -49,7 +50,7 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
     );
   };
 
-  r.get("/plans", async (req, res) => {
+  r.get("/plans", queryOnly("merchant", "q", "cursor", "limit", "sort"), async (req, res) => {
     const merchant = validate(
       req,
       res,
@@ -62,7 +63,7 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
       req,
       res,
       "q",
-      z.string().optional(),
+      z.string().max(256, "must be at most 256 characters").optional(),
       present(req.query.q),
     );
     if (!q.ok) return;
@@ -112,7 +113,7 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
     res.json(body);
   });
 
-  r.get("/plans/:id", async (req, res) => {
+  r.get("/plans/:id", queryOnly(), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
 
@@ -132,7 +133,7 @@ export function plansRouter(db: Storage, tokens: TokenMetadataService): Router {
   /** `GET /plans/:id/stats`: active and total mandates, cancellations, gross
    * collected, average charges per mandate, and the average and median
    * lifetime value per subscriber net of fee. */
-  r.get("/plans/:id/stats", async (req, res) => {
+  r.get("/plans/:id/stats", queryOnly(), async (req, res) => {
     const id = validate(req, res, "id", idSchema, req.params.id);
     if (!id.ok) return;
     const planId = id.value;

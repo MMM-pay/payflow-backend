@@ -16,7 +16,7 @@
  */
 import { StrKey } from "@stellar/stellar-sdk";
 import { z } from "zod";
-import type { Request, Response } from "express";
+import type { Request, RequestHandler, Response } from "express";
 import { sendApiError } from "./errors.ts";
 
 /** What is wrong with one parameter. */
@@ -33,6 +33,53 @@ export interface ValidationDetail {
  * it and use the value without a cast.
  */
 export type Validated<T> = { ok: true; value: T } | { ok: false };
+
+export function hasRequestBody(req: Request): boolean {
+  const contentLength = req.headers["content-length"];
+  return (
+    req.body !== undefined ||
+    req.headers["transfer-encoding"] !== undefined ||
+    (contentLength !== undefined && Number(contentLength) > 0)
+  );
+}
+
+/**
+ * Refuse query parameters a route does not accept, repeated values and
+ * unbounded parameter collections before the handler does any work.
+ */
+export function queryOnly(...allowed: string[]): RequestHandler {
+  const accepted = new Set(allowed);
+  return (req, res, next) => {
+    const entries = Object.entries(req.query);
+    const malformed =
+      entries.length > 16 ||
+      entries.some(
+        ([key, value]) =>
+          !accepted.has(key) ||
+          key.length > 64 ||
+          typeof value !== "string" ||
+          value.length > 4_096,
+      );
+    if (malformed) {
+      sendApiError(res, req, 400, "invalid_request", undefined, [
+        { path: "query", message: "contains unsupported or malformed parameters" },
+      ]);
+      return;
+    }
+    next();
+  };
+}
+
+/** Reject request bodies on read-only API routes, which define no body input. */
+export const rejectReadBody: RequestHandler = (req, res, next) => {
+  if ((req.method === "GET" || req.method === "HEAD") && hasRequestBody(req)) {
+    sendApiError(res, req, 400, "invalid_request", undefined, [
+      { path: "body", message: "is not accepted for this route" },
+    ]);
+    return;
+  }
+  next();
+};
 
 /** A Stellar account (`G...`) or contract (`C...`) address. */
 export const addressSchema = z.string().refine(

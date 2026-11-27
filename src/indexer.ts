@@ -4,6 +4,7 @@ import type { Config, NetworkConfig } from "./config.ts";
 import type { Storage } from "./lib/store/types.ts";
 import { asStorage } from "./lib/store/index.ts";
 import { openDatabase } from "./lib/db.ts";
+import { pruneOldEvents } from "./lib/db.ts";
 import { updateActivePlanSubscriber, type ActivePlanSubscriber } from "./lib/plan-subscribers.ts";
 
 export type IndexerConfig = Config | NetworkConfig;
@@ -39,46 +40,49 @@ async function insertRows(
   }
 }
 
-/** One lifecycle row the timeline already holds, newest first. */
-interface LifecycleRow {
-  kind: string;
-  ledger: number;
-  details: string;
-}
-
 /**
- * The status a lifecycle timeline row describes, or null when the row names
- * none. Used to bring a mandate projected after its own lifecycle events back
- * to the state the chain reached: events delivered out of order are still
- * recorded on the timeline as they arrive.
+ * Split a fetched batch into its ledgers, keeping the RPC's ledger order. The
+ * indexer writes each ledger's rows together (#247), so this is the unit the
+ * projection is applied in.
  */
-function lifecycleStatus(row: LifecycleRow): { status: string; endedBy: string | null } | null {
-  switch (row.kind) {
-    case "cancelled":
-      return { status: "Cancelled", endedBy: "subscriber" };
-    case "mandate_ended":
-      return { status: "Cancelled", endedBy: "merchant" };
-    case "mandate_completed":
-      return { status: "Completed", endedBy: null };
-    case "pause_changed": {
-      let paused: unknown;
-      try {
-        paused = (JSON.parse(row.details) as { paused?: unknown }).paused;
-      } catch {
-        return null;
-      }
-      return { status: paused === true ? "Paused" : "Active", endedBy: null };
+function groupByLedger(events: readonly rpc.Api.EventResponse[]): rpc.Api.EventResponse[][] {
+  const ledgers: rpc.Api.EventResponse[][] = [];
+  let current: rpc.Api.EventResponse[] | null = null;
+  for (const event of events) {
+    if (current === null || current[0]!.ledger !== event.ledger) {
+      current = [];
+      ledgers.push(current);
     }
-    default:
-      return null;
+    current.push(event);
   }
+  return ledgers;
 }
 
 /** RPC caps a single getEvents window; stay well inside it. */
-const LEDGER_WINDOW = 8_000;
+const LEDGER_WINDOW_MAX = 8_000;
+/** Ledgers per batch when `INDEXER_BATCH_SIZE` is not set. */
+const DEFAULT_BATCH_SIZE = LEDGER_WINDOW_MAX;
 const PAGE_LIMIT = 200;
+/**
+ * Raw events retained per statement (#247). One multi-row insert per ledger
+ * replaces one round trip per event; the chunk stays far below PostgreSQL's
+ * 65,535-parameter ceiling (8 columns a row).
+ */
+const RETAIN_CHUNK = 200;
 /** Ledgers between two `indexer progress` log lines when none is configured. */
 const DEFAULT_PROGRESS_LEDGERS = 10_000;
+
+/**
+ * The stable identity of a raw delivery: the RPC event id when it has one,
+ * otherwise the same ledger/tx/topic/value digest the `events` table keys on.
+ * A replayed window carries the same id, which is what makes it detectable.
+ */
+function eventIdOf(raw: rpc.Api.EventResponse): string {
+  return (
+    raw.id ??
+    `${raw.ledger}:${raw.txHash}:${raw.topic.map((topic) => topic.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`
+  );
+}
 
 /** The RPC calls the indexer makes. Narrow so tests can supply a fake. */
 export type IndexerRpc = Pick<rpc.Server, "getLatestLedger" | "getHealth" | "getEvents">;
@@ -150,6 +154,19 @@ export interface IndexerStatus {
    * is silently missing on-chain state.
    */
   corrections?: number;
+  /**
+   * How many days raw events are kept before they are pruned. Zero means
+   * events are kept indefinitely. Set by the operator via
+   * `RAW_EVENT_RETENTION_DAYS` (or `DATA_RETENTION_DAYS` as a fallback).
+   * Surfaced on `/health` so a monitoring dashboard can confirm the policy
+   * is what the operator intended. Undefined until the first tick.
+   */
+  rawEventRetentionDays?: number | undefined;
+  /**
+   * Wall-clock timestamp (unix seconds) when the last automatic prune of the
+   * `events` table completed. Null until the first prune pass has run.
+   */
+  lastPrunedAt?: number | null;
 }
 
 export class Indexer {
@@ -170,6 +187,8 @@ export class Indexer {
     paused: false,
     eventsLedger: 0,
     eventsLag: 0,
+    rawEventRetentionDays: undefined,
+    lastPrunedAt: null,
   };
   /** Events since process start that failed spec validation. */
   get mismatchedEvents(): number {
@@ -201,6 +220,47 @@ export class Indexer {
   /** Let passes run again after {@link pause}. */
   resume(): void {
     this.status.paused = false;
+  }
+
+  /**
+   * Effective raw-event retention in days. Reads from
+   * `NetworkConfig.rawEventRetentionDays` when set by `networkConfigs()`
+   * (the production path). Falls back to the env `Config` fields when this
+   * indexer was constructed directly with a full `Config`. Returns `undefined`
+   * when neither is set (e.g. a bare `NetworkConfig` in a unit test), which
+   * means pruning is skipped — retention must be explicitly opt-in.
+   */
+  private get rawEventRetentionDays(): number | undefined {
+    // NetworkConfig carries the resolved value (set by networkConfigs()).
+    if ("rawEventRetentionDays" in this.config && this.config.rawEventRetentionDays !== undefined) {
+      return this.config.rawEventRetentionDays;
+    }
+    // Env Config path (direct test instantiation with a plain Config object).
+    if ("RAW_EVENT_RETENTION_DAYS" in this.config) {
+      return this.config.RAW_EVENT_RETENTION_DAYS ?? this.config.DATA_RETENTION_DAYS;
+    }
+    // Bare NetworkConfig with no retention field: skip pruning.
+    return undefined;
+  }
+
+  /**
+   * Prune raw events older than the configured retention window. Called at
+   * the end of each `tick()` so old events are removed without a separate
+   * cron job. Only prunes when retention is configured (> 0); a 0 value
+   * keeps events indefinitely. Passes the projection cursor as `maxLedger`
+   * so events not yet projected are never pruned (#246). Logs and continues
+   * on failure so the indexer loop is never brought down by a prune error.
+   */
+  private async pruneRawEvents(): Promise<void> {
+    const days = this.rawEventRetentionDays;
+    this.status.rawEventRetentionDays = days ?? 0;
+    if (days === undefined || days === 0) return;
+    try {
+      await pruneOldEvents(this.db, days, { maxLedger: this.status.cursor });
+      this.status.lastPrunedAt = Math.floor(Date.now() / 1000);
+    } catch (err) {
+      logger.warn({ err, days }, "raw event prune failed; will retry on next pass");
+    }
   }
 
   constructor(
@@ -236,6 +296,20 @@ export class Indexer {
    * first pass that reads ledgers.
    */
   private progress: { ledger: number; at: number; applied: number; mismatched: number } | null = null;
+
+  /**
+   * Ledgers one batch reads and applies before the cursor moves (#241). Read
+   * from the environment config or, for a network configured on its own, from
+   * the network. Clamped to the RPC's getEvents window: asking for more than
+   * it serves would make every pass fail.
+   */
+  private get batchSize(): number {
+    const setting =
+      "INDEXER_BATCH_SIZE" in this.config
+        ? this.config.INDEXER_BATCH_SIZE
+        : this.config.batchSize;
+    return Math.max(1, Math.min(LEDGER_WINDOW_MAX, setting ?? DEFAULT_BATCH_SIZE));
+  }
 
   /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
   private get progressLedgers(): number {
@@ -420,10 +494,11 @@ export class Indexer {
           pastEnd = true;
           break;
         }
-        await this.retain(raw);
+        const pending = await this.retain(raw);
+        if (!pending) continue;
         const decoded = decodeEvent(raw);
-        if (!decoded) continue;
-        if ((await this.apply(decoded)) !== "mismatched") applied += 1;
+        if (decoded && (await this.apply(decoded)) !== "mismatched") applied += 1;
+        await this.markProjected([eventIdOf(raw)]);
       }
       if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
       cursor = page.cursor;
@@ -440,16 +515,17 @@ export class Indexer {
   }
 
   /**
-   * Fetch every page of one ledger window. Cursor pages cannot carry
-   * `endLedger`, so events at or past `end` are dropped here; a short page does
-   * not prove the range is exhausted, only an empty page or the range end does.
+   * Fetch every page of one ledger window from RPC and return all events.
+   * Cursor pages cannot carry `endLedger`, so events at or past `end` are
+   * dropped here; a short page does not prove the range is exhausted, only an
+   * empty page or the range end does.
    */
   private async fetchWindow(
     start: number,
     end: number,
     filters: rpc.Api.EventFilter[],
   ): Promise<rpc.Api.EventResponse[]> {
-    const events: rpc.Api.EventResponse[] = [];
+    const collected: rpc.Api.EventResponse[] = [];
     let page = await this.server.getEvents({
       startLedger: start,
       endLedger: end,
@@ -459,21 +535,26 @@ export class Indexer {
 
     for (;;) {
       let pastEnd = false;
+      const retained: rpc.Api.EventResponse[] = [];
       for (const raw of page.events ?? []) {
         if (raw.ledger >= end) {
           pastEnd = true;
           break;
         }
-        events.push(raw);
+        collected.push(raw);
+        retained.push(raw);
+      }
+      for (const ledgerEvents of groupByLedger(retained)) {
+        await this.retainAll(ledgerEvents);
       }
       if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
       page = await this.server.getEvents({ cursor: page.cursor, filters, limit: PAGE_LIMIT });
     }
-    return events;
+    return collected;
   }
 
   /**
-   * Index ledgers [cursor, min(cursor + LEDGER_WINDOW * concurrency, latest)).
+   * Index ledgers [cursor, min(cursor + batchSize * concurrency, latest)).
    *
    * Up to `INDEXER_FETCH_CONCURRENCY` windows are fetched in parallel, but
    * their events are applied in ledger order and the cursor only advances after
@@ -505,11 +586,11 @@ export class Indexer {
   }
 
   /**
-   * Index ledgers [cursor, min(cursor + LEDGER_WINDOW * concurrency, latest)).
+   * Index ledgers [cursor, min(cursor + batchSize * concurrency, latest)).
    *
-   * Up to `INDEXER_FETCH_CONCURRENCY` windows are fetched in parallel, but
+   * Up to `INDEXER_FETCH_CONCURRENCY` batches are fetched in parallel, but
    * their events are applied in ledger order and the cursor only advances after
-   * a window has been applied. If a fetch fails, windows already applied keep
+   * a batch has been applied. If a fetch fails, batches already applied keep
    * their cursor and the next pass resumes at the failed one. A crash mid-range
    * replays that range on restart; every apply path is idempotent so that is
    * safe.
@@ -547,7 +628,8 @@ export class Indexer {
 
     // endLedger is exclusive. Including `latest` would read a ledger that is
     // still being ingested and could miss part of it.
-    const end = Math.min(start + LEDGER_WINDOW, latest);
+    const batchSize = this.batchSize;
+    const end = Math.min(start + batchSize, latest);
     if (end <= start) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
@@ -565,8 +647,8 @@ export class Indexer {
         : undefined;
     const concurrency = Math.max(1, concurrencySetting ?? 1);
     const windows: Array<{ start: number; end: number }> = [];
-    for (let s = start; s < latest && windows.length < concurrency; s += LEDGER_WINDOW) {
-      windows.push({ start: s, end: Math.min(s + LEDGER_WINDOW, latest) });
+    for (let s = start; s < latest && windows.length < concurrency; s += batchSize) {
+      windows.push({ start: s, end: Math.min(s + batchSize, latest) });
     }
 
     const fetched = await Promise.allSettled(
@@ -584,33 +666,46 @@ export class Indexer {
         failure = result.reason;
         break;
       }
+      const rpcEvents = result.value;
       const nextCursor = windows[i]!.end;
+
       const windowResult = await this.db.transaction(async (storage) => {
-        let windowApplied = 0;
-        let windowMismatched = 0;
+        let wApplied = 0;
+        let wMismatched = 0;
+        let wLastSeenCloseTime: number | null = null;
         const notifications: DecodedEvent[] = [];
-        for (const raw of result.value) {
-          const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
-          if (ct !== null) lastSeenCloseTime = ct;
-          await this.retain(raw, storage);
-          const decoded = decodeEvent(raw);
-          if (!decoded) continue;
-          if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
-          else windowMismatched += 1;
+        const seenEventIds = new Set<string>();
+
+        for (const ledgerEvents of groupByLedger(rpcEvents)) {
+          const pendingEvents = await this.pendingEventIds(ledgerEvents, storage);
+          for (const raw of ledgerEvents) {
+            const eventId = eventIdOf(raw);
+            if (seenEventIds.has(eventId)) continue;
+            seenEventIds.add(eventId);
+            if (!pendingEvents.has(eventId)) continue;
+            const closeTime = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
+            if (closeTime !== null) wLastSeenCloseTime = closeTime;
+            const decoded = decodeEvent(raw);
+            if (!decoded) continue;
+            if ((await this.apply(decoded, storage, notifications)) !== "mismatched") wApplied += 1;
+            else wMismatched += 1;
+          }
+          await this.markProjected([...pendingEvents], storage);
         }
+
         await storage.run(
           `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
            ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
           [nextCursor],
         );
-        return { applied: windowApplied, mismatched: windowMismatched, notifications };
+        return { applied: wApplied, mismatched: wMismatched, lastSeenCloseTime: wLastSeenCloseTime, notifications };
       });
+
       applied += windowResult.applied;
       mismatched += windowResult.mismatched;
+      if (windowResult.lastSeenCloseTime !== null) lastSeenCloseTime = windowResult.lastSeenCloseTime;
+      for (const n of windowResult.notifications) this.events.emit("applied", n);
       cursor = nextCursor;
-      for (const notification of windowResult.notifications) {
-        this.events.emit("applied", notification);
-      }
     }
 
     this.status.cursor = cursor;
@@ -619,31 +714,94 @@ export class Indexer {
     // Windows applied before a failed fetch are real progress, so they count.
     this.reportProgress(start, startedAt, cursor, latest, applied, mismatched);
     await this.publishMetrics(applied);
+    // Prune raw events older than the retention window. Runs after every pass
+    // so the table never grows unboundedly; logs-and-continues on failure.
+    await this.pruneRawEvents();
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
   }
 
 
   /** Preserve every event before decoding, including unknown contract events. */
-  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<void> {
-    const eventId =
-      raw.id ??
-      `${raw.ledger}:${raw.txHash}:${raw.topic.map((topic) => topic.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`;
-    await storage.run(
-      `INSERT OR IGNORE INTO events
-         (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        eventId,
-        raw.contractId?.toString() ?? "",
-        raw.ledger,
-        raw.txHash,
-        raw.id ?? "",
-        JSON.stringify(raw.topic.map((topic) => topic.toXDR("base64"))),
-        raw.value.toXDR("base64"),
-        parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
-      ],
-    );
+  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<boolean> {
+    return (await this.retainAll([raw], storage)).has(eventIdOf(raw));
+  }
+
+  /**
+   * Retain one ledger's raw events in as few statements as possible: one
+   * multi-row `INSERT OR IGNORE` per chunk instead of one statement per event
+   * (#247). The row is unchanged — same event id, same XDR payload — and
+   * `INSERT OR IGNORE` keeps a replay idempotent, whichever chunk a repeated
+   * event lands in.
+   *
+   * Returns the ids that still need projection. Raw pages can be durable
+   * before their window is applied, so presence in `events` alone no longer
+   * means an event has already been projected.
+   */
+  private async retainAll(
+    events: readonly rpc.Api.EventResponse[],
+    storage: Storage = this.db,
+  ): Promise<Set<string>> {
+    const pendingEvents = new Set<string>();
+    for (let i = 0; i < events.length; i += RETAIN_CHUNK) {
+      const chunk = events.slice(i, i + RETAIN_CHUNK);
+      const ids = chunk.map(eventIdOf);
+      const existing = await storage.all<{ event_id: string; projected: number }>(
+        `SELECT event_id, projected FROM events WHERE event_id IN (${ids.map(() => "?").join(", ")})`,
+        ids,
+      );
+      const retained = new Map(existing.map((row) => [row.event_id, row.projected]));
+      const values = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const parameters = chunk.flatMap((raw) => {
+        const topics = raw.topic.map((topic) => topic.toXDR("base64"));
+        return [
+          eventIdOf(raw),
+          raw.contractId?.toString() ?? "",
+          raw.ledger,
+          raw.txHash,
+          raw.id ?? "",
+          JSON.stringify(topics),
+          raw.value.toXDR("base64"),
+          parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
+        ];
+      });
+      await storage.run(
+        `INSERT OR IGNORE INTO events
+           (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+         VALUES ${values}`,
+        parameters,
+      );
+      for (const id of ids) {
+        if (retained.get(id) !== 1) pendingEvents.add(id);
+      }
+    }
+    return pendingEvents;
+  }
+
+  private async pendingEventIds(
+    events: readonly rpc.Api.EventResponse[],
+    storage: Storage,
+  ): Promise<Set<string>> {
+    const pendingEvents = new Set<string>();
+    for (let i = 0; i < events.length; i += RETAIN_CHUNK) {
+      const ids = events.slice(i, i + RETAIN_CHUNK).map(eventIdOf);
+      const pending = await storage.all<{ event_id: string }>(
+        `SELECT event_id FROM events WHERE projected = 0 AND event_id IN (${ids.map(() => "?").join(", ")})`,
+        ids,
+      );
+      for (const row of pending) pendingEvents.add(row.event_id);
+    }
+    return pendingEvents;
+  }
+
+  private async markProjected(eventIds: readonly string[], storage: Storage = this.db): Promise<void> {
+    for (let i = 0; i < eventIds.length; i += RETAIN_CHUNK) {
+      const chunk = eventIds.slice(i, i + RETAIN_CHUNK);
+      await storage.run(
+        `UPDATE events SET projected = 1 WHERE event_id IN (${chunk.map(() => "?").join(", ")})`,
+        chunk,
+      );
+    }
   }
 
   /** Rebuild event-derived projections locally, without querying RPC. */

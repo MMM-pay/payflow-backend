@@ -84,11 +84,57 @@ describe("admin routes", () => {
       const wrong = await call(app.base, "POST", "/admin/reindex", "not-the-token");
       assert.equal(wrong.status, 401);
 
+      const differentLength = await call(app.base, "POST", "/admin/reindex", `${TOKEN}x`);
+      assert.equal(differentLength.status, 401);
+
+      const malformed = await call(app.base, "POST", "/admin/reindex", "token with spaces");
+      assert.equal(malformed.status, 401);
+
       const bare = await fetch(`${app.base}/admin/reindex`, {
         method: "POST",
         headers: { authorization: TOKEN },
       });
       assert.equal(bare.status, 401);
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("reject malformed admin query inputs before calling operator hooks", async () => {
+    let pruneCalls = 0;
+    const app = await startApp(testConfig(TOKEN), {
+      pruneData: async () => {
+        pruneCalls += 1;
+        return { deleted: 0 };
+      },
+      getAuditLogs: () => [],
+    });
+    try {
+      const invalidDays = await fetch(`${app.base}/admin/data/prune?days=1e3`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      assert.equal(invalidDays.status, 400);
+      assert.equal(pruneCalls, 0);
+
+      const unexpected = await fetch(`${app.base}/admin/data/prune?days=30&force=true`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      assert.equal(unexpected.status, 400);
+      assert.equal(pruneCalls, 0);
+
+      const invalidLimit = await fetch(`${app.base}/admin/audit-logs?limit=Infinity`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      assert.equal(invalidLimit.status, 400);
+
+      const valid = await fetch(`${app.base}/admin/data/prune?days=30`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      assert.equal(valid.status, 200);
+      assert.equal(pruneCalls, 1);
     } finally {
       app.stop();
     }
@@ -132,6 +178,24 @@ describe("admin routes", () => {
     }
   });
 
+  test("report what the keeper would charge without submitting", async () => {
+    const app = await startApp(testConfig(TOKEN), {
+      reindex: async () => ({}),
+      keeperDryRun: async () => ({ now: 1, due: [], chargeable: 0, skipped: 0 }),
+    });
+    try {
+      const { status, body } = await call(app.base, "GET", "/admin/keeper/dry-run", TOKEN);
+      assert.equal(status, 200);
+      assert.equal(body.status, "ok");
+      assert.deepEqual(body.dry_run, { now: 1, due: [], chargeable: 0, skipped: 0 });
+
+      const unauthorized = await call(app.base, "GET", "/admin/keeper/dry-run");
+      assert.equal(unauthorized.status, 401, "the report is operator-only");
+    } finally {
+      app.stop();
+    }
+  });
+
   test("say the keeper is unavailable when it is not running", async () => {
     const app = await startApp(testConfig(TOKEN), { reindex: async () => ({}) });
     try {
@@ -142,6 +206,10 @@ describe("admin routes", () => {
       const backoff = await call(app.base, "GET", "/admin/keeper/backoff", TOKEN);
       assert.equal(backoff.status, 503);
       assert.equal((backoff.body.error as { code: string }).code, "keeper_unavailable");
+
+      const dryRun = await call(app.base, "GET", "/admin/keeper/dry-run", TOKEN);
+      assert.equal(dryRun.status, 503);
+      assert.equal((dryRun.body.error as { code: string }).code, "keeper_unavailable");
     } finally {
       app.stop();
     }
@@ -225,6 +293,7 @@ describe("admin routes", () => {
         ["POST", "/admin/indexer/pause"],
         ["POST", "/admin/indexer/resume"],
         ["POST", "/admin/data/prune"],
+        ["GET", "/admin/data/retention"],
         ["GET", "/admin/audit-logs"],
         ["GET", "/admin/past-due"],
         ["POST", "/admin/db/vacuum"],

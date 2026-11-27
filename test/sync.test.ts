@@ -347,6 +347,42 @@ describe("indexer sync", () => {
     assert.ok(tracker.maxInFlight() > 1, "windows were fetched concurrently");
   });
 
+  test("stages each RPC page before requesting the next page", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = {
+      latest: 101,
+      oldest: 1,
+      events: Array.from({ length: 401 }, (_, index) => rawEvent(100, index + 1)),
+      calls: [],
+    };
+    const base = fakeRpc(chain, 200);
+    let failOnce = true;
+    let retainedBeforeSecondPage = 0;
+    const rpc = {
+      ...base,
+      getEvents: async (req: Record<string, unknown>) => {
+        if (req.cursor === "200" && failOnce) {
+          retainedBeforeSecondPage = (db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+          failOnce = false;
+          throw new Error("rpc unavailable");
+        }
+        return base.getEvents(req as never);
+      },
+    } as unknown as IndexerRpc;
+    const ix = new Indexer(db, rpc, net({ startLedger: 100 }));
+
+    await assert.rejects(() => ix.tick(), /rpc unavailable/);
+    assert.equal(retainedBeforeSecondPage, 200, "the first bounded page is durable before continuing");
+    assert.equal(readCursor(db, 0), 0, "a partial window does not advance the cursor");
+    assert.deepEqual(plans(db), [], "staged events are not projected until the window is complete");
+
+    const result = await ix.tick();
+    assert.equal(result.applied, 401);
+    assert.equal(result.cursor, 101);
+    assert.deepEqual(plans(db), Array.from({ length: 401 }, (_, index) => index + 1));
+    db.close();
+  });
+
   test("a failed window keeps the cursor at the last applied window", async () => {
     const db = openDatabase(":memory:");
     const chain: FakeChain = {

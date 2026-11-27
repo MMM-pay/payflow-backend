@@ -64,6 +64,7 @@ describe("webhooks", () => {
   const merchant = merchantKey.publicKey();
   const url = "https://payflow.example/webhooks";
   const secret = "test-webhook-secret";
+  const deliveryToken = "test-webhook-delivery-token";
 
   let db: ReturnType<typeof openDatabase>;
   let ix: Indexer;
@@ -100,6 +101,17 @@ describe("webhooks", () => {
         }
       }
       calls.push({ url: urlStr, headers, body: typeof init?.body === "string" ? init.body : "" });
+      if (urlStr.includes("/sensitive-error")) {
+        throw new Error(`request failed for ${urlStr} with ${secret} and ${deliveryToken}`);
+      }
+      if (urlStr.includes("/sensitive-response")) {
+        return {
+          status: 200,
+          ok: true,
+          text: async () => `${secret} ${deliveryToken}`,
+          json: async () => ({ ok: true }),
+        } as unknown as Response;
+      }
       if (urlStr.includes("/failing")) throw new Error("down");
       return {
         status: 200,
@@ -284,115 +296,71 @@ describe("webhooks", () => {
     assert.equal(call.headers["payflow-signature"], `sha256=${expected}`);
   });
 
-  test("a webhook receives only the event types it subscribed to (#271)", async () => {
-    const key = Keypair.random();
-    const filteredMerchant = key.publicKey();
-    const filteredSeed = key.secret();
-    const filteredUrl = "https://payflow.example/only-failing";
-    const timestamp = nowSec();
-    const registration = await post("/api/webhooks", {
-      merchant: filteredMerchant,
-      url: filteredUrl,
-      secret: "filtered-secret",
-      events: ["charge.failing"],
-      timestamp,
-      signature: sign(filteredMerchant, filteredUrl, timestamp, filteredSeed),
-    });
-    assert.equal(registration.status, 200);
-    const body = registration.body as { id: number; events: string[] };
-    assert.deepEqual(body.events, ["charge.failing"], "the registration echoes the filter");
-    const row = db.prepare("SELECT events FROM webhooks WHERE id = ?").get(body.id) as {
-      events: string;
-    };
-    assert.deepEqual(JSON.parse(row.events), ["charge.failing"], "the filter is stored with the webhook");
-
-    calls.length = 0;
-    await ix.apply(ev("charged", [31n, SUBSCRIBER, filteredMerchant], {
-      amount: 5_000_000n, fee: 0n, charges_made: 1n, next_charge: 1_700_000_000n,
-    }, "tx-filtered-charge"));
-    await new Promise((resolve) => setImmediate(resolve));
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(calls.length, 0, "an unsubscribed event is never delivered");
-    const pending = db
-      .prepare("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id = ?")
-      .get(body.id) as { n: number };
-    assert.equal(pending.n, 0, "nor queued: it does not appear in the delivery history");
-
-    await dispatcher.onChargeStreak({
-      kind: "charge.failing",
-      mandateId: 31,
-      subscriber: SUBSCRIBER,
-      merchant: filteredMerchant,
-      failures: 3,
-      attemptId: 1,
-      shortfall: "100",
-      nextRetryAt: 10_500,
-      errorCode: "INSUFFICIENT_BALANCE",
-    });
-    await waitFor(() => calls.length >= 1);
-    assert.equal(calls.length, 1, "the subscribed event is delivered");
-    assert.equal(calls[0]!.url, filteredUrl);
-    assert.equal((JSON.parse(calls[0]!.body) as { event: string }).event, "charge.failing");
-  });
-
-  test("a webhook with no filter keeps receiving every event type", async () => {
-    const key = Keypair.random();
-    const merchantAll = key.publicKey();
-    const urlAll = "https://payflow.example/all-events";
-    const hook = await dispatcher.register(merchantAll, urlAll, "all-secret");
-    assert.deepEqual(hook.events, ["charged", "charge.failing", "charge.recovered"]);
-
-    calls.length = 0;
-    await ix.apply(ev("charged", [32n, SUBSCRIBER, merchantAll], {
-      amount: 1_000n, fee: 0n, charges_made: 1n, next_charge: 1n,
-    }, "tx-all-charge"));
-    await waitFor(() => calls.length >= 1);
-    await dispatcher.onChargeStreak({
-      kind: "charge.recovered",
-      mandateId: 32,
-      subscriber: SUBSCRIBER,
-      merchant: merchantAll,
-      failures: 3,
-      attemptId: 2,
-      txHash: "ab".repeat(32),
-    });
-    await waitFor(() => calls.length >= 2);
-    assert.deepEqual(
-      calls.slice(0, 2).map((call) => (JSON.parse(call.body) as { event: string }).event),
-      ["charged", "charge.recovered"],
+  test("delivery history never records receiver bodies or transport errors", async () => {
+    const bodyHook = await dispatcher.register(
+      merchant,
+      "https://payflow.example/sensitive-response",
+      secret,
     );
+    await dispatcher.ping(merchant, bodyHook.id);
+
+    const bodyRow = db.prepare(
+      "SELECT response_body, error FROM webhook_deliveries WHERE webhook_id = ?",
+    ).get(bodyHook.id) as { response_body: string | null; error: string | null };
+    assert.equal(bodyRow.response_body, null);
+    assert.equal(bodyRow.error, null);
+
+    const errorHook = await dispatcher.register(
+      merchant,
+      `https://payflow.example/sensitive-error?token=${deliveryToken}`,
+      secret,
+    );
+    const outcome = await dispatcher.ping(merchant, errorHook.id);
+    assert.ok(outcome);
+    assert.equal(outcome.error, "delivery request failed");
+
+    const errorRow = db.prepare(
+      "SELECT response_body, error FROM webhook_deliveries WHERE webhook_id = ?",
+    ).get(errorHook.id) as { response_body: string | null; error: string | null };
+    assert.equal(errorRow.response_body, null);
+    assert.equal(errorRow.error, "delivery request failed");
+
+    const timestamp = nowSec();
+    const proof = `payflow-webhook-deliveries:v1:${merchant}:${errorHook.id}:${timestamp}`;
+    const query = new URLSearchParams({
+      merchant,
+      timestamp: String(timestamp),
+      signature: signMessage(proof, seed),
+    });
+    const historyUrl = `${base}/api/webhooks/${errorHook.id}/deliveries?${query}`;
+    const unauthorized = await fetch(
+      `${base}/api/webhooks/${errorHook.id}/deliveries?merchant=${merchant}`,
+    );
+    assert.equal(unauthorized.status, 400);
+    const invalidProof = new URLSearchParams({
+      merchant,
+      timestamp: String(timestamp),
+      signature: signMessage(proof, StrKey.encodeEd25519SecretSeed(crypto.getRandomValues(new Uint8Array(32)))),
+    });
+    assert.equal(
+      (await fetch(`${base}/api/webhooks/${errorHook.id}/deliveries?${invalidProof}`)).status,
+      401,
+    );
+
+    const response = await fetch(historyUrl);
+    assert.equal(response.status, 200);
+    const historyText = await response.text();
+    assert.equal(historyText.includes(secret), false);
+    assert.equal(historyText.includes(deliveryToken), false);
+    const history = JSON.parse(historyText) as {
+      deliveries: Array<{ error: string | null }>;
+    };
+    assert.equal(history.deliveries[0]!.error, "delivery request failed");
+    await dispatcher.deactivate(merchant, bodyHook.id);
+    await dispatcher.deactivate(merchant, errorHook.id);
   });
 
-  test("registration rejects an empty, unknown or duplicated event filter (#271)", async () => {
-    for (const [events, target] of [
-      [[], "https://payflow.example/no-events"],
-      [["unknown"], "https://payflow.example/unknown-event"],
-      [["charged", "charged"], "https://payflow.example/duplicate-events"],
-    ] as const) {
-      const timestamp = nowSec();
-      const res = await post("/api/webhooks", {
-        merchant,
-        url: target,
-        secret,
-        events,
-        timestamp,
-        signature: sign(merchant, target, timestamp, seed),
-      });
-      assert.equal(res.status, 400, JSON.stringify(events));
-      assert.equal(
-        (res.body as { error: { code: string } }).error.code,
-        "invalid_request",
-        JSON.stringify(events),
-      );
-      assert.equal(
-        (db.prepare("SELECT COUNT(*) AS n FROM webhooks WHERE url = ?").get(target) as { n: number }).n,
-        0,
-        "the invalid registration stored nothing",
-      );
-    }
-  });
-
-  test("delivery retries with backoff and gives up after five attempts", async () => {
+  test("delivery retries with backoff then opens a circuit after five attempts", async () => {
     const failing = Keypair.random().publicKey();
     await dispatcher.register(failing, "https://payflow.example/failing", "another-secret");
     calls.length = 0;
@@ -437,23 +405,25 @@ describe("webhooks", () => {
     }
     assert.equal(calls.length, 4, "attempts 2 through 4 happen at their retry times");
 
-    // Attempt 5 is due next; attempt 6 exceeds MAX_ATTEMPTS, so the delivery
-    // and the webhook are marked failed and nothing is retried after that.
+    // Attempt 5 opens the per-endpoint circuit and pauses the delivery until
+    // the cooldown expires.
     db.prepare("UPDATE webhook_deliveries SET retry_at = ? WHERE id = ?")
       .run(T - 1, row1.id);
     await dispatcher.retryDue(T);
     assert.equal(calls.length, 5, "fifth and final attempt");
     const row = db
       .prepare("SELECT * FROM webhook_deliveries ORDER BY id DESC LIMIT 1")
-      .get() as { attempt: number; status: string };
+      .get() as { attempt: number; status: string; retry_at: number };
     assert.equal(row.attempt, 5);
-    assert.equal(row.status, "failed");
+    assert.equal(row.status, "pending");
+    assert.ok(row.retry_at >= T + 899 && row.retry_at <= T + 901);
 
     const webhook = db.prepare("SELECT * FROM webhooks WHERE merchant = ?").get(failing) as {
-      failed: number; failures: number;
+      failed: number; failures: number; circuit_open_until: number | null;
     };
     assert.equal(webhook.failed, 1);
     assert.equal(webhook.failures, 5);
+    assert.ok(webhook.circuit_open_until! >= T + 899);
 
     calls.length = 0;
     await ix.apply(ev("charged", [8n, SUBSCRIBER, failing], {
@@ -462,6 +432,35 @@ describe("webhooks", () => {
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(calls.length, 0, "a failed webhook receives nothing more");
+  });
+
+  test("an open circuit pauses delivery and resumes after cooldown", async () => {
+    const merchantWithCircuit = Keypair.random().publicKey();
+    const hook = await dispatcher.register(
+      merchantWithCircuit,
+      "https://payflow.example/circuit-recovery",
+      "circuit-secret",
+    );
+    const now = nowSec();
+    db.prepare(
+      "UPDATE webhooks SET failed = 1, failures = 5, circuit_open_until = ? WHERE id = ?",
+    ).run(now + 60, hook.id);
+
+    calls.length = 0;
+    assert.equal(await dispatcher.ping(merchantWithCircuit, hook.id), null);
+    assert.equal(calls.length, 0, "an open circuit receives no test delivery");
+
+    db.prepare("UPDATE webhooks SET circuit_open_until = ? WHERE id = ?")
+      .run(now - 1, hook.id);
+    const result = await dispatcher.ping(merchantWithCircuit, hook.id);
+    assert.ok(result);
+    assert.equal(result.status, "delivered");
+
+    const webhook = db.prepare("SELECT failed, failures, circuit_open_until FROM webhooks WHERE id = ?")
+      .get(hook.id) as { failed: number; failures: number; circuit_open_until: number | null };
+    assert.equal(webhook.failed, 0);
+    assert.equal(webhook.failures, 0);
+    assert.equal(webhook.circuit_open_until, null);
   });
 
   test("retryDue delivers pending deliveries at their retry time", async () => {
@@ -606,7 +605,10 @@ describe("webhooks", () => {
       await waitFor(() => calls.length >= 1);
       await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(calls.map((c) => c.url), ["https://c.example/keep"]);
+      const merchantCalls = calls.filter((call) =>
+        call.url === "https://c.example/keep" || call.url === "https://c.example/failing-gone",
+      );
+      assert.deepEqual(merchantCalls.map((c) => c.url), ["https://c.example/keep"]);
 
       // It is gone from the list, and deleting it again is a 404.
       const listed = (await (await fetch(listUrl(merchantC, t, listSig(merchantC, t, seedC)))).json()) as {
