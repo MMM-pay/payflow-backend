@@ -50,6 +50,8 @@ import type {
 export type {
   ApiErrorResponse,
   AuthTokenResponse,
+  ApiKeyCreateResponse,
+  ApiKeyListResponse,
   ChargeAttemptPage,
   ChargeAttemptRow,
   ChargePage,
@@ -65,6 +67,7 @@ export type {
   KeeperPassSummary,
   MandatePage,
   MandateRow,
+  MerchantApiKey,
   MerchantChurnResponse,
   MerchantNotificationPreferences,
   MerchantRevenueResponse,

@@ -1,0 +1,13 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "The request parameters are not valid.",
+    "requestId": "golden",
+    "details": [
+      {
+        "path": "address",
+        "message": "must be a Stellar address (a G... account or a C... contract)"
+      }
+    ]
+  }
+}

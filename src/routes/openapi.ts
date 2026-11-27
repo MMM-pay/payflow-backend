@@ -1461,6 +1461,89 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/merchants/{address}/keys")]: {
+      post: {
+        tags: ["merchants"],
+        summary: "Create a merchant API key",
+        description:
+          "Issues a new scoped API key for the merchant. The raw key is returned this once and cannot be recovered; store it immediately. Requires a valid SEP-10 JWT whose subject matches the `:address` path parameter.",
+        operationId: `createMerchantApiKey${operationSuffix(root)}`,
+        parameters: [merchantAccountParameter()],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: false,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  name: {
+                    type: "string",
+                    maxLength: 100,
+                    description: "A human-readable label for this key, e.g. 'CI deploy'.",
+                  },
+                  scopes: {
+                    type: "array",
+                    items: { type: "string", enum: ["read"] },
+                    description: "The operations the key permits. Defaults to [\"read\"].",
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "201": {
+            description: "The new key. The `key` field holds the raw secret — this is the only time it is returned.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/ApiKeyCreate" } },
+            },
+          },
+          "400": invalidRequest(),
+          "401": unauthorizedProof(),
+          "403": errorResponse('The token subject does not match the requested merchant address (error.code = "forbidden").'),
+        },
+      },
+      get: {
+        tags: ["merchants"],
+        summary: "List a merchant's API keys",
+        description:
+          "All active (non-revoked) API keys for the merchant. Requires a valid SEP-10 JWT or an active API key with `read` scope for the merchant's address.",
+        operationId: `listMerchantApiKeys${operationSuffix(root)}`,
+        parameters: [merchantAccountParameter()],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "The active keys.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/ApiKeyList" } },
+            },
+          },
+          "401": unauthorizedProof(),
+          "403": errorResponse('The credential does not match the requested merchant address (error.code = "forbidden").'),
+        },
+      },
+    },
+    [p("/merchants/{address}/keys/{id}")]: {
+      delete: {
+        tags: ["merchants"],
+        summary: "Revoke a merchant API key",
+        description:
+          "Marks the key as revoked. It can no longer authenticate requests. Requires a valid SEP-10 JWT for the merchant's address.",
+        operationId: `revokeMerchantApiKey${operationSuffix(root)}`,
+        parameters: [
+          merchantAccountParameter(),
+          { name: "id", in: "path", required: true, description: "The key id.", schema: { type: "integer", minimum: 1 } },
+        ],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "204": { description: "The key was revoked." },
+          "401": unauthorizedProof(),
+          "403": errorResponse('The token subject does not match the requested merchant address (error.code = "forbidden").'),
+          "404": notFound("not_found", "API key"),
+        },
+      },
+    },
   };
 }
 
@@ -2078,6 +2161,40 @@ function componentSchemas(): Record<string, SchemaObject> {
         },
       },
       required: ["merchant", "events", "updatedAt"],
+    },
+    ApiKey: {
+      type: "object",
+      description: "A per-merchant API key (the raw secret is never returned after creation).",
+      properties: {
+        id: { type: "integer" },
+        merchant: { type: "string", description: "The merchant's Stellar account address." },
+        keyPrefix: { type: "string", description: "First 12 characters of the key — enough to identify it, not enough to authenticate." },
+        name: { type: "string", description: "Human-readable label." },
+        scopes: { type: "array", items: { type: "string" }, description: "Operations this key permits." },
+        createdAt: { type: "integer", description: "Unix seconds." },
+        lastUsedAt: { type: ["integer", "null"], description: "Unix seconds of the last authenticated request; null if never used." },
+      },
+      required: ["id", "merchant", "keyPrefix", "name", "scopes", "createdAt", "lastUsedAt"],
+    },
+    ApiKeyCreate: {
+      allOf: [
+        { $ref: "#/components/schemas/ApiKey" },
+        {
+          type: "object",
+          properties: {
+            key: { type: "string", description: "The full raw API key. Store it now — it cannot be recovered later." },
+          },
+          required: ["key"],
+        },
+      ],
+    },
+    ApiKeyList: {
+      type: "object",
+      properties: {
+        merchant: { type: "string" },
+        keys: { type: "array", items: { $ref: "#/components/schemas/ApiKey" } },
+      },
+      required: ["merchant", "keys"],
     },
     Error: {
       type: "object",
@@ -3019,6 +3136,7 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       { name: "service", description: "Health, readiness, metrics and this document." },
       { name: "admin", description: "Operator endpoints; they need a bearer token." },
       { name: "auth", description: "SEP-10 sign-in for merchant-only routes." },
+      { name: "apiKeys", description: "Per-merchant API keys for server-side access." },
     ],
     externalDocs: {
       url: API_CHANGELOG_URL,
@@ -3031,7 +3149,7 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
         bearerAuth: {
           type: "http",
           scheme: "bearer",
-          description: "The ADMIN_TOKEN, as `Authorization: Bearer <token>`.",
+          description: "A SEP-10 JWT from `/api/auth`, or a `pfk_` merchant API key, as `Authorization: Bearer <token>`.",
         },
       },
     },

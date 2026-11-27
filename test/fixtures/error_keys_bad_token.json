@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "unauthorized",
+    "message": "SEP-10 sign-in is not enabled on this instance.",
+    "requestId": "golden"
+  }
+}
