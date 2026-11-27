@@ -7,7 +7,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
 import { asStorage } from "./store/index.ts";
 import type { Storage } from "./store/types.ts";
-import { notificationEnabled } from "./notification-preferences.ts";
+import {
+  DEFAULT_NOTIFICATION_EVENTS,
+  NOTIFICATION_EVENTS,
+  notificationEnabled,
+  type NotificationEvent,
+} from "./notification-preferences.ts";
 import { big, num, str } from "./stellar.ts";
 import type { DecodedEvent } from "./stellar.ts";
 import type {
@@ -176,6 +181,8 @@ export interface Webhook {
   secret: string;
   previous_secret: string | null;
   previous_secret_expires_at: number | null;
+  /** Event types this webhook is subscribed to (#271). */
+  events: NotificationEvent[];
   active: number;
   failed: number;
   failures: number;
@@ -212,6 +219,8 @@ interface WebhookRow {
   secret: string;
   previous_secret: string | null;
   previous_secret_expires_at: number | null;
+  /** JSON array of the event types this webhook receives (#271). */
+  events: string;
   active: number;
   failed: number;
   failures: number;
@@ -219,6 +228,25 @@ interface WebhookRow {
   last_status: number | null;
   circuit_open_until: number | null;
   circuit_half_open: number;
+}
+
+/**
+ * The event types a stored `webhooks.events` value names. Unknown names left
+ * by an older or newer build are dropped, and a value that is not readable as
+ * an array falls back to every event so an upgrade never silently stops a
+ * merchant's deliveries. An empty array is kept: it is a webhook that receives
+ * no standard events (explicit test pings still work).
+ */
+function parseWebhookEvents(value: string): NotificationEvent[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return NOTIFICATION_EVENTS.filter((event) => parsed.includes(event));
+    }
+  } catch {
+    // A malformed stored value is handled below like a missing one.
+  }
+  return [...DEFAULT_NOTIFICATION_EVENTS];
 }
 
 /** How one delivery attempt went. */
@@ -369,9 +397,18 @@ export class WebhookDispatcher {
    * sign deliveries; when omitted a server-generated secret is returned
    * to the caller exactly once.
    */
-  async register(merchant: string, url: string, secret?: string): Promise<WebhookRegistration> {
+  async register(
+    merchant: string,
+    url: string,
+    secret?: string,
+    events: NotificationEvent[] = [...DEFAULT_NOTIFICATION_EVENTS],
+  ): Promise<WebhookRegistration> {
     const value = secret ?? randomUUID();
     const now = Math.floor(Date.now() / 1000);
+    // Stored and echoed in the canonical order, the same order a later
+    // `listForMerchant` reports, so the registration response and the listing
+    // never disagree about the filter.
+    const selected = NOTIFICATION_EVENTS.filter((event) => events.includes(event));
     const row = await this.db.get<{ id: number }>(
       `INSERT INTO webhooks (merchant, url, secret, active, failed, failures, circuit_open_until, circuit_half_open, created_at)
        VALUES (?, ?, ?, 1, 0, 0, NULL, 0, ?) RETURNING id`,
@@ -383,13 +420,14 @@ export class WebhookDispatcher {
       merchant,
       url,
       secret: value,
+      events: [...selected],
       active: true,
     };
   }
 
   /** The active, non-failed webhooks for a merchant, newest first. */
-  listWebhooks(merchant: string): Promise<Webhook[]> {
-    return this.db.all<Webhook>(
+  async listWebhooks(merchant: string): Promise<Webhook[]> {
+    const rows = await this.db.all<WebhookRow>(
       `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
               active, failed, failures, last_attempt, last_status, circuit_open_until, circuit_half_open
          FROM webhooks
@@ -406,6 +444,7 @@ export class WebhookDispatcher {
         ORDER BY id DESC`,
       [merchant, Math.floor(Date.now() / 1000)],
     );
+    return rows.map((row) => ({ ...row, events: parseWebhookEvents(row.events) }));
   }
 
   /**
@@ -419,6 +458,7 @@ export class WebhookDispatcher {
       id: number;
       url: string;
       secret: string;
+      events: string;
       failed: number;
       failures: number;
       last_attempt: number | null;
@@ -720,7 +760,7 @@ export class WebhookDispatcher {
       ledger: e.ledger,
     } as Record<string, unknown>);
 
-    await this.broadcast(webhooks, eventId, payload);
+    await this.broadcast(webhooks, eventId, payload, e.name);
   }
 
   /**
@@ -748,7 +788,7 @@ export class WebhookDispatcher {
         : { ...common, tx_hash: e.txHash },
     );
 
-    await this.broadcast(webhooks, `${e.kind}:${e.mandateId}:${e.attemptId}`, payload);
+    await this.broadcast(webhooks, `${e.kind}:${e.mandateId}:${e.attemptId}`, payload, e.kind);
   }
 
   /** One pending delivery and a first attempt per webhook, under one idempotency key. */

@@ -214,6 +214,19 @@ const schema = z.object({
   KEEPER_BATCH: z.string().default("true").transform((v) => v === "true"),
   /** Mandates per batch transaction, bounded by the contract's supported list size. */
   KEEPER_BATCH_SIZE: z.coerce.number().int().min(2).max(25).default(10),
+  /**
+   * Most mandates one keeper pass settles, across every channel and every
+   * batch (#254). The pass reads at most this many due mandates and stops
+   * taking new ones once it has, so a large backlog is worked off over
+   * several passes instead of one long burst. `1` settles a single mandate
+   * per pass. Unset keeps the historical per-pass cap of 25.
+   */
+  KEEPER_MAX_CHARGES_PER_RUN: z.coerce
+    .number()
+    .int()
+    .min(1, "must be at least 1")
+    .max(1_000, "must be at most 1000")
+    .default(25),
   KEEPER_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   /**
    * Which due mandate to settle first: `oldest` (due date ascending, the

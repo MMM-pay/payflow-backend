@@ -517,6 +517,11 @@ describe("webhooks", () => {
       assert.deepEqual(body.webhooks.map((w) => w.id), [second.id, first.id], "newest first, own only");
       assert.equal(body.webhooks[1]!.secretLast4, "1234");
       assert.equal(body.webhooks[1]!.url, "https://owner.example/a");
+      assert.deepEqual(
+        body.webhooks[1]!.events,
+        ["charged", "charge.failing", "charge.recovered"],
+        "the listing says which events the webhook receives",
+      );
       assert.equal(body.webhooks[1]!.failed, false);
       assert.equal("secret" in body.webhooks[1]!, false);
     });

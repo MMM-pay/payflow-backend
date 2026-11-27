@@ -60,6 +60,12 @@ release that ships them numbers them here.
 
 ### Added
 
+- `events` on webhook registration — `POST /api/webhooks` accepts an optional
+  `events` array (`charged`, `charge.failing`, `charge.recovered`) so a
+  webhook can subscribe to specific event types instead of every one (#271).
+  Omitted, it receives all three as before; an empty list, an unknown name or
+  a duplicate is `400 invalid_request`. The registration response and every
+  entry in `GET /api/webhooks` now carry the webhook's `events`.
 - `GET` and `PUT /api/merchants/:address/notification-preferences` — read or
   replace the merchant's persisted webhook event preferences. Defaults keep
   all supported notifications enabled; updates accept `charged`,

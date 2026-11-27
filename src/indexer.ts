@@ -917,7 +917,7 @@ export class Indexer {
     );
     const mandates = await source.all<Record<string, unknown>>(
       `SELECT id, subscriber, merchant, plan_id, amount, period, next_charge, last_charge,
-              charges_made, max_charges, fee_bps, status, ended_by, ledger
+              charges_made, max_charges, fee_bps, status, ended_by, ledger, status_ledger
        FROM mandates WHERE merchant = ?`,
       [merchant],
     );
@@ -970,6 +970,7 @@ export class Indexer {
       mandates: [
         "id", "subscriber", "merchant", "plan_id", "amount", "period", "next_charge",
         "last_charge", "charges_made", "max_charges", "fee_bps", "status", "ended_by", "ledger",
+        "status_ledger",
       ],
       plan_active_subscribers: ["plan_id", "subscriber", "mandate_count"],
       plan_subscriber_counts: ["plan_id", "active_subscribers"],
@@ -1227,8 +1228,8 @@ export class Indexer {
     await storage.run(
       `INSERT INTO mandates
            (id, subscriber, merchant, plan_id, amount, period, next_charge,
-            last_charge, charges_made, max_charges, fee_bps, status, ledger)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'Active', ?)
+            last_charge, charges_made, max_charges, fee_bps, status, ledger, status_ledger)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'Active', ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            subscriber  = excluded.subscriber,
            merchant    = excluded.merchant,
@@ -1245,13 +1246,79 @@ export class Indexer {
         num(e.data.max_charges),
         num(e.data.fee_bps),
         e.ledger,
+        e.ledger,
       ],
     );
-    await updateActivePlanSubscriber(storage, previous, {
-      plan_id: previous?.plan_id ?? num(e.data.plan_id),
-      subscriber: str(subscriber),
-      status: previous?.status ?? "Active",
-    });
+    const row = await storage.get<ActivePlanSubscriber & { status_ledger: number }>(
+      "SELECT plan_id, subscriber, status, status_ledger FROM mandates WHERE id = ?",
+      [id],
+    );
+    if (!row) return;
+    await updateActivePlanSubscriber(storage, previous, row);
+    // A `subscribed` event that arrives after its mandate's later events must
+    // not reset the projection to its opening state: the charge rows and the
+    // lifecycle timeline already hold what happened on chain. Both helpers
+    // only move the row forward, so a replay in ledger order changes nothing.
+    await this.advanceFromCharges(storage, id);
+    await this.advanceFromTimeline(storage, id, row);
+  }
+
+  /**
+   * Bring a mandate up to the newest charge already projected for it. This is
+   * how a `charged` event delivered before its `subscribed` event survives: the
+   * charge row is written either way, and the subscription catches up to it.
+   * The same `charges_made` guard as `onCharged` keeps it from going backwards.
+   */
+  private async advanceFromCharges(storage: Storage, mandateId: number): Promise<void> {
+    const latest = await storage.get<{ charges_made: number; next_charge: number }>(
+      `SELECT charges_made, next_charge FROM charges
+        WHERE mandate_id = ?
+        ORDER BY charges_made DESC, ledger DESC
+        LIMIT 1`,
+      [mandateId],
+    );
+    if (!latest) return;
+    await storage.run(
+      `UPDATE mandates
+          SET charges_made = ?,
+              next_charge = ?,
+              last_charge = MAX(0, ? - period)
+        WHERE id = ? AND charges_made < ?`,
+      [latest.charges_made, latest.next_charge, latest.next_charge, mandateId, latest.charges_made],
+    );
+  }
+
+  /**
+   * Bring a mandate's status up to the newest lifecycle event already recorded
+   * on its timeline, when that event is newer than the status the row holds.
+   * A cancellation or pause delivered before its subscription is therefore
+   * still reflected once the subscription arrives, and a stale event replayed
+   * later cannot reopen a mandate.
+   */
+  private async advanceFromTimeline(
+    storage: Storage,
+    mandateId: number,
+    row: ActivePlanSubscriber & { status_ledger: number },
+  ): Promise<void> {
+    const latest = await storage.get<LifecycleRow>(
+      `SELECT kind, ledger, details FROM mandate_timeline
+        WHERE mandate_id = ?
+          AND kind IN ('cancelled', 'mandate_ended', 'mandate_completed', 'pause_changed')
+        ORDER BY ledger DESC, tx_hash DESC, kind DESC
+        LIMIT 1`,
+      [mandateId],
+    );
+    if (!latest) return;
+    const target = lifecycleStatus(latest);
+    if (!target || latest.ledger < row.status_ledger || target.status === row.status) return;
+    const changed = await storage.get<{ id: number }>(
+      `UPDATE mandates
+          SET status = ?, ended_by = ?, status_ledger = ?
+        WHERE id = ? AND status = ? AND status_ledger <= ?
+        RETURNING id`,
+      [target.status, target.endedBy, latest.ledger, mandateId, row.status, latest.ledger],
+    );
+    if (changed) await updateActivePlanSubscriber(storage, row, { ...row, status: target.status });
   }
 
   /** The ledger close time is stable across replays; wall time is only a fallback. */
@@ -1321,14 +1388,19 @@ export class Indexer {
   ): Promise<string | undefined> {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
-    const row = await storage.get<ActivePlanSubscriber & { merchant: string }>(
-      "SELECT merchant, plan_id, subscriber, status FROM mandates WHERE id = ?",
+    const row = await storage.get<ActivePlanSubscriber & { merchant: string; status_ledger: number }>(
+      "SELECT merchant, plan_id, subscriber, status, status_ledger FROM mandates WHERE id = ?",
       [mid],
     );
     if (row) await this.merchantCache.invalidate(row.merchant);
+    // A lifecycle event older than the newest one already applied is a replay
+    // arriving late; it must not move the mandate's status backwards.
     const changed = row && await storage.get<{ id: number }>(
-      "UPDATE mandates SET status = ?, ended_by = ? WHERE id = ? AND status = ? RETURNING id",
-      [status, endedBy, mid, row.status],
+      `UPDATE mandates
+          SET status = ?, ended_by = ?, status_ledger = ?
+        WHERE id = ? AND status = ? AND status_ledger <= ?
+        RETURNING id`,
+      [status, endedBy, e.ledger, mid, row.status, e.ledger],
     );
     if (row && changed) await updateActivePlanSubscriber(storage, row, { ...row, status });
     return row?.merchant;
@@ -1377,16 +1449,16 @@ export class Indexer {
   private async onPauseChanged(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
-    const row = await storage.get<ActivePlanSubscriber & { merchant: string }>(
-      "SELECT merchant, plan_id, subscriber, status FROM mandates WHERE id = ?",
+    const row = await storage.get<ActivePlanSubscriber & { merchant: string; status_ledger: number }>(
+      "SELECT merchant, plan_id, subscriber, status, status_ledger FROM mandates WHERE id = ?",
       [mid],
     );
     if (row) await this.merchantCache.invalidate(row.merchant);
     const desiredStatus = e.data.paused ? "Paused" : "Active";
     const changed = row && (row.status === "Active" || row.status === "Paused") && await storage.get<{ id: number }>(
-      `UPDATE mandates SET status = ?
-          WHERE id = ? AND status = ? RETURNING id`,
-      [desiredStatus, mid, row.status],
+      `UPDATE mandates SET status = ?, status_ledger = ?
+          WHERE id = ? AND status = ? AND status_ledger <= ? RETURNING id`,
+      [desiredStatus, e.ledger, mid, row.status, e.ledger],
     );
     if (row && changed) {
       await updateActivePlanSubscriber(storage, row, {

@@ -33,7 +33,12 @@ function keeperConfig(
   },
   order?: "oldest" | "largest",
   fees: { KEEPER_FEE_PERCENTILE?: string; KEEPER_MAX_FEE?: string } = {},
-  toggles: { KEEPER_DRY_RUN?: boolean; KEEPER_BATCH?: boolean; KEEPER_BATCH_SIZE?: number } = {},
+  toggles: {
+    KEEPER_DRY_RUN?: boolean;
+    KEEPER_BATCH?: boolean;
+    KEEPER_BATCH_SIZE?: number;
+    KEEPER_MAX_CHARGES_PER_RUN?: number;
+  } = {},
 ): Config {
   return {
     PLAN_REGISTRY_ID: CONTRACT,
@@ -2221,6 +2226,104 @@ describe("keeper per-mandate backoff (#248)", () => {
     keeper.reloadFromConfig(backoffConfig({ KEEPER_BACKOFF_BASE_S: 45, KEEPER_BACKOFF_MULTIPLIER: 4 }));
     await keeper.tick(START + 45);
     assert.equal(keeper.retryIn(1, START + 45), 180, "a valid reload applies to the next failure");
+    db.close();
+  });
+});
+
+/** Issue #254: one pass settles at most KEEPER_MAX_CHARGES_PER_RUN mandates. */
+describe("keeper per-pass charge cap", () => {
+  test("a pass settles the configured number of mandates and the rest wait for later passes", async () => {
+    const db = openDatabase(":memory:");
+    for (let id = 1; id <= 5; id += 1) insertDue(db, id, 1_000 + id);
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      fakeRpc(new Set([keyA.publicKey()]), submitted),
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_MAX_CHARGES_PER_RUN: 2 }),
+    );
+
+    assert.equal(keeper.maxChargesPerRun, 2);
+    assert.deepEqual(
+      (await keeper.findDue(10_000)).map((mandate) => mandate.id),
+      [1, 2],
+      "the due query itself is bounded by the cap",
+    );
+
+    const first = await keeper.tick(10_000);
+    assert.deepEqual(first.map((result) => result.mandateId), [1, 2]);
+    assert.equal(submitted.length, 2, "no settlement beyond the cap reached the network");
+
+    // The indexer projects the settlements before the next pass in a real
+    // deployment; do the same here so the settled mandates leave the due list
+    // and the next pass reaches the ones after them.
+    db.prepare("UPDATE mandates SET next_charge = next_charge + 10000 WHERE id <= 2").run();
+    const second = await keeper.tick(10_001);
+    assert.deepEqual(second.map((result) => result.mandateId), [3, 4]);
+    db.prepare("UPDATE mandates SET next_charge = next_charge + 10000 WHERE id <= 4").run();
+    const third = await keeper.tick(10_002);
+    assert.deepEqual(third.map((result) => result.mandateId), [5]);
+    assert.equal(submitted.length, 5, "every mandate is eventually settled, spread over passes");
+    db.close();
+  });
+
+  test("the cap also bounds a batched pass, not only single charges", async () => {
+    const db = openDatabase(":memory:");
+    for (let id = 1; id <= 5; id += 1) insertDue(db, id, 1_000 + id);
+    const submitted: string[] = [];
+    const keeper = new Keeper(
+      db,
+      fakeRpc(new Set([keyA.publicKey()]), submitted),
+      keeperConfig(
+        { KEEPER_SECRET: keyA.secret() },
+        undefined,
+        {},
+        { KEEPER_BATCH: true, KEEPER_MAX_CHARGES_PER_RUN: 3 },
+      ),
+    );
+
+    const results = await keeper.tick(10_000);
+    assert.deepEqual(results.map((result) => result.mandateId), [1, 2, 3]);
+    assert.equal(submitted.length, 1, "the capped group is one charge_many transaction");
+    db.close();
+  });
+
+  test("an invalid cap is refused, and a refused reload keeps the running cap", async () => {
+    const db = openDatabase(":memory:");
+    insertDue(db, 1, 1_000);
+    const server = fakeRpc(new Set([keyA.publicKey()]));
+
+    for (const cap of [0, -1, 1.5]) {
+      assert.throws(
+        () =>
+          new Keeper(
+            db,
+            server,
+            keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, {
+              KEEPER_MAX_CHARGES_PER_RUN: cap,
+            }),
+          ),
+        /KEEPER_MAX_CHARGES_PER_RUN/,
+      );
+    }
+
+    const keeper = new Keeper(
+      db,
+      server,
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_MAX_CHARGES_PER_RUN: 2 }),
+    );
+    assert.throws(
+      () =>
+        keeper.reloadFromConfig(
+          keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_MAX_CHARGES_PER_RUN: 0 }),
+        ),
+      /KEEPER_MAX_CHARGES_PER_RUN/,
+    );
+    assert.equal(keeper.maxChargesPerRun, 2, "the refused reload changed nothing");
+
+    keeper.reloadFromConfig(
+      keeperConfig({ KEEPER_SECRET: keyA.secret() }, undefined, {}, { KEEPER_MAX_CHARGES_PER_RUN: 3 }),
+    );
+    assert.equal(keeper.maxChargesPerRun, 3, "a valid reload applies to the next pass");
     db.close();
   });
 });

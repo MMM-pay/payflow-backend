@@ -218,6 +218,9 @@ CREATE TABLE IF NOT EXISTS webhooks (
   -- previous_secret_expires_at (unix seconds).
   previous_secret TEXT,
   previous_secret_expires_at INTEGER,
+  -- Event types this webhook receives, as a JSON array (#271); an event
+  -- outside the list is not enqueued for it at all.
+  events      TEXT    NOT NULL DEFAULT '["charged","charge.failing","charge.recovered"]',
   active      INTEGER NOT NULL DEFAULT 1,
   failed      INTEGER NOT NULL DEFAULT 0,
   failures    INTEGER NOT NULL DEFAULT 0,
@@ -380,6 +383,7 @@ const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]
   ["plans", "payout_address", "TEXT NOT NULL DEFAULT ''"],
   ["mandates", "fee_bps", "INTEGER NOT NULL DEFAULT 0"],
   ["mandates", "ended_by", "TEXT"],
+  ["mandates", "status_ledger", "INTEGER NOT NULL DEFAULT 0"],
   ["webhooks", "previous_secret", "TEXT"],
   ["webhooks", "previous_secret_expires_at", "INTEGER"],
   ["webhooks", "circuit_open_until", "INTEGER"],
